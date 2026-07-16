@@ -59,6 +59,8 @@ mod layout_asserts {
     const _: () = assert!(size_of::<ResourceFlush>() == 24);
     const _: () = assert!(size_of::<ClearPresent>() == 32);
     const _: () = assert!(offset_of!(ClearPresent, scanout_addr) == 24);
+    const _: () = assert!(size_of::<ScanoutPresent>() == 24);
+    const _: () = assert!(offset_of!(ScanoutPresent, scanout_addr) == 16);
 }
 
 #[cfg(test)]

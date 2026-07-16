@@ -19,6 +19,9 @@ _Static_assert(sizeof(struct ClearPresent) == 32, "ClearPresent size");
 _Static_assert(offsetof(struct ClearPresent, rgba) == 8, "ClearPresent.rgba offset");
 _Static_assert(offsetof(struct ClearPresent, scanout_addr) == 24, "ClearPresent.scanout_addr offset");
 
+_Static_assert(sizeof(struct ScanoutPresent) == 24, "ScanoutPresent size");
+_Static_assert(offsetof(struct ScanoutPresent, scanout_addr) == 16, "ScanoutPresent.scanout_addr offset");
+
 _Static_assert(sizeof(struct ResourceCreateBlob) == 24, "ResourceCreateBlob size");
 _Static_assert(sizeof(struct SetScanoutBlob) == 24, "SetScanoutBlob size");
 _Static_assert(sizeof(struct ResourceFlush) == 24, "ResourceFlush size");

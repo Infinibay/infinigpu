@@ -23,7 +23,7 @@ use log::info;
 use std::fs::File;
 use std::io::{self, Write};
 use std::mem::size_of;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use vfio_bindings::bindings::vfio::{
     vfio_region_info, VFIO_IRQ_INFO_EVENTFD, VFIO_IRQ_SET_ACTION_TRIGGER,
     VFIO_IRQ_SET_DATA_EVENTFD, VFIO_PCI_BAR0_REGION_INDEX, VFIO_PCI_BAR1_REGION_INDEX,
@@ -60,6 +60,11 @@ pub struct InfinigpuBackend {
     ring0_retired: u64,
     /// Lazily-opened replay GPU context (only when a render command arrives).
     gpu: Option<HostGpu>,
+    /// Monotonic count of scanout presents (DRM/KMS page-flips) served.
+    present_count: u64,
+    /// If set (env `INFINIGPU_PRESENT_DIR`), each presented framebuffer is written
+    /// here as a PPM so the guest's real console/desktop can be viewed host-side.
+    present_dir: Option<PathBuf>,
 }
 
 impl Default for InfinigpuBackend {
@@ -70,6 +75,10 @@ impl Default for InfinigpuBackend {
 
 impl InfinigpuBackend {
     pub fn new() -> Self {
+        let present_dir = std::env::var_os("INFINIGPU_PRESENT_DIR").map(PathBuf::from);
+        if let Some(dir) = &present_dir {
+            let _ = std::fs::create_dir_all(dir);
+        }
         InfinigpuBackend {
             config: config::build(),
             dma: DmaTable::new(),
@@ -81,6 +90,8 @@ impl InfinigpuBackend {
             ring0_base: 0,
             ring0_retired: 0,
             gpu: None,
+            present_count: 0,
+            present_dir,
         }
     }
 
@@ -194,7 +205,9 @@ impl InfinigpuBackend {
     /// production path uses the polled multi-descriptor ring + real Vulkan payloads;
     /// this drives the whole pipeline end-to-end for bring-up.
     fn process_ring(&mut self) {
-        use infinigpu_abi::wire::{encoding, msg_type, ClearPresent, Descriptor, SubmitCmd};
+        use infinigpu_abi::wire::{
+            encoding, msg_type, ClearPresent, Descriptor, ScanoutPresent, SubmitCmd,
+        };
         use zerocopy::FromBytes;
 
         log::debug!("process_ring: ring0_base={:#x}", self.ring0_base);
@@ -220,19 +233,105 @@ impl InfinigpuBackend {
             return;
         }
         let sc = SubmitCmd::read_from_bytes(&sb).unwrap();
-        if sc.encoding != encoding::DISPLAY_CLEAR {
-            log::warn!("unsupported encoding {:#x}", sc.encoding);
+        let payload_addr = self.ring0_base + desc.data_offset as u64;
+        match sc.encoding {
+            encoding::DISPLAY_CLEAR => {
+                let mut pb = [0u8; core::mem::size_of::<ClearPresent>()];
+                if !self.dma.read(payload_addr, &mut pb) {
+                    return;
+                }
+                let cp = ClearPresent::read_from_bytes(&pb).unwrap();
+                self.render_clear_present(&cp, sc.seqno);
+            }
+            encoding::DISPLAY_SCANOUT => {
+                let mut pb = [0u8; core::mem::size_of::<ScanoutPresent>()];
+                if !self.dma.read(payload_addr, &mut pb) {
+                    return;
+                }
+                let sp = ScanoutPresent::read_from_bytes(&pb).unwrap();
+                self.present_scanout(&sp, sc.seqno);
+            }
+            other => log::warn!("unsupported encoding {:#x}", other),
+        }
+    }
+
+    /// Present a guest-supplied framebuffer (the DRM/KMS page-flip path): read
+    /// `pitch * height` bytes from guest RAM, count non-blank pixels (proof that
+    /// real console/desktop content flowed through the device), and — if
+    /// `INFINIGPU_PRESENT_DIR` is set — write the frame as a PPM so it can be viewed
+    /// host-side. This is a **pure 2D scan-out**: no GPU render is implied (the guest
+    /// already produced the pixels), matching PHASE-0 Step 3.
+    fn present_scanout(&mut self, sp: &infinigpu_abi::wire::ScanoutPresent, seqno: u64) {
+        use infinigpu_abi::wire::format;
+
+        let (w, h, pitch) = (sp.width as usize, sp.height as usize, sp.pitch as usize);
+        let total = w
+            .checked_mul(4)
+            .filter(|min_pitch| pitch >= *min_pitch)
+            .and_then(|_| pitch.checked_mul(h));
+        let total = match total {
+            // Cap at 64 MiB so a hostile geometry can't make us allocate wildly.
+            Some(t) if w != 0 && h != 0 && t <= 64 * 1024 * 1024 => t,
+            _ => {
+                log::error!("present: bad geometry {w}x{h} pitch {pitch}");
+                return;
+            }
+        };
+        let mut buf = vec![0u8; total];
+        if !self.dma.read(sp.scanout_addr, &mut buf) {
+            log::error!(
+                "present: framebuffer {:#x} ({total} bytes) not mapped",
+                sp.scanout_addr
+            );
             return;
         }
-        let mut pb = [0u8; core::mem::size_of::<ClearPresent>()];
-        if !self
-            .dma
-            .read(self.ring0_base + desc.data_offset as u64, &mut pb)
-        {
-            return;
+
+        // Byte order of one 32-bpp pixel. fbcon's XRGB8888 is little-endian
+        // [B,G,R,X]; R8G8B8A8 is [R,G,B,A].
+        let (ri, gi, bi) = match sp.format {
+            format::R8G8B8A8 => (0, 1, 2),
+            _ => (2, 1, 0), // B8G8R8A8 / B8G8R8X8 (fbcon default)
+        };
+        let mut rgb = vec![0u8; w * h * 3];
+        let mut nonblank = 0usize;
+        for y in 0..h {
+            let row = &buf[y * pitch..y * pitch + w * 4];
+            for x in 0..w {
+                let px = &row[x * 4..x * 4 + 4];
+                let (r, g, b) = (px[ri], px[gi], px[bi]);
+                if r | g | b != 0 {
+                    nonblank += 1;
+                }
+                let o = (y * w + x) * 3;
+                rgb[o] = r;
+                rgb[o + 1] = g;
+                rgb[o + 2] = b;
+            }
         }
-        let cp = ClearPresent::read_from_bytes(&pb).unwrap();
-        self.render_clear_present(&cp, sc.seqno);
+
+        self.present_count += 1;
+        let pct = 100.0 * nonblank as f64 / (w * h).max(1) as f64;
+        info!(
+            "present: frame {} {w}x{h} pitch {pitch} @ {:#x} — {nonblank} non-blank px ({pct:.1}%)",
+            self.present_count, sp.scanout_addr
+        );
+        if let Some(dir) = self.present_dir.clone() {
+            // Keep the first few numbered frames plus an always-current one.
+            if self.present_count <= 12 {
+                let _ = self.write_ppm(&dir.join(format!("frame-{:04}.ppm", self.present_count)), w, h, &rgb);
+            }
+            let _ = self.write_ppm(&dir.join("latest.ppm"), w, h, &rgb);
+        }
+
+        // Publish completion (guest polls CMD_RING0_RETIRED and/or takes MSI-X).
+        self.ring0_retired = seqno;
+        self.raise(1);
+    }
+
+    fn write_ppm(&self, path: &Path, w: usize, h: usize, rgb: &[u8]) -> io::Result<()> {
+        let mut f = File::create(path)?;
+        write!(f, "P6\n{w} {h}\n255\n")?;
+        f.write_all(rgb)
     }
 
     fn render_clear_present(&mut self, cp: &infinigpu_abi::wire::ClearPresent, seqno: u64) {

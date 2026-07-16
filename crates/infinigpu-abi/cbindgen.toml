@@ -16,6 +16,7 @@ include = [
   "Descriptor", "MsgHeader", "RingGeometry",
   "Negotiate", "CtxCreate", "ResourceCreateBlob", "MapBlob",
   "SubmitCmd", "Fence", "SetScanoutBlob", "ResourceFlush", "ClearPresent",
+  "ScanoutPresent",
 ]
 
 [parse]

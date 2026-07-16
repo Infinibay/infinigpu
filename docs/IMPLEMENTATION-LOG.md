@@ -135,6 +135,52 @@ driver does immediately. **`infinization`'s `QemuCommandBuilder.addInfinigpuDevi
 include `x-no-posted-writes`** (until the crate honors the posted-write flag). Recorded in
 `ERRATA`-style project memory.
 
+### 2026-07-16 — 🖥️ REAL DRM/KMS DISPLAY DRIVER (guest shows a true framebuffer)
+
+`guest/linux/infinigpu.c` is now a real **DRM/KMS display driver**, not the plain-PCI
+self-test. It registers `/dev/dri/card0` with one CRTC/plane/encoder/connector, uses the
+**GEM-DMA helpers** for contiguous dumb framebuffers, and enables **fbdev emulation** so
+the kernel's **fbcon binds to our framebuffer**. Every page-flip hands the host the
+framebuffer's guest-physical `dma_addr` via a new `DISPLAY_SCANOUT` ring command; the host
+reads the pixels and presents them (`present_scanout` in `infinigpu-device`), dumping each
+frame as a PPM (`INFINIGPU_PRESENT_DIR`) so the guest's console is **viewable host-side**.
+
+`scripts/guest-kms-test.sh` boots a real guest and proves it end to end:
+
+```
+[guest] [drm] Initialized infinigpu 1.0.0 for 0000:00:02.0 on minor 0
+[guest] Console: switching to colour frame buffer device 128x48   ← fbcon on OUR fb
+[guest] [drm] fb0: infinigpudrmfb frame buffer device  →  /dev/dri/card0 + /dev/fb0
+[guest] INFINIGPU-KMS: PASS pipe present retired=1 seqno=1
+[host]  present: frame 1 128x128 …  16384 non-blank px (100.0%)   ← KMS self-test gradient
+[host]  present: frame 5 1024x768 … 30862 non-blank px (3.9%)     ← real fbcon CONSOLE TEXT
+```
+
+`/tmp/infinigpu-frames/latest.png` shows the **live guest kernel console** — including our
+own driver's boot lines — rendered by fbcon onto our framebuffer and scanned out through the
+vfio-user device to the host. This is PHASE-0 Step 3 (Linux DRM/KMS) + a pure-2D Step 6
+(present), done for real.
+
+**Design notes / findings:**
+- **Contiguous (GEM-DMA) framebuffers were the right call.** Each buffer is one `dma_addr`
+  the host reads as a single blob — no scatter-gather. Cost: exactly one extra guest module,
+  `drm_dma_helper.ko` (`CONFIG_DRM_GEM_DMA_HELPER=m` on Ubuntu; everything else in the DRM
+  stack — core, KMS helper, fbdev, GEM-shmem — is `=y`). The harness decompresses the host's
+  `.ko.zst` and `insmod`s it before ours; `modinfo -F depends infinigpu.ko` = just
+  `drm_dma_helper`.
+- **6.14 fbdev API**: `drm_fbdev_dma_setup()` is gone. Use `DRM_FBDEV_DMA_DRIVER_OPS`
+  (`.fbdev_probe`) in the driver + `drm_client_setup(dev, NULL)` after `drm_dev_register`
+  (`<drm/clients/drm_client_setup.h>`). `struct drm_driver.date` was also removed.
+- **The doorbell round-trip is the flip sync.** Because the host processes the ring *inside*
+  the (non-posted) doorbell `region_write` before replying, the guest's `iowrite32(doorbell)`
+  returning already means "presented" — no vblank IRQ needed; the pipe completes flip events
+  immediately with `drm_crtc_send_vblank_event`.
+- **`-vga none` is required** in the test so infinigpu is the *only* DRM device and fbcon
+  binds to `fb0` = ours (not a default QEMU VGA). `console=tty0 console=ttyS0` routes the
+  kernel log to both our framebuffer and the serial capture.
+- The KMS self-test presents a recognizable gradient *before* `drm_client_setup`, so its
+  deterministic PASS can't race a concurrent fbcon flush.
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against

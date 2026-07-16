@@ -64,6 +64,12 @@ pub mod encoding {
     /// colour and write it to a guest scanout address. Proves the whole pipeline
     /// end-to-end before the real Vulkan encoder exists.
     pub const DISPLAY_CLEAR: u32 = 0x0100;
+    /// DRM/KMS present payload: a [`super::ScanoutPresent`] — the guest already
+    /// holds pixels in a contiguous framebuffer (drawn by fbcon / a compositor) and
+    /// asks the host to scan it out. The host *reads* the framebuffer from guest RAM
+    /// (opposite direction to [`DISPLAY_CLEAR`], which writes) and presents it. This
+    /// is what the real Linux DRM/KMS guest driver submits on every page-flip.
+    pub const DISPLAY_SCANOUT: u32 = 0x0101;
 }
 
 /// `ResourceCreateBlob::blob_mem` (virtio-gpu blob semantics).
@@ -270,5 +276,24 @@ pub struct ClearPresent {
     pub width: u32,
     pub height: u32,
     pub rgba: [f32; 4],
+    pub scanout_addr: u64,
+}
+
+/// `DISPLAY_SCANOUT` payload (see [`encoding::DISPLAY_SCANOUT`]): the guest's real
+/// DRM/KMS driver hands the host a contiguous framebuffer to present. `scanout_addr`
+/// is the guest-physical base of the framebuffer (a `dma_addr_t` from
+/// `drm_fb_dma_get_gem_addr`); the host reads `pitch * height` bytes and interprets
+/// them as `format` ([`format`]). No render is implied — this is a pure 2D scan-out
+/// of pixels the guest already produced.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct ScanoutPresent {
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per row (may exceed `width * 4` for alignment).
+    pub pitch: u32,
+    /// [`format`] tag; fbcon's default 32-bpp buffer is `XRGB8888` = [`format::B8G8R8X8`].
+    pub format: u32,
+    /// Guest-physical base address of the framebuffer.
     pub scanout_addr: u64,
 }

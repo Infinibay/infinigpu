@@ -203,3 +203,28 @@ struct ClearPresent {
   float rgba[4];
   uint64_t scanout_addr;
 };
+
+/**
+ * `DISPLAY_SCANOUT` payload (see [`encoding::DISPLAY_SCANOUT`]): the guest's real
+ * DRM/KMS driver hands the host a contiguous framebuffer to present. `scanout_addr`
+ * is the guest-physical base of the framebuffer (a `dma_addr_t` from
+ * `drm_fb_dma_get_gem_addr`); the host reads `pitch * height` bytes and interprets
+ * them as `format` ([`format`]). No render is implied — this is a pure 2D scan-out
+ * of pixels the guest already produced.
+ */
+struct ScanoutPresent {
+  uint32_t width;
+  uint32_t height;
+  /**
+   * Bytes per row (may exceed `width * 4` for alignment).
+   */
+  uint32_t pitch;
+  /**
+   * [`format`] tag; fbcon's default 32-bpp buffer is `XRGB8888` = [`format::B8G8R8X8`].
+   */
+  uint32_t format;
+  /**
+   * Guest-physical base address of the framebuffer.
+   */
+  uint64_t scanout_addr;
+};
