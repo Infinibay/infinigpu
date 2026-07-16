@@ -1,6 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+//
+// Copyright (c) 2026 Infinibay LLC <andres@infinibay.net>
 //
 // infinigpu — Linux guest DRM/KMS display driver (Phase-0, ADR-0005 Linux).
+//
+// Dual-licensed MIT/GPL: MIT is Infinibay's chosen license, and the Linux kernel
+// requires a GPL-compatible MODULE_LICENSE to use the DRM/KMS EXPORT_SYMBOL_GPL
+// stack — "Dual MIT/GPL" satisfies both (a pure "MIT" module would be denied those
+// symbols and fail to load).
 //
 // Binds the infinigpu vfio-user device (1b36:0110) and exposes it as a real
 // DRM/KMS display: a /dev/dri/card0 with one CRTC/plane/encoder/connector, dumb
@@ -393,6 +400,6 @@ static struct pci_driver igpu_driver = {
 };
 module_pci_driver(igpu_driver);
 
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("Dual MIT/GPL");
 MODULE_DESCRIPTION("infinigpu guest DRM/KMS display driver (Phase-0)");
-MODULE_AUTHOR("Infinibay");
+MODULE_AUTHOR("Infinibay LLC <andres@infinibay.net>");

@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 infinigpu-abi = { path = "../infinigpu-abi" }
 infinigpu-replay = { path = "../infinigpu-replay" }
+infinigpu-sched = { path = "../infinigpu-sched" }
 zerocopy = { workspace = true }
 vfio_user = { workspace = true }
 vfio-bindings = { workspace = true }
@@ -27,3 +28,9 @@ path = "src/bin/device.rs"
 [[bin]]
 name = "infinigpu-pipeline-demo"
 path = "src/bin/pipeline_demo.rs"
+
+# The ADR-0007 GPU broker on the real GPU: fail-closed admission + weighted
+# fair-share across two VMs sharing one A5000. Requires a GPU; no QEMU.
+[[bin]]
+name = "infinigpu-broker-demo"
+path = "src/bin/broker_demo.rs"

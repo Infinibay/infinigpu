@@ -18,12 +18,84 @@ pub mod dma;
 
 use dma::DmaTable;
 use infinigpu_abi::regs;
-use infinigpu_replay::HostGpu;
+use infinigpu_replay::{Frame, HostGpu};
+use infinigpu_sched::{BrokerConfig, GpuBroker, VmConfig, VmTicket};
 use log::info;
 use std::fs::File;
 use std::io::{self, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// Estimated VRAM footprint (MB) a display VM reserves at GPU-attach (scanout +
+/// working set). A real encoder/3D VM would report more; Phase-0 uses a flat guess.
+pub const VRAM_ESTIMATE_MB: u64 = 256;
+
+/// One physical GPU context shared by every VM's backend. `render_clear` takes
+/// `&self`; the [`GpuBroker`] run-lock guarantees only one submission runs at a time
+/// (cooperative multiplexing, never MPS — ADR-0002/0007), so the inner mutex only
+/// guards lazy open. Sharing one context is the Phase-1 first-cut simplification of
+/// ADR-0003's per-VM replay *process*.
+pub struct SharedGpu {
+    gpu: Mutex<Option<HostGpu>>,
+}
+
+impl SharedGpu {
+    pub fn new() -> Arc<Self> {
+        Arc::new(SharedGpu {
+            gpu: Mutex::new(None),
+        })
+    }
+
+    /// Lazily open the GPU, then render a cleared frame. `None` on GPU-open/render
+    /// failure (logged). Call only from inside a broker `run()` closure.
+    pub fn render_clear(&self, width: u32, height: u32, rgba: [f32; 4]) -> Option<Frame> {
+        let mut g = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            match HostGpu::open() {
+                Ok(x) => {
+                    info!("replay GPU: {} ({:?})", x.device_name(), x.driver_id());
+                    *g = Some(x);
+                }
+                Err(e) => {
+                    log::error!("cannot open replay GPU: {e}");
+                    return None;
+                }
+            }
+        }
+        match g.as_ref().unwrap().render_clear(width, height, rgba) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                log::error!("render failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Lazily open the GPU and return its device name (e.g. "NVIDIA RTX A5000"), or
+    /// `None` if no GPU is available.
+    pub fn device_name(&self) -> Option<String> {
+        let mut g = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            match HostGpu::open() {
+                Ok(x) => *g = Some(x),
+                Err(e) => {
+                    log::error!("cannot open replay GPU: {e}");
+                    return None;
+                }
+            }
+        }
+        g.as_ref().map(|x| x.device_name().to_string())
+    }
+}
+
+impl Default for SharedGpu {
+    fn default() -> Self {
+        SharedGpu {
+            gpu: Mutex::new(None),
+        }
+    }
+}
 use vfio_bindings::bindings::vfio::{
     vfio_region_info, VFIO_IRQ_INFO_EVENTFD, VFIO_IRQ_SET_ACTION_TRIGGER,
     VFIO_IRQ_SET_DATA_EVENTFD, VFIO_PCI_BAR0_REGION_INDEX, VFIO_PCI_BAR1_REGION_INDEX,
@@ -58,8 +130,18 @@ pub struct InfinigpuBackend {
     ring0_base: u64,
     /// Highest retired seqno for command-ring 0 (completion sync via trapped read).
     ring0_retired: u64,
-    /// Lazily-opened replay GPU context (only when a render command arrives).
-    gpu: Option<HostGpu>,
+    /// The GPU broker (ADR-0007): admission + fair-share scheduling. Shared across
+    /// every VM's backend so they cooperatively share one physical GPU.
+    broker: Arc<GpuBroker>,
+    /// The shared physical GPU context (one per host, serialized by the broker).
+    shared_gpu: Arc<SharedGpu>,
+    /// This VM's scheduling policy (weight, VRAM cap, priority tier).
+    vm_config: VmConfig,
+    /// Admission ticket — `Some` once the broker admits this VM at GPU-attach; holds
+    /// its VRAM reservation + concurrency slot until drop (reap).
+    ticket: Option<VmTicket>,
+    /// True once admission has been attempted and denied (so we stop retrying/log once).
+    admission_denied: bool,
     /// Monotonic count of scanout presents (DRM/KMS page-flips) served.
     present_count: u64,
     /// If set (env `INFINIGPU_PRESENT_DIR`), each presented framebuffer is written
@@ -74,7 +156,21 @@ impl Default for InfinigpuBackend {
 }
 
 impl InfinigpuBackend {
+    /// Standalone single-VM backend: its own default broker + GPU context. Used by the
+    /// single-socket `infinigpu-device` binary and the in-process demos/tests.
     pub fn new() -> Self {
+        let broker = GpuBroker::with_real_clock(BrokerConfig::default());
+        Self::with_broker(broker, SharedGpu::new(), VmConfig::new("vm", 1, 4096))
+    }
+
+    /// Multi-VM backend: shares a `broker` + `shared_gpu` with other VMs' backends, so
+    /// the broker arbitrates one physical GPU across them. `vm_config` carries this
+    /// VM's weight / VRAM cap / priority.
+    pub fn with_broker(
+        broker: Arc<GpuBroker>,
+        shared_gpu: Arc<SharedGpu>,
+        vm_config: VmConfig,
+    ) -> Self {
         let present_dir = std::env::var_os("INFINIGPU_PRESENT_DIR").map(PathBuf::from);
         if let Some(dir) = &present_dir {
             let _ = std::fs::create_dir_all(dir);
@@ -89,9 +185,40 @@ impl InfinigpuBackend {
             dbg_dma_addr: 0,
             ring0_base: 0,
             ring0_retired: 0,
-            gpu: None,
+            broker,
+            shared_gpu,
+            vm_config,
+            ticket: None,
+            admission_denied: false,
             present_count: 0,
             present_dir,
+        }
+    }
+
+    /// Admission control (ADR-0007): ask the broker to admit this VM at GPU-attach.
+    /// Idempotent. Returns whether the VM currently holds a ticket. Fail-closed: on
+    /// denial, no ticket is granted and GPU submissions are refused.
+    fn ensure_admitted(&mut self) -> bool {
+        if self.ticket.is_some() {
+            return true;
+        }
+        if self.admission_denied {
+            return false;
+        }
+        match self.broker.admit(self.vm_config.clone(), VRAM_ESTIMATE_MB) {
+            Ok(t) => {
+                self.ticket = Some(t);
+                true
+            }
+            Err(e) => {
+                log::warn!(
+                    "admission DENIED for vm={}: {e} — GPU submissions refused (fail-closed)",
+                    self.vm_config.vm_id
+                );
+                self.global_status |= regs::global_status::FATAL;
+                self.admission_denied = true;
+                false
+            }
         }
     }
 
@@ -105,6 +232,10 @@ impl InfinigpuBackend {
     fn reset_state(&mut self) {
         self.global_ctrl = 0;
         self.global_status = regs::global_status::NEEDS_RESET;
+        // Reap: dropping the ticket releases this VM's VRAM reservation + concurrency
+        // slot back to the broker so the capacity is immediately re-admittable.
+        self.ticket = None;
+        self.admission_denied = false;
         // DMA maps persist across device reset (the client re-sends DMA_UNMAP/MAP).
     }
 
@@ -147,7 +278,13 @@ impl InfinigpuBackend {
         }
 
         match off {
-            GLOBAL_CTRL => self.global_ctrl = val,
+            GLOBAL_CTRL => {
+                self.global_ctrl = val;
+                // GPU-attach: the guest enabling the device is the admission trigger.
+                if val & regs::global_ctrl::DEVICE_ENABLE != 0 {
+                    self.ensure_admitted();
+                }
+            }
             DEVICE_RESET => {
                 if val & 1 != 0 {
                     self.reset_state();
@@ -264,6 +401,10 @@ impl InfinigpuBackend {
     fn present_scanout(&mut self, sp: &infinigpu_abi::wire::ScanoutPresent, seqno: u64) {
         use infinigpu_abi::wire::format;
 
+        // Admission gate (fail-closed): a VM the broker didn't admit cannot present.
+        if !self.ensure_admitted() {
+            return;
+        }
         let (w, h, pitch) = (sp.width as usize, sp.height as usize, sp.pitch as usize);
         let total = w
             .checked_mul(4)
@@ -341,34 +482,35 @@ impl InfinigpuBackend {
             cp.height,
             cp.scanout_addr
         );
-        if self.gpu.is_none() {
-            info!("  opening replay GPU (first render)…");
-            match HostGpu::open() {
-                Ok(g) => {
-                    info!("replay GPU: {} ({:?})", g.device_name(), g.driver_id());
-                    self.gpu = Some(g);
-                }
-                Err(e) => {
-                    log::error!("cannot open replay GPU: {e}");
-                    return;
-                }
-            }
+        // Admission gate (fail-closed) then run the render under the broker's
+        // fair-share scheduler: it blocks on token-bucket back-pressure, serializes on
+        // the GPU run-lock, and debits the measured GPU-time to this VM.
+        if !self.ensure_admitted() {
+            return;
         }
-        let frame = match self
-            .gpu
-            .as_ref()
-            .unwrap()
-            .render_clear(cp.width, cp.height, cp.rgba)
+        // Validate guest-controlled geometry BEFORE the GPU sees it (fail-closed;
+        // mirrors present_scanout). Keeps an overflowing width×height from ever
+        // panicking inside the shared run-lock and bricking the fleet (verify finding).
+        if cp.width == 0
+            || cp.height == 0
+            || (cp.width as u64 * cp.height as u64 * 4) > 64 * 1024 * 1024
         {
-            Ok(f) => f,
-            Err(e) => {
-                log::error!("render failed: {e}");
-                return;
-            }
+            log::error!("render_clear: bad geometry {}x{}", cp.width, cp.height);
+            return;
+        }
+        // Pre-warm the shared GPU context OUTSIDE the broker's timed region so the
+        // one-time Vulkan init is never billed to this tenant's GPU-time (verify
+        // finding #3). Idempotent: only the first admitted VM host-wide pays it.
+        let _ = self.shared_gpu.device_name();
+        let gpu = Arc::clone(&self.shared_gpu);
+        let (w, h, rgba) = (cp.width, cp.height, cp.rgba);
+        let frame = match self.ticket.as_ref().unwrap().run(move || gpu.render_clear(w, h, rgba)) {
+            Ok(Some(f)) => f,
+            _ => return, // GPU error, or (unreachable here) not admitted
         };
         info!(
-            "seqno {seqno}: rendered {}x{} on the GPU → scanout {:#x}",
-            cp.width, cp.height, cp.scanout_addr
+            "seqno {seqno}: vm={} rendered {}x{} on the GPU → scanout {:#x}",
+            self.vm_config.vm_id, cp.width, cp.height, cp.scanout_addr
         );
         if !self.dma.write(cp.scanout_addr, &frame.rgba) {
             log::error!("scanout {:#x} not fully mapped", cp.scanout_addr);
@@ -543,9 +685,24 @@ pub fn build_irqs() -> Vec<IrqInfo> {
         .collect()
 }
 
-/// Bind a server at `socket_path` and serve one QEMU connection (blocking).
+/// Bind a server at `socket_path` and serve one QEMU connection (blocking). Standalone
+/// single-VM: its own broker + GPU context.
 pub fn serve(socket_path: &Path) -> Result<(), vfio_user::Error> {
     let server = Server::new(socket_path, true, build_irqs(), build_regions())?;
     let mut backend = InfinigpuBackend::new();
+    server.run(&mut backend)
+}
+
+/// Serve one QEMU connection for a VM that **shares** a `broker` + `shared_gpu` with
+/// other VMs (the multi-VM path — see `infinigpu-broker`). Blocks until the guest
+/// disconnects; on return the backend drops and its admission ticket reaps.
+pub fn serve_with_broker(
+    socket_path: &Path,
+    broker: Arc<GpuBroker>,
+    shared_gpu: Arc<SharedGpu>,
+    vm_config: VmConfig,
+) -> Result<(), vfio_user::Error> {
+    let server = Server::new(socket_path, true, build_irqs(), build_regions())?;
+    let mut backend = InfinigpuBackend::with_broker(broker, shared_gpu, vm_config);
     server.run(&mut backend)
 }

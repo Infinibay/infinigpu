@@ -181,6 +181,67 @@ vfio-user device to the host. This is PHASE-0 Step 3 (Linux DRM/KMS) + a pure-2D
 - The KMS self-test presents a recognizable gradient *before* `drm_client_setup`, so its
   deterministic PASS can't race a concurrent fbcon flush.
 
+### 2026-07-16 — 🧠 THE GPU BROKER: two VMs share one A5000 (ADR-0007, Phase-1)
+
+`infinigpu-sched` is the VDI capacity manager + scheduler "brain" — the *differentiator*
+(share one GPU across many desktops, no MPS, no per-VM license). Built in the ADR-0007
+order (accounting → admission → fair-share), **GPU-agnostic** so it unit-tests with no GPU:
+
+- **Fail-closed admission** at GPU-attach: a broker-owned **VRAM commit ledger** + a
+  concurrent-GPU-VM cap + a per-VM VRAM cap. Over-capacity is denied (typed `AdmitError`),
+  never best-effort. An RAII **`VmTicket`** releases the VRAM + slot on drop — the explicit
+  reap on stop *or* panic-unwind.
+- **GPU-time accounting + token bucket**: every render is measured and debited from a per-VM
+  bucket whose refill rate ∝ `gpuTimeWeight` × priority boost. The bucket is the **hard QoS
+  backstop** (ADR-0007: `VK_EXT_global_priority` is only a soft MEDIUM/LOW hint on NVIDIA).
+- **Weighted fair-share**: a hog that empties its bucket is throttled (blocked) until it
+  refills. A per-VM **anti-starvation floor** keeps the lightest desktop moving; a **watchdog**
+  flags a render that overruns its budget (real design kills the per-VM *process*, ADR-0003).
+- 11 deterministic unit tests (`ManualClock`, no GPU): admission fail-closed on all three
+  caps, reap-frees-capacity, the **weighted-share law verified at 3×**, the interactive boost
+  at 1.5×, anti-starvation, watchdog, and real-clock run-serialization.
+
+**Wired into the device** (`infinigpu-device`): a shared `GpuBroker` + one `SharedGpu`
+(single Vulkan context, serialized by the broker's run-lock — cooperative, never MPS).
+`InfinigpuBackend` admits at `GLOBAL_CTRL` enable and routes every GPU render through
+`ticket.run(...)`; `reset_state`/backend-drop reaps. `serve_with_broker()` lets one host
+process serve many VMs off one broker.
+
+**Proven on the real A5000** — `infinigpu-broker-demo` (no QEMU):
+
+```
+Act 1 admission: designer-3 DENIED (VRAM ledger) · greedy DENIED (per-VM cap) ·
+                 office-2 DENIED (concurrency cap) — every over-capacity request fails closed
+Act 2 fair-share: designer (w3) got 1.95× the office (w1×1.5 Interactive) desktop's GPU-time
+                  — matching the 2.0× effective-weight target — on ONE physical A5000.
+```
+
+That is two VM desktops sharing one physical GPU with capacity-aware weighted fair-share and
+no per-VM license — the VDI thesis, working.
+
+**Faithful-but-simplified (called out, not hidden):** (1) one shared Vulkan context in one
+process rather than ADR-0003's per-VM jailed *process* (so this validates the scheduling brain,
+not yet the isolation/NVML-attribution story); (2) GPU-time = wall-clock of the serialized
+render, a proxy for the authoritative Vulkan-timestamp currency; (3) the token bucket enforces
+weighted shares in the token-limited regime — under *full* GPU saturation with generous tokens,
+vruntime-ordered dispatch (tracked, not yet wired) is what makes shares weight-proportional.
+These do not change the admission/fair-share math proven here. Remaining Phase-1: multi-ring
+scale-out, per-VM replay process + NVML attribution, infiniPixel remote protocol.
+
+**Adversarially verified** (`verify-scheduler` workflow — 4 diverse-lens critics × per-finding
+verification: 10 raised, 3 confirmed + fixed):
+- **The load-bearing one:** a render panic could poison the shared GPU run-lock (`.unwrap()`) and
+  brick submission for **every** VM — a host-wide outage from one bad guest. Now **contained** by
+  `catch_unwind` + poison-tolerant locks (`unwrap_or_else(|e| e.into_inner())`), and its
+  guest-reachable trigger — unvalidated `width×height` → u32 overflow in the render path — is
+  closed by geometry validation (mirroring `present_scanout`) + u64 arithmetic. Regression-tested
+  (`a_panicking_render_is_contained_and_does_not_brick_the_fleet`).
+- **vruntime consistency:** the fair-share yardstick now divides by *effective* weight (weight ×
+  boost), matching the share the token bucket enforces (was raw weight) — via a single
+  `VmConfig::effective_weight_num()` used by refill, throttle, and vruntime alike.
+- **Startup fairness:** the one-time Vulkan context open is pre-warmed *outside* the broker's
+  timed region, so the first tenant isn't billed the init and over-throttled.
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against

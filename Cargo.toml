@@ -4,6 +4,7 @@ members = [
     "crates/infinigpu-abi",
     "crates/infinigpu-ring",
     "crates/infinigpu-replay",
+    "crates/infinigpu-sched",
     "crates/infinigpu-device",
 ]
 
@@ -15,9 +16,9 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/Infinibay/infinigpu"
-authors = ["Infinibay"]
+authors = ["Infinibay LLC <andres@infinibay.net>"]
 rust-version = "1.90"
 
 [workspace.dependencies]

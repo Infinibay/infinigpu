@@ -254,7 +254,9 @@ impl HostGpu {
         };
 
         // ---- host-visible readback buffer ----
-        let size = (width * height * 4) as u64;
+        // u64 arithmetic: width*height*4 overflows u32 for large geometries (a debug
+        // build would panic; callers also bound the geometry — verify-scheduler #1).
+        let size = width as u64 * height as u64 * 4;
         let buffer = unsafe {
             dev.create_buffer(
                 &vk::BufferCreateInfo::default()

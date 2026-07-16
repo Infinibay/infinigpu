@@ -202,6 +202,7 @@ dependencies = [
  "env_logger",
  "infinigpu-abi",
  "infinigpu-replay",
+ "infinigpu-sched",
  "libc",
  "log",
  "vfio-bindings",
@@ -223,6 +224,13 @@ version = "0.0.0"
 dependencies = [
  "infinigpu-abi",
  "loom",
+]
+
+[[package]]
+name = "infinigpu-sched"
+version = "0.0.0"
+dependencies = [
+ "log",
 ]
 
 [[package]]
