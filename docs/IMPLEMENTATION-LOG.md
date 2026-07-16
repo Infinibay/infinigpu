@@ -281,6 +281,36 @@ the perceptual/foveation layer, HEVC/AV1 negotiation, WebTransport/QUIC, adaptiv
 cursor sprite, and wiring the encoder input to the live device present path (v0 uses a test
 pattern; the frames already exist in `present_scanout`).
 
+### 2026-07-16 — 🔗 device present → infiniPixel: a live guest desktop in a browser
+
+The two Phase-1 halves are now one path. `infinigpu-device` depends on `infinigpu-pixel`;
+when `INFINIGPU_PIXEL_PORT` is set, the backend binds a `PixelStreamer` (WebSocket server up
+front, encoder created lazily) and feeds every **presented framebuffer** to it — so a real
+guest's DRM/KMS console is NVENC-encoded and streamed to a browser, decoded with WebCodecs.
+
+`scripts/guest-kms-pixel-test.sh` proves the whole stack end to end: boot a real Linux guest
+→ its console renders through `infinigpu.ko` → the host device presents each framebuffer →
+NVENC encodes it → infiniPixel streams it → a client decodes it. `/tmp/infinipixel-guest.png`
+shows the **live guest console** (boot log, `INFINIGPU-KMS: PASS`, and the injected
+`infiniPixel over DRM/KMS … the quick brown fox` line) recovered from the stream.
+
+Two real fixes this milestone taught us:
+- **`PixelStreamer` re-creates its encoder on a resolution change** (keeping the WS server
+  bound), because the guest presents the 128×128 KMS self-test *then* the 1024×768 console —
+  a fixed-size encoder would drop every real frame. This also handles live guest resolution
+  changes.
+- **The DRM driver needed `drm_gem_fb_create_with_dirty`** (not `drm_gem_fb_create`). A
+  directly-scanned-out DMA framebuffer only presents on the boot modeset; fbcon's post-boot
+  console writes go straight to the buffer with nothing telling the device to present. Wiring
+  `drm_atomic_helper_dirtyfb` makes damage trigger a commit → a present. Effect: presents went
+  from **5 (boot only) → 104 (continuous)**, and the live desktop actually updates. (The
+  full-frame flush per damage is CPU-heavy — `drm_fb_helper_damage_work hogged CPU` — which is
+  what the damage-aware idle-skip milestone optimizes.)
+
+Known v0 limits (documented): the encoder holds the newest frame until the next one (fine for
+a live stream, shows as a 1-frame lag on a frozen scene); one `INFINIGPU_PIXEL_PORT` per
+process (per-VM ports come with the multi-VM streaming refinement).
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against

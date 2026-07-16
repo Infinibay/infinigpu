@@ -147,6 +147,11 @@ pub struct InfinigpuBackend {
     /// If set (env `INFINIGPU_PRESENT_DIR`), each presented framebuffer is written
     /// here as a PPM so the guest's real console/desktop can be viewed host-side.
     present_dir: Option<PathBuf>,
+    /// If set (env `INFINIGPU_PIXEL_PORT`), each presented framebuffer is H.264-encoded
+    /// on NVENC and streamed over WebSocket (infiniPixel) — watch the live guest desktop
+    /// in a browser. The WebSocket server binds eagerly; the encoder is created on the
+    /// first present, sized to the guest framebuffer.
+    pixel: Option<infinigpu_pixel::PixelStreamer>,
 }
 
 impl Default for InfinigpuBackend {
@@ -175,6 +180,22 @@ impl InfinigpuBackend {
         if let Some(dir) = &present_dir {
             let _ = std::fs::create_dir_all(dir);
         }
+        let pixel_port: Option<u16> = std::env::var("INFINIGPU_PIXEL_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        // Bind the infiniPixel WebSocket server eagerly (encoder stays lazy, sized to
+        // the first frame) so a viewer can connect *before* the first present and catch
+        // the whole stream from frame 0.
+        let pixel = pixel_port.and_then(|port| match infinigpu_pixel::PixelStreamer::new(30, 8000, port) {
+            Ok(s) => {
+                info!("infiniPixel: serving on ws://0.0.0.0:{port} (open client/infinipixel.html?port={port})");
+                Some(s)
+            }
+            Err(e) => {
+                log::error!("infiniPixel: cannot bind :{port}: {e}");
+                None
+            }
+        });
         InfinigpuBackend {
             config: config::build(),
             dma: DmaTable::new(),
@@ -192,6 +213,7 @@ impl InfinigpuBackend {
             admission_denied: false,
             present_count: 0,
             present_dir,
+            pixel,
         }
     }
 
@@ -434,6 +456,9 @@ impl InfinigpuBackend {
             _ => (2, 1, 0), // B8G8R8A8 / B8G8R8X8 (fbcon default)
         };
         let mut rgb = vec![0u8; w * h * 3];
+        // When streaming, also produce a tightly-packed BGRA frame for the encoder.
+        let streaming = self.pixel.is_some();
+        let mut bgra = if streaming { vec![0u8; w * h * 4] } else { Vec::new() };
         let mut nonblank = 0usize;
         for y in 0..h {
             let row = &buf[y * pitch..y * pitch + w * 4];
@@ -447,6 +472,13 @@ impl InfinigpuBackend {
                 rgb[o] = r;
                 rgb[o + 1] = g;
                 rgb[o + 2] = b;
+                if streaming {
+                    let o4 = (y * w + x) * 4;
+                    bgra[o4] = b;
+                    bgra[o4 + 1] = g;
+                    bgra[o4 + 2] = r;
+                    bgra[o4 + 3] = 255;
+                }
             }
         }
 
@@ -464,9 +496,23 @@ impl InfinigpuBackend {
             let _ = self.write_ppm(&dir.join("latest.ppm"), w, h, &rgb);
         }
 
+        // infiniPixel: encode this framebuffer on NVENC and stream it to any browsers.
+        if streaming {
+            self.stream_frame(&bgra, w as u32, h as u32);
+        }
+
         // Publish completion (guest polls CMD_RING0_RETIRED and/or takes MSI-X).
         self.ring0_retired = seqno;
         self.raise(1);
+    }
+
+    /// Feed one presented frame to the infiniPixel stream. The streamer (re)sizes its
+    /// encoder to match, so the 128×128 KMS self-test and the real console resolution
+    /// both stream correctly.
+    fn stream_frame(&mut self, bgra: &[u8], w: u32, h: u32) {
+        if let Some(p) = self.pixel.as_mut() {
+            let _ = p.submit_bgra(bgra, w, h);
+        }
     }
 
     fn write_ppm(&self, path: &Path, w: usize, h: usize, rgb: &[u8]) -> io::Result<()> {

@@ -227,7 +227,11 @@ static const struct drm_connector_funcs igpu_connector_funcs = {
 };
 
 static const struct drm_mode_config_funcs igpu_mode_config_funcs = {
-	.fb_create = drm_gem_fb_create,
+	/* _with_dirty wires drm_atomic_helper_dirtyfb, so fbcon/compositor damage
+	 * (post-modeset console writes) triggers an atomic commit → a present. Without
+	 * it, a directly-scanned-out DMA framebuffer only presents on the boot modeset,
+	 * and a live desktop would freeze after boot. */
+	.fb_create = drm_gem_fb_create_with_dirty,
 	.atomic_check = drm_atomic_helper_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };

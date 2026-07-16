@@ -294,6 +294,7 @@ version = "0.0.0"
 dependencies = [
  "env_logger",
  "infinigpu-abi",
+ "infinigpu-pixel",
  "infinigpu-replay",
  "infinigpu-sched",
  "libc",

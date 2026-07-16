@@ -392,6 +392,12 @@ impl Hub {
         clients.retain(|c| c.tx.send(msg.clone()).is_ok());
     }
 
+    /// Forget the cached keyframe (call when the encoder is re-created for a new
+    /// resolution, so a newly-connecting client isn't primed with a stale-size frame).
+    pub fn reset_keyframe(&self) {
+        *self.last_keyframe.lock().unwrap() = None;
+    }
+
     pub fn client_count(&self) -> usize {
         self.clients.lock().unwrap().len()
     }
@@ -438,6 +444,104 @@ impl Hub {
             thread::spawn(move || hub.register(stream));
         }
         Ok(())
+    }
+}
+
+// ---------------------------------- Streamer ----------------------------------------
+
+/// One-call infiniPixel stream: a persistent WebSocket [`Hub`] plus an [`Encoder`] that
+/// is created (and **re-created on a resolution change**) to match the frames pushed to
+/// it. Push BGRA frames with [`PixelStreamer::submit_bgra`]; connected browsers decode
+/// them live. The server binds the port once, so a resize doesn't drop clients.
+pub struct PixelStreamer {
+    hub: Arc<Hub>,
+    fps: u32,
+    bitrate_kbps: u32,
+    /// The current encoder sink + the (w,h) it is configured for.
+    enc: Option<(FrameSink, u32, u32)>,
+}
+
+impl PixelStreamer {
+    /// Bind the WebSocket server on `0.0.0.0:port`. The encoder is created lazily on
+    /// the first [`submit_bgra`], sized to that frame.
+    pub fn new(fps: u32, bitrate_kbps: u32, port: u16) -> io::Result<Self> {
+        let hub = Hub::new();
+        {
+            let hub = Arc::clone(&hub);
+            let addr = format!("0.0.0.0:{port}");
+            thread::spawn(move || {
+                if let Err(e) = hub.serve(&addr) {
+                    log::error!("infiniPixel server on :{port} failed: {e}");
+                }
+            });
+        }
+        Ok(PixelStreamer {
+            hub,
+            fps,
+            bitrate_kbps,
+            enc: None,
+        })
+    }
+
+    /// Convenience for a fixed-size producer: bind + prime the encoder for `w`×`h`.
+    pub fn start(w: u32, h: u32, fps: u32, bitrate_kbps: u32, port: u16) -> io::Result<Self> {
+        let mut s = Self::new(fps, bitrate_kbps, port)?;
+        s.ensure_encoder(w, h)?;
+        Ok(s)
+    }
+
+    fn ensure_encoder(&mut self, w: u32, h: u32) -> io::Result<()> {
+        if self.enc.as_ref().map(|(_, ew, eh)| (*ew, *eh)) == Some((w, h)) {
+            return Ok(());
+        }
+        // A resolution change: drop the old sink (its ffmpeg exits, its drain thread
+        // ends) and forget the stale-size keyframe, then spin a new encoder onto the
+        // same persistent hub.
+        self.enc = None;
+        self.hub.reset_keyframe();
+
+        let cfg = EncoderConfig {
+            width: w,
+            height: h,
+            fps: self.fps,
+            bitrate_kbps: self.bitrate_kbps,
+            prefer_hardware: true,
+        };
+        let mut enc = Encoder::spawn(&cfg)?;
+        let sink = enc
+            .take_sink()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "encoder sink missing"))?;
+        let hub = Arc::clone(&self.hub);
+        let codec = enc.codec().wire();
+        let us_per_frame = 1_000_000u64 / self.fps.max(1) as u64;
+        thread::spawn(move || {
+            while let Some(au) = enc.recv() {
+                let flags = if au.keyframe { proto::flags::KEYFRAME } else { 0 };
+                let hdr = FrameHeader {
+                    flags,
+                    codec,
+                    frame_seq: au.seq as u32,
+                    width: w as u16,
+                    height: h as u16,
+                    pts_us: au.seq * us_per_frame,
+                    payload_len: au.data.len() as u32,
+                };
+                hub.broadcast(hdr.message(&au.data), au.keyframe);
+            }
+        });
+        self.enc = Some((sink, w, h));
+        Ok(())
+    }
+
+    /// Submit one tightly-packed `w`×`h` BGRA frame; (re)creates the encoder if the
+    /// size changed since the last frame.
+    pub fn submit_bgra(&mut self, bgra: &[u8], w: u32, h: u32) -> io::Result<()> {
+        self.ensure_encoder(w, h)?;
+        self.enc.as_mut().unwrap().0.submit_bgra(bgra)
+    }
+
+    pub fn client_count(&self) -> usize {
+        self.hub.client_count()
     }
 }
 
