@@ -242,6 +242,45 @@ verification: 10 raised, 3 confirmed + fixed):
 - **Startup fairness:** the one-time Vulkan context open is pre-warmed *outside* the broker's
   timed region, so the first tenant isn't billed the init and over-throttled.
 
+### 2026-07-16 — 📡 infiniPixel v0: the owned remote-display protocol (ADR-0009, Phase-1)
+
+`infinigpu-pixel` is the first cut of **infiniPixel** — the owned low-latency datapath that
+replaces SPICE's GPU display path. A host framebuffer is encoded on the GPU's **dedicated NVENC
+block**, wrapped in an **owned frame protocol**, streamed over WebSocket, and decoded in the
+browser with **WebCodecs**. We control all three ends; SPICE (readback → CPU-encode → TCP →
+native viewer) can't.
+
+- **Encode:** H.264 (the ADR's universal fallback; broadest WebCodecs support) on `h264_nvenc`
+  — the A5000's encode engine, separate from the 3D SMs (the ADR-0007 density story). Low-latency
+  config (`-tune ull`, no B-frames, CBR); `libx264` software fallback via `--sw`. Driven through
+  `ffmpeg` for v0 — a codec *backend* (ADR-0008 vendor HAL), not the protocol; a native
+  NVENC/Vulkan-Video FFI backend comes later.
+- **Framing:** `FrameHeader` — an owned 32-byte little-endian header per access unit
+  (magic/version/flags/codec/seq/w/h/pts/len), mirrored byte-for-byte by the JS client. An
+  Annex-B AU splitter (AUD-delimited via `h264_metadata=aud=insert`) turns the encoder's NAL
+  stream into one clean chunk per frame; keyframes are flagged so a client can start decoding.
+- **Transport:** a pure-Rust WebSocket server (`tungstenite`) — the ADR's *mandatory
+  browser-reachable fallback* rung. A `Hub` fans out to all clients and **primes each new client
+  with the last keyframe** so its decoder starts immediately. (WebTransport/QUIC + datagrams/FEC
+  is the v1 target.)
+- **Client:** `client/infinipixel.html` — WebCodecs `VideoDecoder` (`optimizeForLatency`,
+  prefer-hardware) → canvas, building the codec string from the SPS, with a live fps/kbps HUD.
+
+**Validated end to end, headless** (`scripts/infinipixel-test.sh`, no browser): the demo streams
+an animated pattern; a Node client (Node 22 global `WebSocket`) parses the infiniPixel protocol,
+collects 60 access units (`keyframes=2, dims 960×540`), and **ffmpeg decodes all 60 frames** from
+the collected stream — proving encode + own-protocol framing + WebSocket transport + a real client
+parse + valid decodable H.264. `/tmp/infinipixel-frame.png` shows the recovered animated frame.
+Plus 3 unit tests (header round-trip, AU-splitting incl. byte-at-a-time reads). The **browser
+display itself** is unverified-in-browser here (no display), but the exact wire path the browser
+uses is proven by the headless client.
+
+**Deferred to v1 (all in the ADR, none change this datapath):** damage-aware hybrid (idle ⇒ ~0
+bits — the big density win), intra-refresh/GDR (v0 uses periodic IDR for simple client start-up),
+the perceptual/foveation layer, HEVC/AV1 negotiation, WebTransport/QUIC, adaptive control, local
+cursor sprite, and wiring the encoder input to the live device present path (v0 uses a test
+pattern; the frames already exist in `present_scanout`).
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against

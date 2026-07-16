@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>infiniPixel — live viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0a0b0f; color: #e6e8ef;
+    font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  body { display: grid; grid-template-rows: auto 1fr; }
+  header { display: flex; align-items: center; gap: 16px; padding: 10px 16px;
+    border-bottom: 1px solid #1c2030; background: #0d0f16; }
+  header h1 { font-size: 14px; margin: 0; letter-spacing: .5px; font-weight: 600; }
+  header h1 b { color: #5ad1c8; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #444; }
+  .dot.live { background: #35d07f; box-shadow: 0 0 8px #35d07f; }
+  .dot.err  { background: #e5484d; box-shadow: 0 0 8px #e5484d; }
+  .stats { margin-left: auto; display: flex; gap: 18px; color: #8b90a3; }
+  .stats b { color: #e6e8ef; font-weight: 600; }
+  main { display: grid; place-items: center; padding: 16px; min-height: 0; }
+  canvas { max-width: 100%; max-height: 100%; background: #000;
+    border: 1px solid #1c2030; border-radius: 6px; }
+  .msg { color: #8b90a3; text-align: center; }
+  .msg code { color: #5ad1c8; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1><b>infiniPixel</b> live viewer</h1>
+  <div class="stats">
+    <span>codec <b id="codec">—</b></span>
+    <span><b id="res">—</b></span>
+    <span><b id="fps">0</b> fps</span>
+    <span><b id="kbps">0</b> kbps</span>
+    <span>decode <b id="latency">—</b></span>
+  </div>
+</header>
+<main>
+  <canvas id="view" width="960" height="540"></canvas>
+  <div class="msg" id="msg" hidden></div>
+</main>
+<script type="module">
+// infiniPixel v0 browser client: parse the owned frame protocol off a WebSocket and
+// decode H.264 access units with WebCodecs (low-latency) onto a canvas.
+const MAGIC = 0x49504958, HDR = 32;
+const q = new URLSearchParams(location.search);
+const port = q.get('port') || '8090';
+const host = q.get('host') || location.hostname || '127.0.0.1';
+
+const dot = document.getElementById('dot');
+const canvas = document.getElementById('view');
+const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+const msg = document.getElementById('msg');
+const el = (id) => document.getElementById(id);
+const show = (html) => { msg.hidden = false; msg.innerHTML = html; };
+
+if (!('VideoDecoder' in window)) {
+  dot.className = 'dot err';
+  show('This browser has no <code>WebCodecs</code>. Use Chrome/Edge 94+ (or Safari 17+).');
+  throw new Error('no WebCodecs');
+}
+
+let decoder = null, configured = false;
+let bytes = 0, frames = 0, decoded = 0;
+const hex2 = (n) => n.toString(16).padStart(2, '0');
+
+// Build the WebCodecs codec string from the SPS (profile/constraints/level).
+function codecFromSps(au) {
+  for (let i = 0; i + 5 < au.length; i++) {
+    if (au[i] === 0 && au[i + 1] === 0 && au[i + 2] === 1 && (au[i + 3] & 0x1f) === 7) {
+      return 'avc1.' + hex2(au[i + 4]) + hex2(au[i + 5]) + hex2(au[i + 6]);
+    }
+  }
+  return 'avc1.42e01e'; // baseline 3.0 fallback
+}
+
+function ensureDecoder(codecString) {
+  if (configured) return;
+  configured = true;
+  el('codec').textContent = codecString;
+  decoder = new VideoDecoder({
+    output: (frame) => {
+      if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
+      if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
+      ctx.drawImage(frame, 0, 0);
+      frame.close();
+      decoded++;
+    },
+    error: (e) => { dot.className = 'dot err'; show('Decoder error: ' + e.message); },
+  });
+  // Annex-B input (no description); optimize for low latency.
+  decoder.configure({ codec: codecString, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' });
+}
+
+const ws = new WebSocket(`ws://${host}:${port}`);
+ws.binaryType = 'arraybuffer';
+ws.onopen = () => { dot.className = 'dot live'; show('Waiting for a keyframe…'); };
+ws.onclose = () => { dot.className = 'dot'; show('Disconnected. Is <code>infinigpu-pixel-demo</code> running on port ' + port + '?'); };
+ws.onerror = () => { dot.className = 'dot err'; show('Cannot reach <code>ws://' + host + ':' + port + '</code>.'); };
+
+ws.onmessage = (ev) => {
+  const dv = new DataView(ev.data), u8 = new Uint8Array(ev.data);
+  if (dv.getUint32(0, true) !== MAGIC) return;
+  const flags = u8[5];
+  const w = dv.getUint16(12, true), h = dv.getUint16(14, true);
+  const pts = Number(dv.getBigUint64(16, true));
+  const plen = dv.getUint32(24, true);
+  const au = u8.subarray(HDR, HDR + plen);
+  const key = (flags & 1) !== 0;
+
+  if (!configured) {
+    if (!key) return;             // must start on a keyframe
+    ensureDecoder(codecFromSps(au));
+    el('res').textContent = w + '×' + h;
+    msg.hidden = true;
+  }
+  bytes += plen; frames++;
+  try {
+    decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: pts, data: au }));
+  } catch (e) { console.error(e); }
+};
+
+// Stats once per second.
+let lastBytes = 0, lastDecoded = 0;
+setInterval(() => {
+  el('fps').textContent = decoded - lastDecoded;
+  el('kbps').textContent = Math.round((bytes - lastBytes) * 8 / 1000);
+  const q = frames - decoded;
+  el('latency').textContent = q <= 1 ? 'realtime' : q + ' q';
+  lastBytes = bytes; lastDecoded = decoded;
+}, 1000);
+</script>
+</body>
+</html>

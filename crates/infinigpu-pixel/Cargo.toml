@@ -1,0 +1,20 @@
+[package]
+name = "infinigpu-pixel"
+description = "infiniPixel (ADR-0009): the owned low-latency remote-display protocol — NVENC/H.264 encode, an owned frame framing, and a WebSocket transport to a browser WebCodecs client. Replaces SPICE's GPU display path."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+log = "0.4"
+# Pure-Rust WebSocket server (the ADR's mandatory browser-reachable fallback rung;
+# WebTransport/QUIC is the v1 target). No TLS features — ws:// only for now.
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+env_logger = "0.11"
+
+[[bin]]
+name = "infinigpu-pixel-demo"
+path = "src/bin/pixel_demo.rs"

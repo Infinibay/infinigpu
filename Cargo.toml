@@ -5,6 +5,7 @@ members = [
     "crates/infinigpu-ring",
     "crates/infinigpu-replay",
     "crates/infinigpu-sched",
+    "crates/infinigpu-pixel",
     "crates/infinigpu-device",
 ]
 
