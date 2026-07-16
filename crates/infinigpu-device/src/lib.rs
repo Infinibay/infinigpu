@@ -31,6 +31,11 @@ use std::sync::{Arc, Mutex};
 /// working set). A real encoder/3D VM would report more; Phase-0 uses a flat guess.
 pub const VRAM_ESTIMATE_MB: u64 = 256;
 
+/// Number of independent command rings (contexts) this device serves (ADR-0004/0006
+/// multi-ring). Each has its own base + retired register + MSI-X vector (`ctx+1`).
+/// `MAX_CONTEXTS` (63) is the ABI ceiling; MSI-X vector 0 is device/control.
+pub const NUM_CONTEXTS: usize = 8;
+
 /// One physical GPU context shared by every VM's backend. `render_clear` takes
 /// `&self`; the [`GpuBroker`] run-lock guarantees only one submission runs at a time
 /// (cooperative multiplexing, never MPS — ADR-0002/0007), so the inner mutex only
@@ -140,10 +145,12 @@ pub struct InfinigpuBackend {
     global_status: u32,
     irq_mask: u32,
     dbg_dma_addr: u64,
-    /// Command-ring 0 base (guest physical), programmed via `CMD_RING_BASE`.
-    ring0_base: u64,
-    /// Highest retired seqno for command-ring 0 (completion sync via trapped read).
-    ring0_retired: u64,
+    /// Per-context command-ring bases (guest physical), programmed via the per-context
+    /// `CMD_RING_BASE` block. Index = context/ring id (`0..NUM_CONTEXTS`).
+    ring_base: Vec<u64>,
+    /// Per-context highest retired seqno (completion sync via trapped read). Ring 0 is
+    /// also mirrored at the fixed `CMD_RING0_RETIRED` register for the Phase-0 driver.
+    ring_retired: Vec<u64>,
     /// The GPU broker (ADR-0007): admission + fair-share scheduling. Shared across
     /// every VM's backend so they cooperatively share one physical GPU.
     broker: Arc<GpuBroker>,
@@ -218,8 +225,8 @@ impl InfinigpuBackend {
             global_status: regs::global_status::READY,
             irq_mask: 0,
             dbg_dma_addr: 0,
-            ring0_base: 0,
-            ring0_retired: 0,
+            ring_base: vec![0; NUM_CONTEXTS],
+            ring_retired: vec![0; NUM_CONTEXTS],
             broker,
             shared_gpu,
             vm_config,
@@ -272,23 +279,49 @@ impl InfinigpuBackend {
         // slot back to the broker so the capacity is immediately re-admittable.
         self.ticket = None;
         self.admission_denied = false;
+        self.ring_base.iter_mut().for_each(|b| *b = 0);
+        self.ring_retired.iter_mut().for_each(|r| *r = 0);
         // DMA maps persist across device reset (the client re-sends DMA_UNMAP/MAP).
+    }
+
+    /// If `off` falls in the per-context config block region, return `(ctx, field)`
+    /// where `field` is the byte offset within context `ctx`'s block.
+    fn ctx_block(off: u64) -> Option<(usize, u64)> {
+        let base = regs::ctrl::CMD_RING_CFG;
+        let span = NUM_CONTEXTS as u64 * regs::CMD_RING_STRIDE;
+        if (base..base + span).contains(&off) {
+            let rel = off - base;
+            Some(((rel / regs::CMD_RING_STRIDE) as usize, rel % regs::CMD_RING_STRIDE))
+        } else {
+            None
+        }
     }
 
     fn bar0_read_u32(&mut self, off: u64) -> u32 {
         use regs::ctrl::*;
+        // Per-context config block: base + retired readback for ring `ctx`.
+        if let Some((ctx, field)) = Self::ctx_block(off) {
+            return match field {
+                CMD_RING_BASE_LO => (self.ring_base[ctx] & 0xFFFF_FFFF) as u32,
+                CMD_RING_BASE_HI => (self.ring_base[ctx] >> 32) as u32,
+                CMD_RING_RETIRED_LO => (self.ring_retired[ctx] & 0xFFFF_FFFF) as u32,
+                CMD_RING_RETIRED_HI => (self.ring_retired[ctx] >> 32) as u32,
+                _ => 0,
+            };
+        }
         match off {
             DEV_MAGIC => infinigpu_abi::DEV_MAGIC,
             ABI_VERSION => infinigpu_abi::abi_version(),
             DEV_CAPS => regs::PHASE0_DEV_CAPS,
-            NUM_CONTEXTS => 1, // skeleton advertises a single command ring for now
+            NUM_CONTEXTS => crate::NUM_CONTEXTS as u32,
             MAX_RING_ENTRIES => 256,
             BAR2_APERTURE_MB => 0, // no blob aperture yet
             GLOBAL_CTRL => self.global_ctrl,
             GLOBAL_STATUS => self.global_status,
             IRQ_MASK => self.irq_mask,
-            CMD_RING0_RETIRED_LO => (self.ring0_retired & 0xFFFF_FFFF) as u32,
-            CMD_RING0_RETIRED_HI => (self.ring0_retired >> 32) as u32,
+            // Ring 0 retired mirrored at the fixed register for the Phase-0 guest driver.
+            CMD_RING0_RETIRED_LO => (self.ring_retired[0] & 0xFFFF_FFFF) as u32,
+            CMD_RING0_RETIRED_HI => (self.ring_retired[0] >> 32) as u32,
             dbg::DMA_DATA => self.dma.read_u32(self.dbg_dma_addr).unwrap_or(0xFFFF_FFFF),
             _ => 0,
         }
@@ -297,18 +330,35 @@ impl InfinigpuBackend {
     fn bar0_write_u32(&mut self, off: u64, val: u32) {
         use regs::ctrl::*;
 
-        const RING0_BASE_LO: u64 = CMD_RING_CFG + CMD_RING_BASE_LO;
-        const RING0_BASE_HI: u64 = CMD_RING_CFG + CMD_RING_BASE_HI;
-
         // Doorbell page: a trapped write. In the real device this wakes the poller;
-        // here we run the submit engine inline, then raise the matching MSI-X vector.
+        // here we run the submit engine for the addressed ring inline (which raises the
+        // ring's MSI-X vector on completion).
         if (regs::doorbell::PAGE..regs::doorbell::PAGE + 0x1000).contains(&off) {
             if off == regs::doorbell::CTRL {
                 self.raise(0);
             } else if off >= regs::doorbell::CMD_BASE {
-                let vector = ((off - regs::doorbell::CMD_BASE) / 4) as usize + 1;
-                self.process_ring();
-                self.raise(vector);
+                let ctx = ((off - regs::doorbell::CMD_BASE) / 4) as usize;
+                if ctx < crate::NUM_CONTEXTS {
+                    self.process_ring(ctx);
+                    // Signal ring `ctx`'s completion vector (models the poller waking on
+                    // the doorbell and retiring submitted work; guests may instead poll
+                    // this ring's retired register).
+                    self.raise(ctx + 1);
+                }
+            }
+            return;
+        }
+
+        // Per-context config block: program ring `ctx`'s base address.
+        if let Some((ctx, field)) = Self::ctx_block(off) {
+            match field {
+                CMD_RING_BASE_LO => {
+                    self.ring_base[ctx] = (self.ring_base[ctx] & !0xFFFF_FFFF) | u64::from(val)
+                }
+                CMD_RING_BASE_HI => {
+                    self.ring_base[ctx] = (self.ring_base[ctx] & 0xFFFF_FFFF) | (u64::from(val) << 32)
+                }
+                _ => {}
             }
             return;
         }
@@ -325,10 +375,6 @@ impl InfinigpuBackend {
                 if val & 1 != 0 {
                     self.reset_state();
                 }
-            }
-            RING0_BASE_LO => self.ring0_base = (self.ring0_base & !0xFFFF_FFFF) | u64::from(val),
-            RING0_BASE_HI => {
-                self.ring0_base = (self.ring0_base & 0xFFFF_FFFF) | (u64::from(val) << 32)
             }
             IRQ_MASK => self.irq_mask = val,
             dbg::DMA_ADDR_LO => {
@@ -372,24 +418,26 @@ impl InfinigpuBackend {
         }
     }
 
-    /// Phase-0 submit engine: decode the SUBMIT_CMD at command-ring 0's base from
-    /// guest RAM (via the DMA table) and execute it. For `DISPLAY_CLEAR` this renders
-    /// on the GPU and DMA-writes the result to the guest scanout address. The
-    /// production path uses the polled multi-descriptor ring + real Vulkan payloads;
-    /// this drives the whole pipeline end-to-end for bring-up.
-    fn process_ring(&mut self) {
+    /// Phase-0 submit engine for command ring `ctx`: decode the SUBMIT_CMD at that
+    /// ring's base from guest RAM (via the DMA table) and execute it. For `DISPLAY_CLEAR`
+    /// this renders on the GPU and DMA-writes the result to the guest scanout address.
+    /// The production path uses the polled multi-descriptor ring + real Vulkan payloads;
+    /// this drives the whole pipeline end-to-end for bring-up. Completion sets ring
+    /// `ctx`'s retired seqno and raises MSI-X vector `ctx+1`.
+    fn process_ring(&mut self, ctx: usize) {
         use infinigpu_abi::wire::{
             encoding, msg_type, ClearPresent, Descriptor, ScanoutPresent, SubmitCmd,
         };
         use zerocopy::FromBytes;
 
-        log::debug!("process_ring: ring0_base={:#x}", self.ring0_base);
-        if self.ring0_base == 0 {
+        let base = self.ring_base[ctx];
+        log::debug!("process_ring ctx={ctx} base={base:#x}");
+        if base == 0 {
             return;
         }
         let mut db = [0u8; core::mem::size_of::<Descriptor>()];
-        if !self.dma.read(self.ring0_base, &mut db) {
-            log::error!("ring base {:#x} not mapped", self.ring0_base);
+        if !self.dma.read(base, &mut db) {
+            log::error!("ring {ctx} base {base:#x} not mapped");
             return;
         }
         let desc = Descriptor::read_from_bytes(&db).unwrap();
@@ -402,11 +450,11 @@ impl InfinigpuBackend {
             return;
         }
         let mut sb = [0u8; core::mem::size_of::<SubmitCmd>()];
-        if !self.dma.read(self.ring0_base + db.len() as u64, &mut sb) {
+        if !self.dma.read(base + db.len() as u64, &mut sb) {
             return;
         }
         let sc = SubmitCmd::read_from_bytes(&sb).unwrap();
-        let payload_addr = self.ring0_base + desc.data_offset as u64;
+        let payload_addr = base + desc.data_offset as u64;
         match sc.encoding {
             encoding::DISPLAY_CLEAR => {
                 let mut pb = [0u8; core::mem::size_of::<ClearPresent>()];
@@ -414,7 +462,7 @@ impl InfinigpuBackend {
                     return;
                 }
                 let cp = ClearPresent::read_from_bytes(&pb).unwrap();
-                self.render_clear_present(&cp, sc.seqno);
+                self.render_clear_present(&cp, sc.seqno, ctx);
             }
             encoding::DISPLAY_SCANOUT => {
                 let mut pb = [0u8; core::mem::size_of::<ScanoutPresent>()];
@@ -422,7 +470,7 @@ impl InfinigpuBackend {
                     return;
                 }
                 let sp = ScanoutPresent::read_from_bytes(&pb).unwrap();
-                self.present_scanout(&sp, sc.seqno);
+                self.present_scanout(&sp, sc.seqno, ctx);
             }
             other => log::warn!("unsupported encoding {:#x}", other),
         }
@@ -434,7 +482,12 @@ impl InfinigpuBackend {
     /// `INFINIGPU_PRESENT_DIR` is set — write the frame as a PPM so it can be viewed
     /// host-side. This is a **pure 2D scan-out**: no GPU render is implied (the guest
     /// already produced the pixels), matching PHASE-0 Step 3.
-    fn present_scanout(&mut self, sp: &infinigpu_abi::wire::ScanoutPresent, seqno: u64) {
+    fn present_scanout(
+        &mut self,
+        sp: &infinigpu_abi::wire::ScanoutPresent,
+        seqno: u64,
+        ctx: usize,
+    ) {
         use infinigpu_abi::wire::format;
 
         // Admission gate (fail-closed): a VM the broker didn't admit cannot present.
@@ -521,9 +574,9 @@ impl InfinigpuBackend {
             }
         }
 
-        // Publish completion (guest polls CMD_RING0_RETIRED and/or takes MSI-X).
-        self.ring0_retired = seqno;
-        self.raise(1);
+        // Publish completion (guest polls this ring's retired register; the MSI-X is
+        // raised by the doorbell handler).
+        self.ring_retired[ctx] = seqno;
     }
 
     /// Feed one presented frame to the infiniPixel stream. The streamer (re)sizes its
@@ -541,7 +594,12 @@ impl InfinigpuBackend {
         f.write_all(rgb)
     }
 
-    fn render_clear_present(&mut self, cp: &infinigpu_abi::wire::ClearPresent, seqno: u64) {
+    fn render_clear_present(
+        &mut self,
+        cp: &infinigpu_abi::wire::ClearPresent,
+        seqno: u64,
+        ctx: usize,
+    ) {
         log::debug!(
             "  render_clear_present {}x{} scanout={:#x}",
             cp.width,
@@ -582,10 +640,10 @@ impl InfinigpuBackend {
             log::error!("scanout {:#x} not fully mapped", cp.scanout_addr);
             return;
         }
-        // Publish completion: the guest polls CMD_RING0_RETIRED (a non-posted read,
-        // so it also flushes the doorbell write) and/or takes the MSI-X.
-        self.ring0_retired = seqno;
-        self.raise(1);
+        // Publish completion: the guest polls this ring's retired register (a non-posted
+        // read, so it also flushes the doorbell write) and/or takes the MSI-X raised by
+        // the doorbell handler.
+        self.ring_retired[ctx] = seqno;
     }
 }
 
@@ -771,4 +829,67 @@ pub fn serve_with_broker(
     let server = Server::new(socket_path, true, build_irqs(), build_regions())?;
     let mut backend = InfinigpuBackend::with_broker(broker, shared_gpu, vm_config);
     server.run(&mut backend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use infinigpu_abi::regs::{ctrl, CMD_RING_STRIDE};
+
+    fn base_off(ctx: u64) -> u64 {
+        ctrl::CMD_RING_CFG + ctx * CMD_RING_STRIDE + ctrl::CMD_RING_BASE_LO
+    }
+    fn retired_off(ctx: u64) -> u64 {
+        ctrl::CMD_RING_CFG + ctx * CMD_RING_STRIDE + ctrl::CMD_RING_RETIRED_LO
+    }
+
+    #[test]
+    fn advertises_multiple_command_rings() {
+        assert!(NUM_CONTEXTS >= 2, "multi-ring must serve >1 context");
+        let mut b = InfinigpuBackend::new();
+        assert_eq!(b.bar0_read_u32(ctrl::NUM_CONTEXTS), NUM_CONTEXTS as u32);
+    }
+
+    #[test]
+    fn per_context_ring_base_is_independent() {
+        let mut b = InfinigpuBackend::new();
+        // Program three rings with distinct 64-bit bases via their per-context blocks.
+        for ctx in 0..3u64 {
+            let base = 0x1000_0000u64 * (ctx + 1) + 0x40;
+            b.bar0_write_u32(base_off(ctx), (base & 0xFFFF_FFFF) as u32);
+            b.bar0_write_u32(base_off(ctx) + 4, (base >> 32) as u32);
+        }
+        for ctx in 0..3u64 {
+            let want = 0x1000_0000u64 * (ctx + 1) + 0x40;
+            let lo = b.bar0_read_u32(base_off(ctx)) as u64;
+            let hi = b.bar0_read_u32(base_off(ctx) + 4) as u64;
+            assert_eq!((hi << 32) | lo, want, "ring {ctx} base read-back");
+        }
+        assert_ne!(b.ring_base[0], b.ring_base[1], "rings are independent");
+        assert_ne!(b.ring_base[1], b.ring_base[2]);
+    }
+
+    #[test]
+    fn ring0_retired_mirrored_at_legacy_and_per_context_registers() {
+        let mut b = InfinigpuBackend::new();
+        b.ring_retired[0] = 0xDEAD_BEEF_0000_0007;
+        b.ring_retired[3] = 0x0000_0000_0000_002A;
+        // Ring 0 via the fixed Phase-0 register…
+        assert_eq!(b.bar0_read_u32(ctrl::CMD_RING0_RETIRED_LO), 0x0000_0007);
+        assert_eq!(b.bar0_read_u32(ctrl::CMD_RING0_RETIRED_HI), 0xDEAD_BEEF);
+        // …and via ring 0's per-context block…
+        assert_eq!(b.bar0_read_u32(retired_off(0)), 0x0000_0007);
+        // …while ring 3 reports its own retired seqno, independently.
+        assert_eq!(b.bar0_read_u32(retired_off(3)), 0x0000_002A);
+    }
+
+    #[test]
+    fn device_reset_clears_all_rings() {
+        let mut b = InfinigpuBackend::new();
+        b.ring_base[2] = 0xABCD;
+        b.ring_retired[2] = 9;
+        b.reset_state();
+        assert_eq!(b.ring_base[2], 0);
+        assert_eq!(b.ring_retired[2], 0);
+    }
 }

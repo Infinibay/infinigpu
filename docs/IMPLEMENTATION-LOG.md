@@ -337,6 +337,17 @@ not a rewrite:
 The broker-demo prints the GPU HAL caps; unit-tested that consumers query by capability, not
 vendor. This is the "vendors are backends" scaffold ADR-0008 wants from day one.
 
+### 2026-07-16 — 🎚️ multi-ring command scale-out (ADR-0004/0006)
+
+The device advertised `MULTI_RING` but served only ring 0; now it serves **`NUM_CONTEXTS`=8
+independent command rings**. Each context `i` has its own base + retired register in its
+per-context config block (`CMD_RING_CFG + i*0x40`) and its own MSI-X vector (`i+1`); a doorbell
+write to `CMD_BASE + i*4` processes ring `i` and signals vector `i+1`. Ring 0's retired seqno is
+still mirrored at the fixed `CMD_RING0_RETIRED` register so the Phase-0 single-ring guest driver
+is unchanged (verified: `INFINIGPU-KMS: PASS`). Added `ctx_block()` to route the per-context
+register window; `reset_state` clears all rings. 4 GPU-free unit tests
+(advertises 8 rings, independent per-ring bases, ring-0 legacy+block retired mirroring, reset).
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against

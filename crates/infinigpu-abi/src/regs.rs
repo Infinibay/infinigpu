@@ -57,6 +57,12 @@ pub mod ctrl {
     pub const CMD_RING_SIZE: u64 = 0x08;
     pub const CMD_RING_CTRL: u64 = 0x0C;
     pub const CMD_RING_CAPSET: u64 = 0x10;
+    /// Highest retired seqno for *this* context (host-written), pollable per-ring for
+    /// multi-ring completion sync. Context `i` reads it at
+    /// `CMD_RING_CFG + i*CMD_RING_STRIDE + CMD_RING_RETIRED_LO`. Ring 0 is also mirrored
+    /// at the fixed [`CMD_RING0_RETIRED_LO`] for the Phase-0 single-ring guest driver.
+    pub const CMD_RING_RETIRED_LO: u64 = 0x14;
+    pub const CMD_RING_RETIRED_HI: u64 = 0x18;
 }
 
 /// Shared, directly-mmapped index page (`0x2000..0x2FFF`): one
