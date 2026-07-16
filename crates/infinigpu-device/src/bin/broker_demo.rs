@@ -116,8 +116,15 @@ fn act2_fair_share(dur: Duration) {
         )
         .expect("office admitted");
 
-    let dev = gpu.device_name().unwrap_or_else(|| "NO GPU".to_string());
-    println!("  two VMs rendering on the physical GPU: {dev}");
+    // HAL capability probe (ADR-0008): the stack selects by capability, not vendor name.
+    match gpu.caps() {
+        Some(c) => println!(
+            "  GPU backend [HAL]: {} — {} ({}); render={} timestamp-qos={} dma-buf={} global-priority={}",
+            c.vendor, c.device_name, c.driver_name, c.vulkan_render, c.timestamp_queries,
+            c.external_memory, c.global_priority
+        ),
+        None => println!("  GPU backend [HAL]: none available"),
+    }
     println!("  designer: weight 3 (Normal)   office: weight 1 (Interactive, 1.5× boost)");
 
     let workers: Vec<_> = [("designer", [0.0f32, 0.6, 0.8, 1.0]), ("office", [0.8, 0.4, 0.0, 1.0])]

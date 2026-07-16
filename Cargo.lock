@@ -294,6 +294,7 @@ version = "0.0.0"
 dependencies = [
  "env_logger",
  "infinigpu-abi",
+ "infinigpu-hal",
  "infinigpu-pixel",
  "infinigpu-replay",
  "infinigpu-sched",
@@ -305,10 +306,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "infinigpu-hal"
+version = "0.0.0"
+
+[[package]]
 name = "infinigpu-pixel"
 version = "0.0.0"
 dependencies = [
  "env_logger",
+ "infinigpu-hal",
  "log",
  "tungstenite",
 ]
@@ -319,6 +325,7 @@ version = "0.0.0"
 dependencies = [
  "ash",
  "infinigpu-abi",
+ "infinigpu-hal",
 ]
 
 [[package]]

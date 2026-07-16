@@ -320,6 +320,23 @@ v0 proxy for the guest damage map (a real damage-rect path is v1). The guest tes
 live (`56 encoded, N idle-skipped` — skip ratio approaches 100% as the desktop goes idle);
 unit-tested by `idle_skip_drops_unchanged_frames_only`.
 
+### 2026-07-16 — 🔌 vendor HAL: capability traits (ADR-0008)
+
+`infinigpu-hal` — a **pure** trait crate (no `ash`/`ffmpeg`) that keeps the NVIDIA-specific
+render + encode as *backends*, not the architecture. The stack selects by **capability**,
+never by vendor name, so AMD (RADV Vulkan + VA-API/Vulkan-Video) or Intel is a new backend,
+not a rewrite:
+- `GpuBackend` → `GpuCaps { vendor, device/driver, vulkan_render, timestamp_queries,
+  external_memory, global_priority }`. Implemented by `HostGpu` (maps `vk::DriverId` →
+  `Vendor`). Live probe on the A5000: `NVIDIA — NVIDIA RTX A5000; render=true timestamp-qos=true
+  dma-buf=true global-priority=true`.
+- `MediaEncoder` → `CodecCaps { vendor, hardware, encode:[…], low_latency, max_sessions }`.
+  Implemented by the infiniPixel `Encoder` (NVENC vs libx264; `max_sessions = Some(1)` encodes
+  GA102's single NVENC block as the scarce ADR-0007 admission resource; GA102 can't AV1-encode).
+
+The broker-demo prints the GPU HAL caps; unit-tested that consumers query by capability, not
+vendor. This is the "vendors are backends" scaffold ADR-0008 wants from day one.
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against

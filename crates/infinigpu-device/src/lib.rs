@@ -72,6 +72,20 @@ impl SharedGpu {
         }
     }
 
+    /// Lazily open the GPU and return its HAL capabilities (ADR-0008) — vendor, driver,
+    /// render/timestamp/external-memory/priority flags — or `None` if no GPU.
+    pub fn caps(&self) -> Option<infinigpu_hal::GpuCaps> {
+        use infinigpu_hal::GpuBackend;
+        let mut g = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            match HostGpu::open() {
+                Ok(x) => *g = Some(x),
+                Err(_) => return None,
+            }
+        }
+        g.as_ref().map(|x| x.caps())
+    }
+
     /// Lazily open the GPU and return its device name (e.g. "NVIDIA RTX A5000"), or
     /// `None` if no GPU is available.
     pub fn device_name(&self) -> Option<String> {

@@ -9,6 +9,7 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+infinigpu-hal = { path = "../infinigpu-hal" }
 ash = { workspace = true }
 infinigpu-abi = { path = "../infinigpu-abi" }
 

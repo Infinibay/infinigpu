@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/infinigpu-abi",
     "crates/infinigpu-ring",
+    "crates/infinigpu-hal",
     "crates/infinigpu-replay",
     "crates/infinigpu-sched",
     "crates/infinigpu-pixel",

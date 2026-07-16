@@ -349,6 +349,23 @@ impl Drop for Encoder {
     }
 }
 
+impl infinigpu_hal::MediaEncoder for Encoder {
+    fn caps(&self) -> infinigpu_hal::CodecCaps {
+        use infinigpu_hal::{CodecCaps, Vendor, VideoCodec};
+        CodecCaps {
+            // NVENC on the GPU vs. libx264 on the CPU.
+            vendor: if self.hardware { Vendor::Nvidia } else { Vendor::Software },
+            hardware: self.hardware,
+            // v0 encodes H.264 (the universal fallback); HEVC/AV1 are negotiated later.
+            encode: vec![VideoCodec::H264],
+            low_latency: true,
+            // GA102 has a single NVENC block — a scarce, first-class admission resource
+            // (ADR-0007). Software encode is bounded by CPU, not a fixed engine count.
+            max_sessions: if self.hardware { Some(1) } else { None },
+        }
+    }
+}
+
 /// The write side of an [`Encoder`] — a producer thread pushes BGRA frames here.
 pub struct FrameSink {
     stdin: ChildStdin,

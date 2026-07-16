@@ -9,6 +9,7 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+infinigpu-hal = { path = "../infinigpu-hal" }
 log = "0.4"
 # Pure-Rust WebSocket server (the ADR's mandatory browser-reachable fallback rung;
 # WebTransport/QUIC is the v1 target). No TLS features — ws:// only for now.

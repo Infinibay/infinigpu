@@ -1,0 +1,11 @@
+[package]
+name = "infinigpu-hal"
+description = "Vendor HAL (ADR-0008): GpuBackend / MediaEncoder capability-flag traits so the NVIDIA-specific render + encode bits are backends, not the architecture. No GPU/codec deps — pure trait + capability definitions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]

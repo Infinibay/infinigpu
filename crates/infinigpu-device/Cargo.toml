@@ -13,6 +13,7 @@ infinigpu-abi = { path = "../infinigpu-abi" }
 infinigpu-replay = { path = "../infinigpu-replay" }
 infinigpu-sched = { path = "../infinigpu-sched" }
 infinigpu-pixel = { path = "../infinigpu-pixel" }
+infinigpu-hal = { path = "../infinigpu-hal" }
 zerocopy = { workspace = true }
 vfio_user = { workspace = true }
 vfio-bindings = { workspace = true }

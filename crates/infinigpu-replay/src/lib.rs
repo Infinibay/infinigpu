@@ -384,6 +384,33 @@ impl HostGpu {
     }
 }
 
+impl infinigpu_hal::GpuBackend for HostGpu {
+    fn caps(&self) -> infinigpu_hal::GpuCaps {
+        use ash::vk::DriverId;
+        use infinigpu_hal::Vendor;
+        let vendor = match self.driver_id {
+            DriverId::NVIDIA_PROPRIETARY => Vendor::Nvidia,
+            DriverId::MESA_RADV | DriverId::AMD_PROPRIETARY | DriverId::AMD_OPEN_SOURCE => {
+                Vendor::Amd
+            }
+            DriverId::INTEL_OPEN_SOURCE_MESA | DriverId::INTEL_PROPRIETARY_WINDOWS => Vendor::Intel,
+            DriverId::MESA_LLVMPIPE => Vendor::Software,
+            _ => Vendor::Other,
+        };
+        infinigpu_hal::GpuCaps {
+            vendor,
+            device_name: self.device_name.clone(),
+            driver_name: self.driver_name.clone(),
+            vulkan_render: true,
+            // Vulkan core exposes timestamp queries; external memory (dma-buf) and a
+            // global-priority hint are broadly available on the discrete vendors.
+            timestamp_queries: true,
+            external_memory: true,
+            global_priority: matches!(vendor, Vendor::Nvidia | Vendor::Amd | Vendor::Intel),
+        }
+    }
+}
+
 impl Drop for HostGpu {
     fn drop(&mut self) {
         unsafe {
