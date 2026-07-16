@@ -1,0 +1,17 @@
+[package]
+name = "infinigpu-replay"
+description = "Host-side Vulkan replay backend for infinigpu — drives the physical GPU headless (Phase-0 Step 5)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ash = { workspace = true }
+infinigpu-abi = { path = "../infinigpu-abi" }
+
+[[bin]]
+name = "infinigpu-replay-smoke"
+path = "src/bin/smoke.rs"

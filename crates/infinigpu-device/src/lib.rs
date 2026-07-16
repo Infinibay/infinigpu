@@ -1,0 +1,452 @@
+//! # infinigpu-device
+//!
+//! The host device seam (ADR-0001): a **vfio-user PCI device server** that QEMU
+//! attaches to a guest (`-device vfio-user-pci,socket=…`). It implements
+//! [`vfio_user::ServerBackend`] — config space + BAR0 control registers on the
+//! trapped socket path, zero-copy guest-RAM DMA via `mmap`'d memfds ([`dma`]), and
+//! MSI-X completion (hand-rolled capability; per-vector eventfds).
+//!
+//! Verified against `vfio_user` v0.1.3: there is **no ioeventfd doorbell**
+//! (`GET_REGION_IO_FDS` is rejected), so submissions use `POLL_SUBMIT` (the host
+//! polls the shared index page; a trapped doorbell write only wakes an idle poller
+//! — modelled here by an immediate MSI-X raise for the loopback test). The whole
+//! seam is exercised by `tests/loopback.rs` with the in-process `Client`, so it is
+//! validated **before** QEMU exists.
+
+mod config;
+pub mod dma;
+
+use dma::DmaTable;
+use infinigpu_abi::regs;
+use infinigpu_replay::HostGpu;
+use log::info;
+use std::fs::File;
+use std::io::{self, Write};
+use std::mem::size_of;
+use std::path::Path;
+use vfio_bindings::bindings::vfio::{
+    vfio_region_info, VFIO_IRQ_INFO_EVENTFD, VFIO_IRQ_SET_ACTION_TRIGGER,
+    VFIO_IRQ_SET_DATA_EVENTFD, VFIO_PCI_BAR0_REGION_INDEX, VFIO_PCI_BAR1_REGION_INDEX,
+    VFIO_PCI_CONFIG_REGION_INDEX, VFIO_PCI_MSIX_IRQ_INDEX, VFIO_PCI_NUM_IRQS, VFIO_PCI_NUM_REGIONS,
+    VFIO_REGION_INFO_FLAG_READ, VFIO_REGION_INFO_FLAG_WRITE,
+};
+use vfio_user::{DmaMapFlags, DmaUnmapFlags, IrqInfo, Server, ServerBackend, ServerRegion};
+
+/// Test/debug scaffolding registers in a reserved BAR0 sub-range. These let the
+/// loopback test drive DMA through the seam; they are **not** part of the guest ABI
+/// and will be removed once the real ring decoder lands.
+pub mod dbg {
+    /// Program the guest IOVA the debug DMA register operates on (lo/hi halves).
+    pub const DMA_ADDR_LO: u64 = 0x0F00;
+    pub const DMA_ADDR_HI: u64 = 0x0F04;
+    /// Read = load a `u32` from guest RAM at the programmed IOVA (via the DMA table);
+    /// write = store a `u32` there. Proves bidirectional zero-copy DMA.
+    pub const DMA_DATA: u64 = 0x0F08;
+}
+
+/// The infinigpu vfio-user device backend.
+pub struct InfinigpuBackend {
+    config: Vec<u8>,
+    dma: DmaTable,
+    /// Per-vector MSI-X trigger eventfds (index 0 = device/control, 1.. per-context).
+    msix: Vec<Option<File>>,
+    global_ctrl: u32,
+    global_status: u32,
+    irq_mask: u32,
+    dbg_dma_addr: u64,
+    /// Command-ring 0 base (guest physical), programmed via `CMD_RING_BASE`.
+    ring0_base: u64,
+    /// Highest retired seqno for command-ring 0 (completion sync via trapped read).
+    ring0_retired: u64,
+    /// Lazily-opened replay GPU context (only when a render command arrives).
+    gpu: Option<HostGpu>,
+}
+
+impl Default for InfinigpuBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InfinigpuBackend {
+    pub fn new() -> Self {
+        InfinigpuBackend {
+            config: config::build(),
+            dma: DmaTable::new(),
+            msix: (0..config::MSIX_VECTORS).map(|_| None).collect(),
+            global_ctrl: 0,
+            global_status: regs::global_status::READY,
+            irq_mask: 0,
+            dbg_dma_addr: 0,
+            ring0_base: 0,
+            ring0_retired: 0,
+            gpu: None,
+        }
+    }
+
+    /// Raise MSI-X `vector` by writing to its eventfd (QEMU's irqfd delivers it).
+    fn raise(&mut self, vector: usize) {
+        if let Some(Some(f)) = self.msix.get_mut(vector) {
+            let _ = f.write_all(&1u64.to_le_bytes());
+        }
+    }
+
+    fn reset_state(&mut self) {
+        self.global_ctrl = 0;
+        self.global_status = regs::global_status::NEEDS_RESET;
+        // DMA maps persist across device reset (the client re-sends DMA_UNMAP/MAP).
+    }
+
+    fn bar0_read_u32(&mut self, off: u64) -> u32 {
+        use regs::ctrl::*;
+        match off {
+            DEV_MAGIC => infinigpu_abi::DEV_MAGIC,
+            ABI_VERSION => infinigpu_abi::abi_version(),
+            DEV_CAPS => regs::PHASE0_DEV_CAPS,
+            NUM_CONTEXTS => 1, // skeleton advertises a single command ring for now
+            MAX_RING_ENTRIES => 256,
+            BAR2_APERTURE_MB => 0, // no blob aperture yet
+            GLOBAL_CTRL => self.global_ctrl,
+            GLOBAL_STATUS => self.global_status,
+            IRQ_MASK => self.irq_mask,
+            CMD_RING0_RETIRED_LO => (self.ring0_retired & 0xFFFF_FFFF) as u32,
+            CMD_RING0_RETIRED_HI => (self.ring0_retired >> 32) as u32,
+            dbg::DMA_DATA => self.dma.read_u32(self.dbg_dma_addr).unwrap_or(0xFFFF_FFFF),
+            _ => 0,
+        }
+    }
+
+    fn bar0_write_u32(&mut self, off: u64, val: u32) {
+        use regs::ctrl::*;
+
+        const RING0_BASE_LO: u64 = CMD_RING_CFG + CMD_RING_BASE_LO;
+        const RING0_BASE_HI: u64 = CMD_RING_CFG + CMD_RING_BASE_HI;
+
+        // Doorbell page: a trapped write. In the real device this wakes the poller;
+        // here we run the submit engine inline, then raise the matching MSI-X vector.
+        if (regs::doorbell::PAGE..regs::doorbell::PAGE + 0x1000).contains(&off) {
+            if off == regs::doorbell::CTRL {
+                self.raise(0);
+            } else if off >= regs::doorbell::CMD_BASE {
+                let vector = ((off - regs::doorbell::CMD_BASE) / 4) as usize + 1;
+                self.process_ring();
+                self.raise(vector);
+            }
+            return;
+        }
+
+        match off {
+            GLOBAL_CTRL => self.global_ctrl = val,
+            DEVICE_RESET => {
+                if val & 1 != 0 {
+                    self.reset_state();
+                }
+            }
+            RING0_BASE_LO => self.ring0_base = (self.ring0_base & !0xFFFF_FFFF) | u64::from(val),
+            RING0_BASE_HI => {
+                self.ring0_base = (self.ring0_base & 0xFFFF_FFFF) | (u64::from(val) << 32)
+            }
+            IRQ_MASK => self.irq_mask = val,
+            dbg::DMA_ADDR_LO => {
+                self.dbg_dma_addr = (self.dbg_dma_addr & !0xFFFF_FFFF) | u64::from(val)
+            }
+            dbg::DMA_ADDR_HI => {
+                self.dbg_dma_addr = (self.dbg_dma_addr & 0xFFFF_FFFF) | (u64::from(val) << 32)
+            }
+            dbg::DMA_DATA => {
+                self.dma.write_u32(self.dbg_dma_addr, val);
+            }
+            _ => {}
+        }
+    }
+
+    fn read_bar0(&mut self, offset: u64, data: &mut [u8]) {
+        let mut done = 0;
+        while done < data.len() {
+            let cur = offset + done as u64;
+            let aligned = cur & !3;
+            let within = (cur - aligned) as usize;
+            let word = self.bar0_read_u32(aligned).to_le_bytes();
+            let n = core::cmp::min(4 - within, data.len() - done);
+            data[done..done + n].copy_from_slice(&word[within..within + n]);
+            done += n;
+        }
+    }
+
+    fn write_bar0(&mut self, offset: u64, data: &[u8]) {
+        let mut done = 0;
+        while done < data.len() {
+            let cur = offset + done as u64;
+            let aligned = cur & !3;
+            let within = (cur - aligned) as usize;
+            let n = core::cmp::min(4 - within, data.len() - done);
+            // read-modify-write so sub-word writes are safe (doorbells read as 0).
+            let mut word = self.bar0_read_u32(aligned).to_le_bytes();
+            word[within..within + n].copy_from_slice(&data[done..done + n]);
+            self.bar0_write_u32(aligned, u32::from_le_bytes(word));
+            done += n;
+        }
+    }
+
+    /// Phase-0 submit engine: decode the SUBMIT_CMD at command-ring 0's base from
+    /// guest RAM (via the DMA table) and execute it. For `DISPLAY_CLEAR` this renders
+    /// on the GPU and DMA-writes the result to the guest scanout address. The
+    /// production path uses the polled multi-descriptor ring + real Vulkan payloads;
+    /// this drives the whole pipeline end-to-end for bring-up.
+    fn process_ring(&mut self) {
+        use infinigpu_abi::wire::{encoding, msg_type, ClearPresent, Descriptor, SubmitCmd};
+        use zerocopy::FromBytes;
+
+        log::debug!("process_ring: ring0_base={:#x}", self.ring0_base);
+        if self.ring0_base == 0 {
+            return;
+        }
+        let mut db = [0u8; core::mem::size_of::<Descriptor>()];
+        if !self.dma.read(self.ring0_base, &mut db) {
+            log::error!("ring base {:#x} not mapped", self.ring0_base);
+            return;
+        }
+        let desc = Descriptor::read_from_bytes(&db).unwrap();
+        log::debug!(
+            "  desc msg_type={:#x} data_offset={}",
+            desc.msg_type,
+            desc.data_offset
+        );
+        if desc.msg_type != msg_type::SUBMIT_CMD {
+            return;
+        }
+        let mut sb = [0u8; core::mem::size_of::<SubmitCmd>()];
+        if !self.dma.read(self.ring0_base + db.len() as u64, &mut sb) {
+            return;
+        }
+        let sc = SubmitCmd::read_from_bytes(&sb).unwrap();
+        if sc.encoding != encoding::DISPLAY_CLEAR {
+            log::warn!("unsupported encoding {:#x}", sc.encoding);
+            return;
+        }
+        let mut pb = [0u8; core::mem::size_of::<ClearPresent>()];
+        if !self
+            .dma
+            .read(self.ring0_base + desc.data_offset as u64, &mut pb)
+        {
+            return;
+        }
+        let cp = ClearPresent::read_from_bytes(&pb).unwrap();
+        self.render_clear_present(&cp, sc.seqno);
+    }
+
+    fn render_clear_present(&mut self, cp: &infinigpu_abi::wire::ClearPresent, seqno: u64) {
+        log::debug!(
+            "  render_clear_present {}x{} scanout={:#x}",
+            cp.width,
+            cp.height,
+            cp.scanout_addr
+        );
+        if self.gpu.is_none() {
+            info!("  opening replay GPU (first render)…");
+            match HostGpu::open() {
+                Ok(g) => {
+                    info!("replay GPU: {} ({:?})", g.device_name(), g.driver_id());
+                    self.gpu = Some(g);
+                }
+                Err(e) => {
+                    log::error!("cannot open replay GPU: {e}");
+                    return;
+                }
+            }
+        }
+        let frame = match self
+            .gpu
+            .as_ref()
+            .unwrap()
+            .render_clear(cp.width, cp.height, cp.rgba)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("render failed: {e}");
+                return;
+            }
+        };
+        info!(
+            "seqno {seqno}: rendered {}x{} on the GPU → scanout {:#x}",
+            cp.width, cp.height, cp.scanout_addr
+        );
+        if !self.dma.write(cp.scanout_addr, &frame.rgba) {
+            log::error!("scanout {:#x} not fully mapped", cp.scanout_addr);
+            return;
+        }
+        // Publish completion: the guest polls CMD_RING0_RETIRED (a non-posted read,
+        // so it also flushes the doorbell write) and/or takes the MSI-X.
+        self.ring0_retired = seqno;
+        self.raise(1);
+    }
+}
+
+impl ServerBackend for InfinigpuBackend {
+    fn region_read(&mut self, region: u32, offset: u64, data: &mut [u8]) -> io::Result<()> {
+        if region == VFIO_PCI_CONFIG_REGION_INDEX {
+            for (i, b) in data.iter_mut().enumerate() {
+                *b = self.config.get(offset as usize + i).copied().unwrap_or(0);
+            }
+            if offset == 0 && data.len() >= 4 {
+                info!(
+                    "config read @0x00 (PCI enumeration): {:#06x}:{:#06x}",
+                    u16::from_le_bytes([data[0], data[1]]),
+                    u16::from_le_bytes([data[2], data[3]])
+                );
+            }
+        } else if region == VFIO_PCI_BAR0_REGION_INDEX {
+            self.read_bar0(offset, data);
+        } else {
+            data.fill(0);
+        }
+        Ok(())
+    }
+
+    fn region_write(&mut self, region: u32, offset: u64, data: &[u8]) -> io::Result<()> {
+        if region == VFIO_PCI_CONFIG_REGION_INDEX {
+            for (i, b) in data.iter().enumerate() {
+                let idx = offset as usize + i;
+                if idx < self.config.len() {
+                    self.config[idx] = *b;
+                }
+            }
+        } else if region == VFIO_PCI_BAR0_REGION_INDEX {
+            log::debug!("BAR0 write off={:#06x} len={}", offset, data.len());
+            self.write_bar0(offset, data);
+        }
+        Ok(())
+    }
+
+    fn dma_map(
+        &mut self,
+        _flags: DmaMapFlags,
+        offset: u64,
+        address: u64,
+        size: u64,
+        fd: Option<File>,
+    ) -> io::Result<()> {
+        match fd {
+            Some(f) => {
+                info!("DMA_MAP iova={address:#x} size={size:#x} (guest RAM mapped zero-copy)");
+                self.dma.map(address, offset, size, f)
+            }
+            // No fd: a region QEMU can't share by fd (BIOS/ROM shadow, MMIO holes).
+            // Accept as a no-op — we simply never map it, so any guest DMA into it
+            // fails closed at translation time. The device never needs these.
+            None => {
+                log::debug!(
+                    "DMA_MAP iova={address:#x} size={size:#x} without fd — not mappable, ignoring"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn dma_unmap(&mut self, flags: DmaUnmapFlags, address: u64, _size: u64) -> io::Result<()> {
+        info!(
+            "DMA_UNMAP iova={address:#x} all={}",
+            flags.contains(DmaUnmapFlags::UNMAP_ALL)
+        );
+        if flags.contains(DmaUnmapFlags::UNMAP_ALL) {
+            self.dma.clear();
+        } else {
+            self.dma.unmap(address);
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) -> io::Result<()> {
+        info!("DEVICE_RESET");
+        self.reset_state();
+        Ok(())
+    }
+
+    fn set_irqs(
+        &mut self,
+        index: u32,
+        flags: u32,
+        start: u32,
+        count: u32,
+        fds: Vec<File>,
+    ) -> io::Result<()> {
+        if index != VFIO_PCI_MSIX_IRQ_INDEX {
+            return Ok(());
+        }
+        info!(
+            "SET_IRQS msix start={start} count={count} fds={}",
+            fds.len()
+        );
+        if flags & (VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER) != 0 && !fds.is_empty()
+        {
+            for (i, f) in fds.into_iter().enumerate() {
+                let v = start as usize + i;
+                if v < self.msix.len() {
+                    self.msix[v] = Some(f);
+                }
+            }
+        } else {
+            // Disable the requested range.
+            for v in start..start + count {
+                if let Some(slot) = self.msix.get_mut(v as usize) {
+                    *slot = None;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The 9 PCI regions (config + BARs). BAR0 = control/index/doorbell, BAR1 = MSI-X.
+pub fn build_regions() -> Vec<ServerRegion> {
+    let rw = VFIO_REGION_INFO_FLAG_READ | VFIO_REGION_INFO_FLAG_WRITE;
+    (0..VFIO_PCI_NUM_REGIONS)
+        .map(|index| {
+            let mut ri = vfio_region_info {
+                argsz: size_of::<vfio_region_info>() as u32,
+                index,
+                ..Default::default()
+            };
+            if index == VFIO_PCI_BAR0_REGION_INDEX {
+                ri.size = regs::BAR0_SIZE;
+                ri.flags = rw;
+            } else if index == VFIO_PCI_BAR1_REGION_INDEX {
+                ri.size = regs::BAR1_SIZE;
+                ri.flags = rw;
+            } else if index == VFIO_PCI_CONFIG_REGION_INDEX {
+                ri.size = config::CONFIG_SPACE_SIZE as u64;
+                ri.flags = rw;
+            }
+            ServerRegion {
+                region_info: ri,
+                sparse_areas: Vec::new(),
+                mmap_fd: None,
+            }
+        })
+        .collect()
+}
+
+/// IRQ descriptors: MSI-X with [`config::MSIX_VECTORS`] eventfd vectors.
+pub fn build_irqs() -> Vec<IrqInfo> {
+    (0..VFIO_PCI_NUM_IRQS)
+        .map(|index| {
+            let mut irq = IrqInfo {
+                index,
+                count: 0,
+                flags: 0,
+            };
+            if index == VFIO_PCI_MSIX_IRQ_INDEX {
+                irq.count = config::MSIX_VECTORS as u32;
+                irq.flags = VFIO_IRQ_INFO_EVENTFD;
+            }
+            irq
+        })
+        .collect()
+}
+
+/// Bind a server at `socket_path` and serve one QEMU connection (blocking).
+pub fn serve(socket_path: &Path) -> Result<(), vfio_user::Error> {
+    let server = Server::new(socket_path, true, build_irqs(), build_regions())?;
+    let mut backend = InfinigpuBackend::new();
+    server.run(&mut backend)
+}

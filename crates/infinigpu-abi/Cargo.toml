@@ -1,0 +1,15 @@
+[package]
+name = "infinigpu-abi"
+description = "no_std, no-alloc wire ABI (register map + zerocopy framing) shared by the infinigpu host backend and both guest drivers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+zerocopy = { workspace = true }

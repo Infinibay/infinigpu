@@ -1,0 +1,40 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.orig
+*.rs.bk
+*.pdb
+
+# Linux kernel module build artifacts (out-of-tree build under guest/linux/)
+*.ko
+*.o
+*.mod
+*.mod.c
+.*.cmd
+*.symvers
+modules.order
+.tmp_versions/
+
+# Build / cross-compile artifacts
+/dist/
+*.sys
+*.inf.bak
+*.cat
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local env / secrets
+.env
+.env.local
+
+# Never commit the research book corpus or scratch extracts
+/books/
+/Libros/
+*.pdf
+
+# Logs
+*.log

@@ -1,0 +1,29 @@
+[package]
+name = "infinigpu-device"
+description = "The infinigpu host device: a vfio-user PCI device server (ADR-0001) that QEMU attaches to a guest."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+infinigpu-abi = { path = "../infinigpu-abi" }
+infinigpu-replay = { path = "../infinigpu-replay" }
+zerocopy = { workspace = true }
+vfio_user = { workspace = true }
+vfio-bindings = { workspace = true }
+libc = { workspace = true }
+log = "0.4"
+env_logger = "0.11"
+
+[[bin]]
+name = "infinigpu-device"
+path = "src/bin/device.rs"
+
+# End-to-end host pipeline: guest-RAM ring → device DMA/decode → A5000 render →
+# scanout write-back. Requires a GPU; drives the backend in-process (no socket).
+[[bin]]
+name = "infinigpu-pipeline-demo"
+path = "src/bin/pipeline_demo.rs"

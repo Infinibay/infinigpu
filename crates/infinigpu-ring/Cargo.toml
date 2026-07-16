@@ -1,0 +1,20 @@
+[package]
+name = "infinigpu-ring"
+description = "no_std single-producer/single-consumer descriptor ring + seqno completion for infinigpu, with loom-checked memory ordering."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lints.rust]
+# `loom` is a custom cfg set via RUSTFLAGS="--cfg loom" for model-checking.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[dependencies]
+infinigpu-abi = { path = "../infinigpu-abi" }
+
+# Pulled in only under `--cfg loom` for the memory-ordering model checks.
+[target.'cfg(loom)'.dependencies]
+loom = { workspace = true }

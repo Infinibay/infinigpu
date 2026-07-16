@@ -1,0 +1,26 @@
+/* Cross-language ABI conformance: the C view (generated from infinigpu-abi by
+ * cbindgen) must have the exact byte layout the Rust side asserts. Compile with:
+ *   cc -std=c11 -I guest/include guest/include/abi_conformance.c -o /tmp/abiconf
+ * A build failure here means the Rust ABI and the generated C header drifted.
+ * Mirrors infiniservice's cross-language HMAC test. */
+#include <stddef.h>
+#include "infinigpu_abi.h"
+
+_Static_assert(sizeof(struct Descriptor) == 32, "Descriptor size");
+_Static_assert(offsetof(struct Descriptor, seqno) == 16, "Descriptor.seqno offset");
+
+_Static_assert(sizeof(struct MsgHeader) == 8, "MsgHeader size");
+
+_Static_assert(sizeof(struct SubmitCmd) == 40, "SubmitCmd size");
+_Static_assert(offsetof(struct SubmitCmd, seqno) == 16, "SubmitCmd.seqno offset");
+_Static_assert(offsetof(struct SubmitCmd, out_fence) == 32, "SubmitCmd.out_fence offset");
+
+_Static_assert(sizeof(struct ClearPresent) == 32, "ClearPresent size");
+_Static_assert(offsetof(struct ClearPresent, rgba) == 8, "ClearPresent.rgba offset");
+_Static_assert(offsetof(struct ClearPresent, scanout_addr) == 24, "ClearPresent.scanout_addr offset");
+
+_Static_assert(sizeof(struct ResourceCreateBlob) == 24, "ResourceCreateBlob size");
+_Static_assert(sizeof(struct SetScanoutBlob) == 24, "SetScanoutBlob size");
+_Static_assert(sizeof(struct ResourceFlush) == 24, "ResourceFlush size");
+
+int main(void) { return 0; }

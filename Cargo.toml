@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/infinigpu-abi",
+    "crates/infinigpu-ring",
+    "crates/infinigpu-replay",
+    "crates/infinigpu-device",
+]
+
+# Crates added as their Phase-0 step comes online:
+#   infinigpu-proto   — postcard control messages (no_std + alloc)
+#   infinigpu-device  — vfio-user server (host, std)          [Step 1, needs QEMU >= 10.1.1]
+#   infinigpu-replay  — headless Vulkan replay (host, std)    [Step 5, runs on the A5000 now]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Infinibay/infinigpu"
+authors = ["Infinibay"]
+rust-version = "1.90"
+
+[workspace.dependencies]
+# Fixed-layout wire framing in shared memory. no_std, no alloc; unsafe is Miri/Kani-verified.
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+# Loom is only pulled in under `cfg(loom)` for the ring's memory-ordering model checks.
+loom = "0.7"
+# Vulkan bindings for the host replay backend (loads libvulkan.so.1 at runtime).
+ash = "0.38"
+# vfio-user device-side server + client (the host device seam, ADR-0001).
+# Published crate name uses an underscore.
+vfio_user = "0.1.3"
+# Must match the version vfio_user 0.1.3 resolves to, so `vfio_region_info` etc. are the same type.
+vfio-bindings = "=0.6.2"
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1

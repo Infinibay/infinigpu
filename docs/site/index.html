@@ -1,0 +1,711 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>infinigpu — Una GPU, muchos escritorios</title>
+<style>
+  :root{
+    --ink:#16131f; --ink-1:#1b1729; --ink-2:#221c33; --ink-3:#2d2542;
+    --line:#372e50; --line-2:#463a63;
+    --text:#ece7f4; --muted:#9a90b4; --faint:#6f6689;
+    --guest:#f2b45c;         /* ámbar: el guest, la luz, lo que ve el usuario */
+    --guest-dim:#7a5a2b;
+    --host:#57d4cf;          /* cian: el host, el cómputo, la GPU real */
+    --host-dim:#2c6e6b;
+    --silicon:#9d80f7;       /* violeta: el silicio, raro */
+    --good:#63d29b; --warn:#f2b45c; --bad:#f0796b;
+    --maxw:1120px;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--ink);color:var(--text);font-family:var(--sans);
+    font-size:17px;line-height:1.65;-webkit-font-smoothing:antialiased;
+    background-image:
+      radial-gradient(1100px 600px at 82% -8%, rgba(87,212,207,.10), transparent 60%),
+      radial-gradient(900px 500px at 6% 4%, rgba(242,180,92,.09), transparent 55%);
+    background-attachment:fixed;
+  }
+  /* faint pixel-grid texture — the ambient signature */
+  body::before{
+    content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.5;
+    background-image:linear-gradient(rgba(255,255,255,.020) 1px,transparent 1px),
+                     linear-gradient(90deg,rgba(255,255,255,.020) 1px,transparent 1px);
+    background-size:44px 44px;mask-image:radial-gradient(circle at 50% 30%,#000,transparent 90%);
+  }
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 26px;position:relative;z-index:1}
+  a{color:var(--host);text-decoration:none}
+  a:hover{text-decoration:underline}
+  h1,h2,h3{line-height:1.1;letter-spacing:-.02em;font-weight:800;margin:0}
+  .mono{font-family:var(--mono)}
+  .eyebrow{font-family:var(--mono);font-size:12.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);display:inline-flex;gap:.6em;align-items:center}
+  .eyebrow .addr{color:var(--host)}
+
+  /* ---------- top bar ---------- */
+  header.top{position:sticky;top:0;z-index:30;backdrop-filter:blur(10px);
+    background:rgba(22,19,31,.72);border-bottom:1px solid var(--line)}
+  .top .wrap{display:flex;align-items:center;justify-content:space-between;height:60px}
+  .brand{display:flex;align-items:center;gap:11px;font-weight:800;letter-spacing:-.02em}
+  .brand .dot{width:26px;height:26px;border-radius:7px;flex:0 0 auto;
+    background:conic-gradient(from 210deg,var(--guest),var(--host),var(--silicon),var(--guest));
+    box-shadow:0 0 22px rgba(87,212,207,.35)}
+  .brand small{color:var(--muted);font-weight:500;font-family:var(--mono);font-size:12px}
+  nav.links{display:flex;gap:22px;font-size:14px}
+  nav.links a{color:var(--muted)} nav.links a:hover{color:var(--text);text-decoration:none}
+  @media(max-width:760px){nav.links{display:none}}
+
+  /* ---------- hero ---------- */
+  .hero{padding:76px 0 34px}
+  .hero h1{font-size:clamp(42px,7.5vw,84px);letter-spacing:-.035em}
+  .hero h1 .g{color:var(--guest)} .hero h1 .h{color:var(--host)}
+  .lede{font-size:clamp(18px,2.4vw,22px);color:var(--muted);max-width:60ch;margin:22px 0 0}
+  .lede b{color:var(--text);font-weight:600}
+  .herogrid{display:grid;grid-template-columns:1.05fr .95fr;gap:40px;align-items:center}
+  @media(max-width:900px){.herogrid{grid-template-columns:1fr;gap:26px}}
+  .chips{display:flex;flex-wrap:wrap;gap:9px;margin-top:26px}
+  .chip{font-family:var(--mono);font-size:12.5px;color:var(--muted);border:1px solid var(--line-2);
+    border-radius:999px;padding:6px 13px;background:var(--ink-1)}
+  .chip b{color:var(--text);font-weight:600}
+
+  /* hero diagram */
+  .fan{width:100%;height:auto;filter:drop-shadow(0 18px 40px rgba(0,0,0,.45))}
+  .flow{stroke-dasharray:5 9;animation:flow 1.1s linear infinite}
+  @keyframes flow{to{stroke-dashoffset:-14}}
+  .scr{fill:var(--ink-2);stroke:var(--line-2)}
+  .scrlit{fill:#20334a;stroke:var(--host)}
+
+  /* ---------- sections ---------- */
+  section{padding:58px 0;border-top:1px solid var(--line)}
+  .sec-h{max-width:74ch;margin-bottom:30px}
+  .sec-h h2{font-size:clamp(27px,4vw,40px);margin:12px 0 0}
+  .sec-h p.sub{color:var(--muted);font-size:clamp(16px,2vw,18.5px);margin:16px 0 0;max-width:66ch}
+  .lead-word{color:var(--guest);font-weight:700}
+
+  p{margin:16px 0}
+  .analogy{border-left:3px solid var(--guest);background:linear-gradient(90deg,rgba(242,180,92,.07),transparent);
+    padding:13px 18px;border-radius:0 10px 10px 0;color:#f4ead8;font-size:16px;margin:20px 0}
+  .analogy b{color:var(--guest)}
+
+  /* cards */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px;margin-top:22px}
+  .card{background:var(--ink-1);border:1px solid var(--line);border-radius:14px;padding:20px}
+  .card h4{margin:0 0 6px;font-size:16.5px;letter-spacing:-.01em}
+  .card p{margin:6px 0 0;font-size:14.5px;color:var(--muted)}
+  .card .tag{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase}
+  .verdict-bad .tag{color:var(--bad)} .verdict-good .tag{color:var(--good)}
+  .card.verdict-good{border-color:var(--host-dim)}
+  .card.verdict-bad{border-color:#5a3630}
+
+  /* diagram frame */
+  figure{margin:26px 0 0;background:var(--ink-1);border:1px solid var(--line);border-radius:16px;padding:22px;overflow-x:auto}
+  figure figcaption{color:var(--muted);font-size:13.5px;margin-top:14px;font-family:var(--mono)}
+  .flowsteps{display:flex;align-items:stretch;gap:0;min-width:640px}
+  .step{flex:1;text-align:center;position:relative;padding:0 6px}
+  .step .bubble{border:1px solid var(--line-2);border-radius:12px;padding:12px 8px;background:var(--ink-2);height:100%}
+  .step .k{font-family:var(--mono);font-size:11px;color:var(--host);letter-spacing:.08em;text-transform:uppercase}
+  .step .t{font-size:13.5px;color:var(--muted);margin-top:6px}
+  .step:not(:last-child)::after{content:"→";position:absolute;right:-8px;top:50%;transform:translateY(-50%);color:var(--faint);font-size:18px;z-index:2}
+
+  /* stack diagram */
+  .stack{display:grid;gap:10px;margin-top:8px}
+  .layer{display:grid;grid-template-columns:150px 1fr;gap:16px;align-items:center;border:1px solid var(--line);
+    border-radius:12px;padding:14px 16px;background:var(--ink-1)}
+  .layer .who{font-family:var(--mono);font-size:12.5px;letter-spacing:.06em}
+  .layer .desc{color:var(--muted);font-size:14.5px}
+  .layer.guest{border-left:3px solid var(--guest)} .layer.guest .who{color:var(--guest)}
+  .layer.host{border-left:3px solid var(--host)} .layer.host .who{color:var(--host)}
+  .layer.wire{border-left:3px solid var(--silicon)} .layer.wire .who{color:var(--silicon)}
+  @media(max-width:640px){.layer{grid-template-columns:1fr;gap:4px}}
+
+  /* register mini */
+  .regmap{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:8px;font-family:var(--mono);font-size:12.5px}
+  .reg{border:1px solid var(--line-2);border-radius:10px;padding:11px 13px;background:var(--ink-2)}
+  .reg .off{color:var(--host)} .reg .nm{color:var(--text);display:block;margin-top:3px;font-size:13px}
+  .reg .note{color:var(--faint);display:block;margin-top:4px}
+  .reg.fast{border-color:var(--host-dim);background:#152a2a}
+  .reg.fast .off{color:#79e6e1}
+
+  /* foveation mockup ("pantalla") */
+  .screen{border:1px solid var(--line-2);border-radius:14px;padding:14px;background:#0e0c16;box-shadow:inset 0 0 60px rgba(0,0,0,.5)}
+  .screen .bar{display:flex;gap:6px;margin-bottom:12px}
+  .screen .bar i{width:11px;height:11px;border-radius:50%;background:var(--line-2);display:inline-block}
+  .fov{display:grid;grid-template-columns:repeat(12,1fr);gap:3px;aspect-ratio:16/9}
+  .fov span{border-radius:2px;background:var(--host)}
+  .caplbl{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-top:10px;text-align:center}
+
+  /* scheduler mockup */
+  .sched{display:grid;gap:9px;margin-top:6px}
+  .vmrow{display:grid;grid-template-columns:120px 1fr auto;gap:12px;align-items:center;font-size:13.5px}
+  .vmrow .nm{font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+  .track{height:16px;border-radius:8px;background:var(--ink-3);overflow:hidden;position:relative}
+  .track i{display:block;height:100%;border-radius:8px}
+  .vmrow .pct{font-family:var(--mono);font-size:12px;color:var(--faint);min-width:44px;text-align:right}
+  .badge{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;border-radius:6px}
+  .badge.fg{background:rgba(242,180,92,.16);color:var(--guest)}
+  .badge.th{background:rgba(240,121,107,.14);color:var(--bad)}
+
+  /* comparison table */
+  .tbl{width:100%;border-collapse:collapse;margin-top:22px;font-size:14.5px;min-width:560px}
+  .tbl th,.tbl td{padding:12px 12px;text-align:left;border-bottom:1px solid var(--line)}
+  .tbl th{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600}
+  .tbl td:first-child{font-weight:600}
+  .yes{color:var(--good)} .no{color:var(--bad)} .meh{color:var(--warn)}
+  .tbl tr.us td{background:linear-gradient(90deg,rgba(87,212,207,.08),transparent)}
+  .tbl tr.us td:first-child{color:var(--host)}
+  .scrollx{overflow-x:auto}
+
+  /* callout */
+  .callout{border:1px solid var(--line-2);border-radius:16px;padding:24px 26px;margin-top:20px;
+    background:linear-gradient(180deg,var(--ink-1),var(--ink))}
+  .callout.honest{border-color:#5a4a2c;background:linear-gradient(180deg,rgba(242,180,92,.08),var(--ink))}
+  .callout h3{font-size:20px;margin-bottom:8px}
+  .verdicts{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px}
+  @media(max-width:640px){.verdicts{grid-template-columns:1fr}}
+  .vd{border-radius:12px;padding:16px;border:1px solid var(--line)}
+  .vd .lbl{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase}
+  .vd.nogo{border-color:#5a3630;background:rgba(240,121,107,.06)} .vd.nogo .lbl{color:var(--bad)}
+  .vd.go{border-color:var(--host-dim);background:rgba(87,212,207,.06)} .vd.go .lbl{color:var(--good)}
+  .vd p{font-size:14px;color:var(--muted);margin:8px 0 0}
+
+  /* timeline */
+  .tl{display:grid;gap:0;margin-top:10px}
+  .ph{display:grid;grid-template-columns:88px 1fr;gap:18px;padding:16px 0;border-top:1px dashed var(--line)}
+  .ph:first-child{border-top:none}
+  .ph .p{font-family:var(--mono);font-size:12.5px;color:var(--host);letter-spacing:.05em;padding-top:2px}
+  .ph h4{margin:0 0 4px;font-size:16.5px}
+  .ph p{margin:0;color:var(--muted);font-size:14.5px}
+  .ph .p b{display:block;color:var(--faint);font-weight:400;font-size:11px;margin-top:3px}
+
+  /* problems */
+  .prob{display:grid;grid-template-columns:1fr;gap:14px;margin-top:22px}
+  .pcard{border:1px solid var(--line);border-radius:14px;padding:18px 20px;background:var(--ink-1);display:grid;grid-template-columns:auto 1fr;gap:16px;align-items:start}
+  .pcard .ic{width:40px;height:40px;border-radius:10px;display:grid;place-items:center;font-size:19px;flex:0 0 auto;background:var(--ink-3)}
+  .pcard h4{margin:0 0 5px;font-size:16.5px}
+  .pcard p{margin:0;color:var(--muted);font-size:14.5px}
+  .pcard .fix{color:var(--host);font-family:var(--mono);font-size:12.5px;margin-top:8px;display:block}
+
+  footer{border-top:1px solid var(--line);padding:40px 0 70px;color:var(--muted);font-size:14px}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:24px;justify-content:space-between;align-items:flex-start}
+  footer b{color:var(--text)}
+  .kv{font-family:var(--mono);font-size:12.5px;color:var(--faint)}
+  .reveal{opacity:0;transform:translateY(14px);transition:opacity .6s ease,transform .6s ease}
+  .reveal.in{opacity:1;transform:none}
+  @media(prefers-reduced-motion:reduce){
+    .reveal{opacity:1;transform:none;transition:none}.flow{animation:none}html{scroll-behavior:auto}
+  }
+  /* ---------- interactive controls ---------- */
+  .ctrls{display:flex;flex-wrap:wrap;gap:14px 22px;align-items:center;margin:18px 0 6px}
+  .seg{display:inline-flex;border:1px solid var(--line-2);border-radius:10px;overflow:hidden}
+  .seg button{background:var(--ink-2);color:var(--muted);border:0;padding:8px 15px;font-family:var(--mono);font-size:12.5px;cursor:pointer;transition:background .2s,color .2s}
+  .seg button:hover{color:var(--text)}
+  .seg button[aria-pressed="true"]{background:var(--guest);color:#1a1206;font-weight:600}
+  .slider{display:flex;align-items:center;gap:12px;font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+  input[type=range]{-webkit-appearance:none;appearance:none;height:5px;border-radius:5px;background:var(--line-2);width:170px;outline:none;cursor:pointer}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:17px;height:17px;border-radius:50%;background:var(--host);cursor:pointer;box-shadow:0 0 12px rgba(87,212,207,.55)}
+  input[type=range]::-moz-range-thumb{width:17px;height:17px;border:0;border-radius:50%;background:var(--host);cursor:pointer}
+  .readout{font-family:var(--mono);font-size:13px;color:var(--muted)} .readout b{color:var(--host)}
+  .track i{transition:width .55s cubic-bezier(.4,0,.2,1),background .3s}
+  .degr{margin-top:14px;font-family:var(--mono);font-size:12.5px;color:var(--muted);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .degr .lv{padding:3px 9px;border-radius:7px;border:1px solid var(--line-2);color:var(--faint)}
+  .degr .lv.on{border-color:var(--guest);color:var(--guest);background:rgba(242,180,92,.1)}
+  .dgrid{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:14px;align-items:end}
+  @media(max-width:640px){.dgrid{grid-template-columns:1fr}}
+  .big{font-family:var(--mono);font-weight:800;letter-spacing:-.03em;font-size:clamp(30px,6vw,52px);line-height:1}
+  .big.guest{color:var(--guest)} .big.host{color:var(--host)}
+  .big small{font-size:15px;color:var(--faint);font-weight:500;letter-spacing:0}
+  .kcap{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);margin-top:6px}
+  .hint{font-family:var(--mono);font-size:11.5px;color:var(--host);opacity:.85}
+  .fov span{transition:opacity .18s,transform .18s,filter .18s,box-shadow .18s}
+  #fov{cursor:crosshair;touch-action:none}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <div class="brand"><span class="dot"></span> infinigpu <small>/ vdi · gpu sharing</small></div>
+    <nav class="links">
+      <a href="#idea">La idea</a><a href="#reparto">Reparto</a>
+      <a href="#pixel">infiniPixel</a><a href="#ojo">El ojo</a>
+      <a href="#duro">Problemas</a><a href="#plan">Plan</a>
+    </nav>
+  </div>
+</header>
+
+<!-- HERO -->
+<div class="hero"><div class="wrap herogrid">
+  <div>
+    <div class="eyebrow"><span class="addr">0x00</span> El resumen en una frase</div>
+    <h1 style="margin-top:16px">Una <span class="g">GPU</span>.<br>Muchos <span class="h">escritorios</span>.</h1>
+    <p class="lede">infinigpu es un driver de GPU <b>100% propio, en Rust</b>, que le permite a un solo servidor
+      Linux <b>repartir su(s) GPU entre muchas máquinas virtuales</b> — escritorios Windows y Linux — de forma
+      inteligente. Sin licencias por-VM. Sin depender de ningún driver experimental ajeno.</p>
+    <div class="chips">
+      <span class="chip"><b>Rust</b> en casi todo</span>
+      <span class="chip"><b>Windows</b> + <b>Linux</b> guests</span>
+      <span class="chip"><b>NVIDIA · AMD · Intel</b></span>
+      <span class="chip">Protocolo de imagen propio</span>
+    </div>
+  </div>
+  <div>
+    <!-- signature: una GPU -> muchos escritorios, con la señal viajando -->
+    <svg class="fan" viewBox="0 0 420 320" role="img" aria-label="Una GPU repartida entre varios escritorios virtuales">
+      <defs>
+        <linearGradient id="sig" x1="0" x2="1">
+          <stop offset="0" stop-color="#57d4cf"/><stop offset="1" stop-color="#f2b45c"/>
+        </linearGradient>
+      </defs>
+      <!-- the GPU core -->
+      <rect x="26" y="128" width="96" height="66" rx="12" fill="#152a2a" stroke="#57d4cf" stroke-width="1.5"/>
+      <text x="74" y="156" text-anchor="middle" fill="#79e6e1" font-family="ui-monospace,monospace" font-size="12">GPU</text>
+      <text x="74" y="174" text-anchor="middle" fill="#9a90b4" font-family="ui-monospace,monospace" font-size="10">A5000 ×2</text>
+      <!-- signal paths -->
+      <g fill="none" stroke="url(#sig)" stroke-width="2">
+        <path class="flow" d="M122 150 C 190 120, 210 60, 300 58"/>
+        <path class="flow" d="M122 158 C 200 150, 220 128, 300 130"/>
+        <path class="flow" d="M122 168 C 200 175, 220 198, 300 202"/>
+        <path class="flow" d="M122 176 C 190 210, 210 270, 300 274"/>
+      </g>
+      <!-- VM screens -->
+      <g>
+        <rect class="scrlit" x="300" y="34" width="96" height="52" rx="7" stroke-width="1.4"/>
+        <rect class="scr" x="300" y="106" width="96" height="52" rx="7" stroke-width="1.4"/>
+        <rect class="scrlit" x="300" y="178" width="96" height="52" rx="7" stroke-width="1.4"/>
+        <rect class="scr" x="300" y="250" width="96" height="52" rx="7" stroke-width="1.4"/>
+        <g fill="#3a3350"><rect x="308" y="44" width="52" height="4" rx="2"/><rect x="308" y="116" width="52" height="4" rx="2"/><rect x="308" y="188" width="52" height="4" rx="2"/><rect x="308" y="260" width="52" height="4" rx="2"/></g>
+      </g>
+      <text x="348" y="316" text-anchor="middle" fill="#6f6689" font-family="ui-monospace,monospace" font-size="10">VMs (escritorios)</text>
+    </svg>
+  </div>
+</div></div>
+
+<!-- 0x01 PROBLEMA -->
+<section id="problema"><div class="wrap">
+  <div class="sec-h reveal">
+    <div class="eyebrow"><span class="addr">0x01</span> El problema</div>
+    <h2>Un escritorio necesita GPU. Y una GPU no se comparte sola.</h2>
+    <p class="sub">Infinibay corre escritorios de verdad (VMs). Cualquier escritorio moderno necesita GPU:
+      componer la pantalla, el navegador, <b>vídeo</b> (Teams, Zoom, YouTube), 3D/CAD, IA. El problema es que
+      una GPU física, por defecto, atiende a <b>una sola</b> VM a la vez.</p>
+  </div>
+  <p class="analogy"><b>Piénsalo así:</b> la GPU es una única cocina profesional carísima. Tienes muchos
+    comensales (las VMs) que quieren cocinar a la vez. Darle la cocina entera a uno solo desperdicia todo;
+    lo que hace falta es un <b>chef que reparta la cocina</b> entre todos, con criterio.</p>
+  <div class="cards">
+    <div class="card"><span class="tag" style="color:var(--host)">densidad</span><h4>La densidad es el negocio</h4><p>El VDI vive de meter muchos escritorios por servidor. Si cada GPU sirve a una sola VM, no hay densidad — no hay VDI.</p></div>
+    <div class="card"><span class="tag" style="color:var(--guest)">heterogéneo</span><h4>No todos piden lo mismo</h4><p>El oficinista casi no usa GPU; el diseñador la exprime a ráfagas. Repartir bien significa entender <em>quién</em> pide <em>qué</em>.</p></div>
+    <div class="card"><span class="tag" style="color:var(--silicon)">interactivo</span><h4>Se siente al instante</h4><p>Un escritorio se toca. El retardo entre mover el mouse y ver el pixel (input→foto) tiene que ser mínimo.</p></div>
+  </div>
+</div></section>
+
+<!-- 0x02 POR QUE LO DE SIEMPRE NO SIRVE -->
+<section id="alternativas"><div class="wrap">
+  <div class="sec-h reveal">
+    <div class="eyebrow"><span class="addr">0x02</span> Por qué lo de siempre no sirve</div>
+    <h2>Las opciones existentes fallan, cada una a su manera.</h2>
+    <p class="sub">Antes de inventar, descartamos lo conocido — con evidencia, no por gusto.</p>
+  </div>
+  <div class="scrollx"><table class="tbl">
+    <thead><tr><th>Opción</th><th>¿Comparte 1 GPU → N VMs?</th><th>¿Sin licencia?</th><th>¿En nuestras NVIDIA?</th><th>¿Es nuestra?</th></tr></thead>
+    <tbody>
+      <tr><td>Passthrough (VFIO)</td><td class="no">✗ 1 GPU → 1 VM</td><td class="yes">✓</td><td class="yes">✓</td><td class="meh">a medias</td></tr>
+      <tr><td>NVIDIA vGPU / GRID</td><td class="yes">✓</td><td class="no">✗ licencia por-VM</td><td class="meh">solo ciertas SKUs</td><td class="no">✗ propietario</td></tr>
+      <tr><td>virtio-gpu / VirGL / Venus</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">✗ ajeno, experimental</td></tr>
+      <tr class="us"><td>infinigpu</td><td class="yes">✓ (el objetivo)</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓ 100%</td></tr>
+    </tbody>
+  </table></div>
+  <p><b>Passthrough</b> le da la GPU entera a una VM → con 2 tarjetas, máximo 2 escritorios con GPU. <b>vGPU</b> sí
+    reparte, pero es de pago por-VM y atado a NVIDIA. <b>virtio-gpu y compañía</b> son justo los drivers experimentales
+    que <em>no</em> queremos como base (flojos en Windows, techos de versión, no son nuestros). Nos los quedamos solo
+    como <em>referencia</em> para estudiar.</p>
+</div></section>
+
+<!-- 0x03 LA IDEA -->
+<section id="idea"><div class="wrap">
+  <div class="sec-h reveal">
+    <div class="eyebrow"><span class="addr">0x03</span> La idea</div>
+    <h2>El guest no dibuja. <span class="lead-word">Le dicta</span> el dibujo al host.</h2>
+    <p class="sub">Se llama <b>API-remoting</b>. En vez de darle a cada VM un pedazo de GPU, la VM
+      <b>describe</b> lo que quiere dibujar (comandos de Vulkan), y el <b>host</b> —que tiene la GPU real y su
+      driver libre— lo dibuja de verdad y le devuelve la imagen.</p>
+  </div>
+  <p class="analogy"><b>La analogía:</b> es como dictarle un dibujo por teléfono a un artista que tiene los
+    lápices buenos. Tú (la VM) no necesitas los lápices; solo describes trazo por trazo. El artista (el host)
+    dibuja con el material caro y te manda una foto del resultado. <b>Una sola caja de lápices, muchos dictando.</b></p>
+  <div class="cards">
+    <div class="card verdict-good"><span class="tag">por qué funciona</span><h4>El host usa el driver <em>libre</em></h4><p>La GPU la maneja el host con el driver normal de NVIDIA. Cero licencias. Probado: Venus ya se testea así sobre NVIDIA.</p></div>
+    <div class="card verdict-good"><span class="tag">por qué es agnóstico</span><h4>El guest nunca ve la GPU física</h4><p>Habla Vulkan con <em>nuestro</em> dispositivo. Da igual si abajo hay NVIDIA, AMD o Intel. Portabilidad "gratis".</p></div>
+    <div class="card verdict-good"><span class="tag">por qué es nuestro</span><h4>Dispositivo + protocolo + drivers, propios</h4><p>Todo el camino es código nuestro. Sin forkear QEMU. Sin adoptar drivers ajenos.</p></div>
+  </div>
+</div></section>
+
+<!-- 0x04 EL RECORRIDO DE UN FRAME -->
+<section id="dataplane"><div class="wrap">
+  <div class="sec-h reveal">
+    <div class="eyebrow"><span class="addr">0x04</span> El recorrido de un frame</div>
+    <h2>De un clic en la VM a un pixel en tu pantalla.</h2>
+    <p class="sub">Este bucle es <em>todo</em> el proyecto. Si este viaje funciona y es rápido, lo demás es escala.</p>
+  </div>
+  <figure class="reveal">
+    <div class="flowsteps">
+      <div class="step"><div class="bubble"><div class="k">serializa</div><div class="t">La VM empaqueta sus comandos Vulkan en un anillo de memoria</div></div></div>
+      <div class="step"><div class="bubble"><div class="k">transporta</div><div class="t">Un timbre (doorbell) avisa; la memoria se comparte sin copiar</div></div></div>
+      <div class="step"><div class="bubble"><div class="k">re-ejecuta</div><div class="t">El árbitro del host lo dibuja en la GPU real (Vulkan headless)</div></div></div>
+      <div class="step"><div class="bubble"><div class="k">avisa</div><div class="t">Una interrupción (MSI-X) le dice a la VM "listo"</div></div></div>
+      <div class="step"><div class="bubble"><div class="k">presenta</div><div class="t">La imagen viaja a tu navegador por infiniPixel</div></div></div>
+    </div>
+    <figcaption>serializar → transportar → re-ejecutar → avisar → presentar · zero-copy en todo el camino caliente</figcaption>
+  </figure>
+  <div class="stack" style="margin-top:26px">
+    <div class="layer guest"><span class="who">GUEST (la VM)</span><span class="desc">Nuestro driver (DRM/KMS en Linux · WDDM/IddCx en Windows) empaqueta el trabajo gráfico.</span></div>
+    <div class="layer wire"><span class="who">EL "ASIENTO"</span><span class="desc">Un dispositivo PCI propio vía <span class="mono">vfio-user</span> — el guest lo ve como una placa de video normal. Sin tocar QEMU.</span></div>
+    <div class="layer host"><span class="who">HOST (el árbitro)</span><span class="desc">Un proceso Rust <em>enjaulado por VM</em> re-ejecuta en Vulkan sobre la GPU real y presenta el frame.</span></div>
+  </div>
+</div></section>
+
+<!-- 0x05 EL DISPOSITIVO -->
+<section id="dispositivo"><div class="wrap">
+  <div class="sec-h reveal">
+    <div class="eyebrow"><span class="addr">0x05</span> El dispositivo QEMU propio</div>
+    <h2>Cómo la VM "ve" una placa de video que no existe.</h2>
+    <p class="sub">Le presentamos a la VM un dispositivo PCI inventado por nosotros — con su espacio de
+      configuración, sus registros y su DMA — pero implementado como un <b>proceso Rust aparte</b> (no dentro de
+      QEMU). La VM le engancha nuestro driver y cree que es hardware.</p>
+  </div>
+  <p>Lo importante para que sea rápido: separar lo que es <em>lento</em> (un registro de control = un viaje por
+    socket) de lo que es <em>caliente</em> (los índices del anillo y el timbre = memoria compartida, a velocidad
+    de RAM). Este es, simplificado, el mapa de registros de la barra BAR0:</p>
+  <div class="regmap reveal">
+    <div class="reg"><span class="off">0x0000</span><span class="nm">CONTROL / RESET</span><span class="note">trapeado (socket)</span></div>
+    <div class="reg"><span class="off">0x0100</span><span class="nm">RING_BASE / SIZE</span><span class="note">trapeado (socket)</span></div>
+    <div class="reg fast"><span class="off">0x2000</span><span class="nm">HEAD / TAIL / SEQNO</span><span class="note">mmap directo · rápido</span></div>
+    <div class="reg fast"><span class="off">0x3000</span><span class="nm">DOORBELL</span><span class="note">ioeventfd · un "kick"</span></div>
+  </div>
+  <p style="margin-top:20px;color:var(--muted);font-size:14.5px"><span class="mono" style="color:var(--host)">→ verificado a mano</span>
+    contra los libros de drivers (Madieu, cap. PCI): el binding es por <span class="mono">VEN/DEV</span>, hay que
+    llamar <span class="mono">pci_set_master()</span> para DMA, y la página de índices va <em>cacheable con barreras</em>
+    (no "uncached", como un vring). El review corrigió un choque de ID PCI y el detalle del doorbell.</p>
+</div></section>
+
+<!-- 0x06 REPARTO INTELIGENTE -->
+<section id="reparto"><div class="wrap">
+  <div class="sec-h reveal">
+    <div class="eyebrow"><span class="addr">0x06</span> Reparto inteligente</div>
+    <h2>El chef que reparte la cocina, con criterio.</h2>
+    <p class="sub">No es un multiplexor genérico: es un cerebro pensado para <b>este</b> caso de uso. La clave es un
+      contraste: la oficina es <b>barata pero urgente</b>; el diseñador es <b>caro pero paciente</b>. Eso <em>es</em>
+      la oportunidad de scheduling.</p>
+  </div>
+  <div class="ctrls reveal">
+    <div class="seg" role="group" aria-label="Qué VM está en foco">
+      <button id="foco-of" aria-pressed="true">Foco: oficina</button>
+      <button id="foco-di" aria-pressed="false">Foco: diseño</button>
+    </div>
+    <label class="slider">Presión del host <input id="pressure" type="range" min="0" max="100" value="20" aria-label="Presión del host"> <span id="presslbl" class="hint">baja</span></label>
+  </div>
+  <div class="screen">
+    <div class="bar"><i></i><i></i><i></i><span class="caplbl" style="margin:0 0 0 8px;color:var(--faint)">reparto de GPU · probá los controles ↑</span></div>
+    <div class="sched" id="sched">
+      <div class="vmrow" data-vm="of7"><span class="nm">oficina-07 <span class="badge fg" data-fg>foreground</span></span><span class="track"><i data-bar style="width:34%;background:var(--guest)"></i></span><span class="pct" data-pct>—</span></div>
+      <div class="vmrow" data-vm="of12"><span class="nm">oficina-12 <span class="badge fg" data-fg style="display:none">foreground</span></span><span class="track"><i data-bar style="width:12%;background:var(--guest-dim)"></i></span><span class="pct" data-pct>—</span></div>
+      <div class="vmrow" data-vm="cad"><span class="nm">diseño-CAD-2 <span class="badge th" data-th>throttle</span></span><span class="track"><i data-bar style="width:46%;background:var(--host)"></i></span><span class="pct" data-pct>—</span></div>
+      <div class="vmrow" data-vm="idle"><span class="nm">idle-x9</span><span class="track"><i data-bar style="width:2%;background:var(--faint)"></i></span><span class="pct" data-pct>—</span></div>
+    </div>
+    <div class="degr" id="degr">Bajo presión, degrada en escalera:
+      <span class="lv" data-lv="1">sin recortes</span>
+      <span class="lv" data-lv="2">↓ FPS diseñador</span>
+      <span class="lv" data-lv="3">↓ bitrate</span>
+      <span class="lv" data-lv="4">↓ resolución</span>
+    </div>
+    <div class="caplbl">La VM en foco recibe el empujón; el diseñador cede primero; el interactivo nunca falla en duro.</div>
+  </div>
+  <div class="cards" style="margin-top:24px">
+    <div class="card"><span class="tag" style="color:var(--host)">capacidad en vivo</span><h4>Sabe cuánto queda ahora</h4><p>Mide VRAM y tiempo-GPU en tiempo real. Admite una VM solo si hay lugar (fail-closed).</p></div>
+    <div class="card"><span class="tag" style="color:var(--guest)">justo, con foco</span><h4>Fair-share + boost</h4><p>Reparte por prioridad de departamento; el token-bucket es el freno real (en NVIDIA no hay preempción, ojo).</p></div>
+    <div class="card"><span class="tag" style="color:var(--silicon)">memoria elástica</span><h4>Overcommit de VRAM</h4><p>Pagina a RAM la VRAM de las VMs quietas. Nunca falla en duro un escritorio interactivo: baja calidad primero.</p></div>
+    <div class="card"><span class="tag" style="color:var(--host)">vídeo aparte</span><h4>El vídeo no roba 3D</h4><p>El decode de vídeo va a los motores NVDEC/NVENC — separados de los núcleos 3D. Multiplicador de densidad.</p></div>
+  </div>
+</div></section>
+
+<!-- 0x07 DRIVERS + 0x08 VENDOR -->
+<section id="drivers"><div class="wrap">
+  <div class="sec-h reveal">
+    <div class="eyebrow"><span class="addr">0x07 · 0x08</span> El driver del guest, y muchos fabricantes</div>
+    <h2>Un driver en cada VM. Y que funcione en NVIDIA, AMD e Intel.</h2>
+    <p class="sub">En Linux, un driver DRM/KMS (en C — Rust todavía no cubre el modeset del kernel). En Windows, por
+      fases: primero <b>solo-pantalla</b>, luego 3D. Y como el guest nunca ve la GPU física, ser multi-fabricante
+      sale <em>casi gratis</em>.</p>
+  </div>
+  <div class="cards">
+    <div class="card"><span class="tag" style="color:var(--guest)">windows · fases</span><h4>De pantalla a 3D</h4><p>M1 IddCx (solo píxeles, en Rust) → M2 apps Vulkan/GL nativas → M3 D3D real (miniport WDDM + DXVK/vkd3d en el guest).</p></div>
+    <div class="card"><span class="tag" style="color:var(--host)">linux</span><h4>DRM/KMS sobre virtio-gpu 2D</h4><p>El modeset en C; el 3D en Mesa. El crate Rust del protocolo es la fuente de verdad, exportado a C con cbindgen.</p></div>
+    <div class="card"><span class="tag" style="color:var(--silicon)">multi-fabricante</span><h4>4 "costuras" y listo</h4><p>Todo se abstrae en un trait <span class="mono">GpuBackend</span>. AMD e Intel incluso <em>mejoran</em> el aislamiento (reset por-cola, no de toda la GPU).</p></div>
+  </div>
+</div></section>
+
+<!-- 0x09 INFINIPIXEL -->
+<section id="pixel"><div class="wrap">
+  <div class="sec-h reveal">
+    <div class="eyebrow"><span class="addr">0x09</span> infiniPixel — nuestro protocolo de imagen</div>
+    <h2>SPICE es genérico. Nosotros controlamos las tres puntas.</h2>
+    <p class="sub">Como somos dueños del driver del guest, del árbitro del host (el frame <em>ya</em> está en la GPU) y
+      del cliente (el navegador), podemos armar un protocolo de baja latencia estilo cloud-gaming que le gana a SPICE
+      por un margen enorme.</p>
+  </div>
+  <div class="cards">
+    <div class="card verdict-bad"><span class="tag">SPICE hoy</span><h4>~40-70 ms + trabajo de más</h4><p>Lee el frame de la GPU a la RAM, lo codifica en CPU, lo manda por TCP, a un visor nativo. Cuatro cosas que borramos.</p></div>
+    <div class="card verdict-good"><span class="tag">infiniPixel</span><h4>Datapath ~14-22 ms en LAN</h4><p>NVENC en la GPU (sin readback) → transporte QUIC → decode por hardware en el navegador (WebCodecs). El cursor se dibuja local: instantáneo.</p></div>
+    <div class="card verdict-good"><span class="tag">idle = casi 0</span><h4>Un escritorio quieto no gasta</h4><p>Solo se manda lo que cambió (damage). Un escritorio idle baja de megabits a ~0 — así una GPU abanica a decenas.</p></div>
+  </div>
+  <div class="ctrls reveal" style="margin-top:28px">
+    <label class="slider">Escritorios quietos (idle) <input id="idlefrac" type="range" min="0" max="95" value="55" aria-label="Fracción de escritorios idle"> <span id="idlelbl" class="hint">55%</span></label>
+    <span class="readout">flota de <b>24</b> escritorios · 1 GPU · moví el slider</span>
+  </div>
+  <div class="screen"><div class="dgrid">
+    <div><div class="big host" id="bwval">—</div><div class="kcap">banda agregada al cliente</div></div>
+    <div><div class="big guest" id="denval">—</div><div class="kcap">escritorios servidos por GPU</div></div>
+  </div>
+  <div class="caplbl" style="margin-top:14px">Un escritorio idle cuesta ~0 (solo se manda lo que cambia). Cuantos más quietos, más caben — así se hace densidad.</div>
+  </div>
+  <p style="margin-top:20px;color:var(--muted);font-size:14.5px"><span class="mono" style="color:var(--host)">nota del review:</span>
+    la GA102 tiene <b>1 motor NVENC</b> (no dos) — por eso el encoder es un recurso escaso que el scheduler administra.</p>
+</div></section>
+
+<!-- 0x0A EL OJO -->
+<section id="ojo"><div class="wrap">
+  <div class="sec-h reveal">
+    <div class="eyebrow"><span class="addr">0x0A</span> Los trucos del ojo</div>
+    <h2>Comprimir lo que el ojo no puede ver.</h2>
+    <p class="sub">El ojo humano solo ve nítido en un puntito central (la fóvea); el resto es borroso. Y es mucho más
+      sensible al brillo que al color, y "se pierde" durante el movimiento rápido. Usamos <b>cualquier truco</b> de
+      biología y óptica para mandar menos bits sin que se note.</p>
+  </div>
+  <div class="herogrid" style="align-items:start;gap:32px">
+    <div>
+      <div class="screen reveal">
+        <div class="bar"><i></i><i></i><i></i></div>
+        <div class="fov" id="fov"></div>
+        <div class="caplbl"><span class="hint">▲ moví el cursor por acá</span> — la calidad sigue tu mirada; la periferia se abarata en bloques.</div>
+      </div>
+    </div>
+    <div>
+      <p class="analogy" style="margin-top:0"><b>Sin eye-tracking</b> adivinamos a dónde mirás: el cursor, la ventana
+        activa y lo que acaba de cambiar. Ahí ponemos calidad; en la periferia, ahorramos.</p>
+      <div class="cards" style="grid-template-columns:1fr">
+        <div class="card"><h4>Luma ≫ croma</h4><p>El ojo ve mucho más el brillo que el color → color a menor resolución, salvo en el texto (donde la nitidez es sagrada).</p></div>
+        <div class="card"><h4>Enmascaramiento temporal</h4><p>En movimiento rápido el ojo no resuelve detalle → bajamos calidad justo ahí, y no se percibe.</p></div>
+        <div class="card"><h4>Latencia percibida</h4><p>El cursor local y la cadencia estable importan más que el mínimo absoluto: el jitter molesta más que la latencia pareja.</p></div>
+      </div>
+    </div>
+  </div>
+</div></section>
+
+<!-- 0x0B DELEGAR AL CLIENTE -->
+<section id="cliente"><div class="wrap">
+  <div class="sec-h reveal">
+    <div class="eyebrow"><span class="addr">0x0B</span> Delegar al cliente</div>
+    <h2>Tu PC también tiene GPU. Usémosla.</h2>
+    <p class="sub">Abrís la VM desde una PC que tiene su propia placa (aunque sea modesta): decodifica vídeo, hace 2D y
+      3D. Si le <b>delegamos trabajo</b>, descargamos la GPU del host (= más VMs) y bajamos latencia. Todo
+      <b>negociado por capacidad</b>, con caída elegante a "cliente tonto".</p>
+  </div>
+  <figure class="reveal">
+    <div class="flowsteps" style="min-width:560px">
+      <div class="step"><div class="bubble"><div class="k">negocia</div><div class="t">El cliente declara qué puede hacer (WebGPU, códecs, WebNN…)</div></div></div>
+      <div class="step"><div class="bubble"><div class="k">ofrece</div><div class="t">El host arma un "perfil de delegación" y ambos acuerdan</div></div></div>
+      <div class="step"><div class="bubble"><div class="k">delega</div><div class="t">Opcodes de 1 byte + un sidecar binario por-frame, atado por época</div></div></div>
+      <div class="step"><div class="bubble"><div class="k">se adapta</div><div class="t">Balancea host↔cliente según red y carga, sin frenar frames</div></div></div>
+    </div>
+    <figcaption>capability-negotiation → perfil → instrucciones por-frame → re-balanceo adaptativo (degrade-never-deny)</figcaption>
+  </figure>
+  <div class="cards">
+    <div class="card"><h4>Componer y post-proceso</h4><p>El cliente compone las capas y reconstruye color — libera al host casi gratis.</p></div>
+    <div class="card"><h4>Super-resolución</h4><p>El host manda menor resolución; el cliente la reconstruye. ~mitad de encode y de banda.</p></div>
+    <div class="card"><h4>Caché de tiles (texto)</h4><p>La UI estática se manda como una referencia de pocos bytes → ~20× menos banda en texto.</p></div>
+  </div>
+</div></section>
+
+<!-- 0x0C PROBLEMAS DUROS -->
+<section id="duro"><div class="wrap">
+  <div class="sec-h reveal">
+    <div class="eyebrow"><span class="addr">0x0C</span> Los problemas duros</div>
+    <h2>Dónde mueren los prototipos — y cómo lo resolvemos.</h2>
+  </div>
+  <div class="prob">
+    <div class="pcard reveal"><div class="ic">🧊</div><div>
+      <h4>Que una VM lenta congele a todas (deadlock)</h4>
+      <p>El único caso de campo (helix.ml) se congeló a las 4 VMs por <em>un contador global</em> y una cola FIFO con
+        bloqueo en cabeza. No es inherente: es un bug concreto.</p>
+      <span class="fix">→ solución: completion por seqno + timeline semaphores + hilos 1:1 + 8 reglas (ningún wait global; el seqno del guest nunca es un dma-fence del kernel).</span>
+    </div></div>
+    <div class="pcard reveal"><div class="ic">⚠️</div><div>
+      <h4>Un fault severo que resetea toda la GPU (y tumba a todos)</h4>
+      <p>En la GA102 no hay partición por hardware (MIG): un Xid grave fuerza reset de todo el dispositivo. <b>Es un
+        residual honesto</b> que no se arregla por software en esta placa.</p>
+      <span class="fix">→ mitigación: procesos por-VM aíslan los faults comunes; en AMD/Intel el reset es por-cola (mejor); repartir personas entre las 2 GPUs; y decirlo claro en el SLA.</span>
+    </div></div>
+    <div class="pcard reveal"><div class="ic">🪟</div><div>
+      <h4>3D de verdad dentro de Windows</h4>
+      <p>El GPU-PV de Microsoft hace justo esto, pero solo en Hyper-V. En KVM no hay precedente… salvo que sí lo hay.</p>
+      <span class="fix">→ solución: forkear un miniport que ya funciona (viogpu3d) y correr DXVK/vkd3d <em>dentro</em> del guest sobre nuestro árbitro Vulkan. ~3-5 trimestres, pero con mapa.</span>
+    </div></div>
+  </div>
+</div></section>
+
+<!-- 0x0D VEREDICTO -->
+<section id="veredicto"><div class="wrap">
+  <div class="sec-h reveal">
+    <div class="eyebrow"><span class="addr">0x0D</span> El veredicto honesto</div>
+    <h2>Cuándo tiene sentido construir esto — y cuándo no.</h2>
+  </div>
+  <div class="callout honest reveal">
+    <h3>Lo digo sin adornos</h3>
+    <p style="margin-top:6px;color:var(--muted)">Un red-team adversarial de todo el plan dio un resultado con dos caras. Depende del encuadre:</p>
+    <div class="verdicts">
+      <div class="vd nogo"><span class="lbl">✗ NO-GO</span>
+        <p>Como <b>producto VDI comercial con SLA</b> sobre NVIDIA GA102: un guest puede resetear la GPU y tumbar a
+          todos, y vGPU ya corre barato en esa placa. Si tu métrica es costo, comprá vGPU.</p></div>
+      <div class="vd go"><span class="lbl">✓ GO</span>
+        <p>Como <b>plataforma propia, multi-fabricante y por principio</b> (100% propio, sin licencia, protocolo
+          propio): coherente. Y AMD/Intel reducen el residual. Ese es <em>tu</em> encuadre.</p></div>
+    </div>
+  </div>
+</div></section>
+
+<!-- 0x0E PLAN -->
+<section id="plan"><div class="wrap">
+  <div class="sec-h reveal">
+    <div class="eyebrow"><span class="addr">0x0E</span> El plan por fases</div>
+    <h2>Primero probar el bucle. Después, escalar.</h2>
+    <p class="sub">Antes de gastar trimestres: experimentos baratos para matar los riesgos (TCO vs vGPU, el muro de
+      concurrencia N=4-8, el spike de vfio-user). Si pasan → Fase 0.</p>
+  </div>
+  <div class="tl reveal">
+    <div class="ph"><div class="p">Stage −1<b>días–semanas</b></div><div><h4>Matar riesgos, barato</h4><p>TCO vs vGPU · matriz de skew de driver · spike vfio-user (MSI-X, Windows, hot-unplug) · reproducir el muro N=4-8 (el go/no-go real) · medir pérdida de KSM.</p></div></div>
+    <div class="ph"><div class="p">Fase 0<b>el MVP</b></div><div><h4>Probar el bucle entero</h4><p>Una VM Linux → un contexto Vulkan → un triángulo por un anillo, con una fence y un blob, presentado una vez. Ese viaje <em>es</em> todo el riesgo.</p></div></div>
+    <div class="ph"><div class="p">Fase 1<b>compartir</b></div><div><h4>Repartir + el protocolo real</h4><p>2ª VM + el cerebro (scheduler) + infiniPixel v1 (NVENC/QUIC/navegador) + inteligencia del guest + capa perceptual.</p></div></div>
+    <div class="ph"><div class="p">Fase 2<b>windows</b></div><div><h4>Escritorio Windows</h4><p>IddCx solo-pantalla (oficina completa) + apps Vulkan/GL nativas. Cert EV + attestation desde el día 1.</p></div></div>
+    <div class="ph"><div class="p">Fase 3<b>la frontera</b></div><div><h4>3D acelerado en Windows</h4><p>Miniport WDDM + DXVK/vkd3d en el guest → D3D real para CAD/3D. La parte más grande, pero con precedente.</p></div></div>
+  </div>
+</div></section>
+
+<footer><div class="wrap">
+  <div>
+    <div class="brand" style="margin-bottom:10px"><span class="dot"></span> infinigpu</div>
+    <div style="max-width:52ch">Un reporte re-explicado del diseño. Detrás hay <b>29 documentos de investigación</b>,
+      <b>11 ADRs</b>, un registro de riesgos y un review adversarial — todo en <span class="mono">docs/</span>.</div>
+  </div>
+  <div class="kv">
+    Fase actual: investigación & diseño<br>
+    Host de prueba: 2× RTX A5000<br>
+    Objetivo: una GPU, muchos escritorios<br>
+    <span style="color:var(--faint)">2026 · self-hosted VDI</span>
+  </div>
+</div></footer>
+
+<script>
+  // ---- interactive foveation: quality follows the pointer ----
+  (function(){
+    var host=document.getElementById('fov'); if(!host) return;
+    var cols=12, rows=Math.round(cols*9/16);
+    var pal=['#57d4cf','#f2b45c','#9d80f7','#63d29b'];
+    var cells=[];
+    for(var r=0;r<rows;r++){for(var c=0;c<cols;c++){
+      var s=document.createElement('span');
+      s.style.background=pal[(r*cols+c)%pal.length];
+      s.__c=c; s.__r=r; cells.push(s); host.appendChild(s);
+    }}
+    var maxd=Math.hypot(cols/2,rows/2);
+    function render(fx,fy){
+      for(var i=0;i<cells.length;i++){
+        var s=cells[i];
+        var d=Math.hypot(s.__c+0.5-fx, s.__r+0.5-fy)/maxd; // 0 fovea .. 1 periphery
+        var sharp=Math.max(0,1-d);
+        s.style.opacity=(0.16+0.84*sharp*sharp).toFixed(2);
+        s.style.filter='saturate('+(0.18+sharp).toFixed(2)+')';
+        s.style.transform='scale('+(0.74+0.26*sharp).toFixed(2)+')';
+        s.style.boxShadow= sharp>0.62 ? '0 0 12px rgba(87,212,207,.45)':'none';
+      }
+    }
+    function fromEvent(e){
+      var rect=host.getBoundingClientRect();
+      var px=(e.touches?e.touches[0].clientX:e.clientX)-rect.left;
+      var py=(e.touches?e.touches[0].clientY:e.clientY)-rect.top;
+      render(px/rect.width*cols, py/rect.height*rows);
+    }
+    host.addEventListener('pointermove',fromEvent);
+    host.addEventListener('touchmove',function(e){e.preventDefault();fromEvent(e);},{passive:false});
+    host.addEventListener('pointerleave',function(){render(cols/2,rows/2);});
+    render(cols/2,rows/2);
+  })();
+
+  // ---- interactive scheduler simulator ----
+  (function(){
+    var sched=document.getElementById('sched'); if(!sched) return;
+    var pressureEl=document.getElementById('pressure'), presslbl=document.getElementById('presslbl');
+    var focus='of7';
+    var base={of7:1.0, of12:0.9, cad:3.2, idle:0.05};
+    var rows={}; [].forEach.call(sched.querySelectorAll('.vmrow'),function(row){rows[row.dataset.vm]=row;});
+    function set(vm,pct,fg,th){
+      var row=rows[vm];
+      row.querySelector('[data-bar]').style.width=Math.max(1.5,pct).toFixed(0)+'%';
+      row.querySelector('[data-pct]').textContent=Math.round(pct)+'%';
+      var fgb=row.querySelector('[data-fg]'); if(fgb) fgb.style.display=fg?'':'none';
+      var thb=row.querySelector('[data-th]'); if(thb) thb.style.display=th?'':'none';
+    }
+    function render(){
+      var p=(+pressureEl.value)/100;
+      presslbl.textContent = p<.33?'baja':p<.7?'media':'alta';
+      var w=Object.assign({},base);
+      w[focus]*=4;                        // foreground boost
+      w.cad*=(1-0.72*p);                  // designer throttled under pressure
+      // anti-starvation floor: designer never below a small guaranteed share
+      var total=w.of7+w.of12+w.cad+w.idle;
+      var shares={of7:w.of7/total*100, of12:w.of12/total*100, cad:Math.max(w.cad/total*100, 6*(1-p)+2), idle:w.idle/total*100};
+      var s2=shares.of7+shares.of12+shares.cad+shares.idle; // renormalize
+      for(var k in shares) shares[k]=shares[k]/s2*100;
+      set('of7',shares.of7, focus==='of7', false);
+      set('of12',shares.of12, focus==='of12', false);
+      set('cad',shares.cad, focus==='cad', p>0.25);
+      set('idle',shares.idle,false,false);
+      // degradation ladder
+      var lv = p<0.30?1 : p<0.60?2 : p<0.85?3 : 4;
+      [].forEach.call(document.querySelectorAll('#degr .lv'),function(el){
+        el.classList.toggle('on', (+el.dataset.lv)===lv);
+      });
+    }
+    document.getElementById('foco-of').addEventListener('click',function(){focus='of7';this.setAttribute('aria-pressed','true');document.getElementById('foco-di').setAttribute('aria-pressed','false');render();});
+    document.getElementById('foco-di').addEventListener('click',function(){focus='cad';this.setAttribute('aria-pressed','true');document.getElementById('foco-of').setAttribute('aria-pressed','false');render();});
+    pressureEl.addEventListener('input',render);
+    render();
+  })();
+
+  // ---- interactive density widget ----
+  (function(){
+    var el=document.getElementById('idlefrac'); if(!el) return;
+    var lbl=document.getElementById('idlelbl'), bw=document.getElementById('bwval'), den=document.getElementById('denval');
+    var FLEET=24, PER_ACTIVE=3.5 /*Mbit/s*/, IDLE_COST=0.02, NVENC_ACTIVE=8;
+    function render(){
+      var idle=(+el.value)/100; lbl.textContent=Math.round(idle*100)+'%';
+      var active=1-idle;
+      var mbit=FLEET*(active*PER_ACTIVE + idle*IDLE_COST);
+      bw.innerHTML = mbit>=1000 ? (mbit/1000).toFixed(1)+' <small>Gbit/s</small>' : Math.round(mbit)+' <small>Mbit/s</small>';
+      var served=Math.min(48, Math.round(NVENC_ACTIVE/Math.max(active,0.05)));
+      den.innerHTML = served+' <small>escritorios</small>';
+    }
+    el.addEventListener('input',render); render();
+  })();
+
+  // ---- gentle scroll reveal ----
+  (function(){
+    var els=[].slice.call(document.querySelectorAll('.reveal'));
+    if(!('IntersectionObserver' in window)){els.forEach(function(e){e.classList.add('in')});return;}
+    var io=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target);}})},{threshold:.12});
+    els.forEach(function(e){io.observe(e)});
+  })();
+</script>
+</body>
+</html>
