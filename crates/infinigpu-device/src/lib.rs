@@ -499,6 +499,12 @@ impl InfinigpuBackend {
         // infiniPixel: encode this framebuffer on NVENC and stream it to any browsers.
         if streaming {
             self.stream_frame(&bgra, w as u32, h as u32);
+            if self.present_count % 60 == 0 {
+                if let Some(p) = &self.pixel {
+                    let (sent, skipped) = p.stats();
+                    info!("infiniPixel: {sent} frames encoded, {skipped} idle-skipped (unchanged)");
+                }
+            }
         }
 
         // Publish completion (guest polls CMD_RING0_RETIRED and/or takes MSI-X).

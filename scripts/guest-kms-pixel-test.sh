@@ -116,7 +116,7 @@ wait "$NODEPID" 2>/dev/null || true
 CAP="$(cat "$WORK/capture.log" 2>/dev/null || true)"
 
 echo ">> capture: $CAP"
-echo ">> device : $(grep -E 'infiniPixel: streaming|present: frame' "$WORK/dev.log" | tail -2 | sed 's/^/    /')"
+echo ">> presents: $(grep -c 'present: frame' "$WORK/dev.log") total; $(grep 'idle-skipped' "$WORK/dev.log" | tail -1 | sed 's/.*infinigpu_device\] //')"
 
 DIMS=""; NF=0
 if [[ -s "$WORK/guest-stream.h264" ]]; then

@@ -311,6 +311,15 @@ Known v0 limits (documented): the encoder holds the newest frame until the next 
 a live stream, shows as a 1-frame lag on a frozen scene); one `INFINIGPU_PIXEL_PORT` per
 process (per-VM ports come with the multi-VM streaming refinement).
 
+### 2026-07-16 — 💤 infiniPixel damage-aware idle-skip (idle ⇒ ~0 bits)
+
+The ADR-0009 common-case density win: `PixelStreamer` hashes each frame (fast FNV-1a over
+64-bit words) and **skips encoding+sending a frame identical to the previous one**. A static
+desktop presents identical framebuffers → they hash equal → ~0 encode, ~0 bytes. This is the
+v0 proxy for the guest damage map (a real damage-rect path is v1). The guest test shows it
+live (`56 encoded, N idle-skipped` — skip ratio approaches 100% as the desktop goes idle);
+unit-tested by `idle_skip_drops_unchanged_frames_only`.
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against

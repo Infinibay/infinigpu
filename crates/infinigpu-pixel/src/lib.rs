@@ -447,6 +447,45 @@ impl Hub {
     }
 }
 
+// ------------------------------- Damage / idle-skip ---------------------------------
+
+/// Fast FNV-1a-style hash over 64-bit words — used to detect an unchanged framebuffer.
+fn frame_hash(b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let chunks = b.chunks_exact(8);
+    let rem = chunks.remainder();
+    for c in chunks {
+        let w = u64::from_le_bytes(c.try_into().unwrap());
+        h = (h ^ w).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    for &x in rem {
+        h = (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Idle-skip: reports whether a frame differs from the last one it saw. An idle desktop
+/// presents identical framebuffers → they hash equal → we don't re-encode or send them,
+/// so **idle ⇒ ~0 bits and ~0 encode** (ADR-0009's common-case density win). A
+/// full-frame hash is the v0 proxy for the guest damage map.
+#[derive(Default)]
+struct Deduper {
+    last: Option<u64>,
+}
+
+impl Deduper {
+    /// True if `bgra` differs from the previous frame (and records it).
+    fn changed(&mut self, bgra: &[u8]) -> bool {
+        let h = frame_hash(bgra);
+        if self.last == Some(h) {
+            false
+        } else {
+            self.last = Some(h);
+            true
+        }
+    }
+}
+
 // ---------------------------------- Streamer ----------------------------------------
 
 /// One-call infiniPixel stream: a persistent WebSocket [`Hub`] plus an [`Encoder`] that
@@ -459,6 +498,10 @@ pub struct PixelStreamer {
     bitrate_kbps: u32,
     /// The current encoder sink + the (w,h) it is configured for.
     enc: Option<(FrameSink, u32, u32)>,
+    /// Idle-skip: drop frames identical to the previous one.
+    dedup: Deduper,
+    sent: u64,
+    skipped: u64,
 }
 
 impl PixelStreamer {
@@ -480,6 +523,9 @@ impl PixelStreamer {
             fps,
             bitrate_kbps,
             enc: None,
+            dedup: Deduper::default(),
+            sent: 0,
+            skipped: 0,
         })
     }
 
@@ -534,10 +580,21 @@ impl PixelStreamer {
     }
 
     /// Submit one tightly-packed `w`×`h` BGRA frame; (re)creates the encoder if the
-    /// size changed since the last frame.
+    /// size changed since the last frame. An unchanged frame is **skipped** (idle-skip)
+    /// — no encode, no bytes — so a static desktop costs ~0.
     pub fn submit_bgra(&mut self, bgra: &[u8], w: u32, h: u32) -> io::Result<()> {
+        if !self.dedup.changed(bgra) {
+            self.skipped += 1;
+            return Ok(());
+        }
         self.ensure_encoder(w, h)?;
+        self.sent += 1;
         self.enc.as_mut().unwrap().0.submit_bgra(bgra)
+    }
+
+    /// `(frames encoded, frames skipped as unchanged)`.
+    pub fn stats(&self) -> (u64, u64) {
+        (self.sent, self.skipped)
     }
 
     pub fn client_count(&self) -> usize {
@@ -655,6 +712,19 @@ mod tests {
         assert_eq!(aus.len(), 2, "expected two complete access units");
         assert!(!au_is_keyframe(&aus[0]), "first AU is a plain slice");
         assert!(au_is_keyframe(&aus[1]), "second AU carries an SPS → keyframe");
+    }
+
+    #[test]
+    fn idle_skip_drops_unchanged_frames_only() {
+        let mut d = Deduper::default();
+        let a = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9];
+        let b = vec![1u8, 2, 3, 4, 5, 6, 7, 42, 9]; // one byte different
+        assert!(d.changed(&a), "first frame is always 'changed'");
+        assert!(!d.changed(&a), "identical frame is skipped");
+        assert!(!d.changed(&a), "still skipped");
+        assert!(d.changed(&b), "a different frame re-encodes");
+        assert!(!d.changed(&b), "then skipped again");
+        assert!(d.changed(&a), "back to a is a change");
     }
 
     #[test]
