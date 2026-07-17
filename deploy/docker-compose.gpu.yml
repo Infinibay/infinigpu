@@ -69,11 +69,17 @@ services:
       context: ${REPOS_DIR:-./repos}/infinigpu
       dockerfile: deploy/Dockerfile.builder
     image: infinibay/dev-infinigpu-builder
+    environment:
+      # Where the backend serves guest artifacts from (infiniservice + gpu-driver).
+      INFINIBAY_BASE_DIR: /opt/infinibay
     volumes:
       - ${REPOS_DIR:-./repos}/infinigpu:/src
       - infinigpu_build:/out
       - infinigpu_target:/target
       - infinigpu_cargo:/usr/local/cargo/registry
+      # Shared with the backend — the builder stages the guest driver tarball here
+      # (…/gpu-driver/linux/source.tar.gz) so the backend can serve it to GPU VMs.
+      - infinibay_base:/opt/infinibay
 
 volumes:
   infinigpu_build:

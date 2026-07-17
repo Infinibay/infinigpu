@@ -42,3 +42,17 @@ test -x "${OUT}/bin/qemu-system-x86_64" || { echo "!! QEMU missing in output"; e
 test -x "${OUT}/bin/infinigpu-device"   || { echo "!! device binary missing in output"; exit 1; }
 echo ">> done: $("${OUT}/bin/qemu-system-x86_64" --version | head -1)"
 echo ">> device binary published → ${OUT}/bin/infinigpu-device"
+
+# Stage the Linux guest DRM driver for the backend to serve to GPU VMs during OS
+# install (GET /gpu-driver/linux/source). The guest builds it in-guest via DKMS, so
+# we ship SOURCE (kernel-version-independent), not a prebuilt .ko. Only runs when the
+# shared infinibay_base volume is mounted (INFINIBAY_BASE_DIR layout).
+GD_BASE="${INFINIBAY_BASE_DIR:-/opt/infinibay}/gpu-driver/linux"
+if [ -d "${INFINIBAY_BASE_DIR:-/opt/infinibay}" ]; then
+  mkdir -p "${GD_BASE}"
+  tar -czf "${GD_BASE}/source.tar.gz" -C "${SRC}/guest/linux" \
+    infinigpu.c Makefile dkms.conf install.sh
+  echo ">> staged Linux guest driver → ${GD_BASE}/source.tar.gz"
+else
+  echo ">> (infinibay_base not mounted; skipped staging the guest driver tarball)"
+fi
