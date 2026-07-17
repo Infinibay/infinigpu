@@ -43,8 +43,12 @@ pub mod proto {
     pub mod codec {
         pub const H264: u8 = 1;
         pub const HEVC: u8 = 2;
-        /// Reserved for AV1. AV1 is OBU-framed (no Annex-B start codes / AUDs), so it
-        /// needs a different splitter than [`super::super::AuSplitter`] — not yet wired.
+        /// Reserved for AV1. Two blockers before it's wired: (1) AV1 is OBU-framed (no
+        /// Annex-B start codes / AUDs), so it needs an OBU splitter — temporal-delimiter
+        /// OBU (type 2) splits temporal units, SEQ_HDR OBU (type 1) marks keyframes —
+        /// not the [`super::super::AuSplitter`]; (2) NVENC AV1 encode needs an **Ada+**
+        /// GPU — Ampere (e.g. the RTX A5000) is AV1 *decode*-only, so it can't be
+        /// hardware-validated on this project's GPU. HEVC covers the compression need.
         pub const AV1: u8 = 3;
     }
     pub mod flags {

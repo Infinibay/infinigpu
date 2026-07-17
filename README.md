@@ -114,7 +114,8 @@ the per-VM device-server lifecycle, the `Department` GPU policy fields + `GpuBro
 | Multi-VM broker (admission + weighted fair-share), multi-ring, vendor HAL | ✅ working |
 | infiniPixel v0 (NVENC H.264 + owned protocol + WebCodecs) + idle-skip + device wiring | ✅ working |
 | infiniPixel: **HEVC codec** + **NVENC intra-refresh** (codec-generic AU splitter) | ✅ working |
-| infiniPixel v1 remainder (damage-rect hybrid, AV1 OBU framing, WebTransport, perceptual/foveation) | ⏳ next |
+| infiniPixel v1 remainder (damage-rect hybrid, WebTransport, perceptual/foveation) | ⏳ next |
+| infiniPixel AV1 (OBU framing) | ⏸ needs an Ada+ host — the A5000 is AV1 **decode**-only (no NVENC AV1) |
 | NVML real capacity + per-process VRAM attribution (broker admits against measured VRAM) | ✅ working |
 | Per-VM jailed replay *process* over IPC + per-pid NVML attribution (ADR-0003 isolation) | ✅ working |
 | Infinibay backend/infinization wiring (per [`docs/INTEGRATION.md`](docs/INTEGRATION.md)) | ⏳ blueprint ready |
