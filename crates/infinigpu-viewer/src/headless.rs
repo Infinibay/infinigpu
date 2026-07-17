@@ -12,7 +12,7 @@ pub fn run(url: &str, frames: usize, out: Option<&str>) -> Result<(), Box<dyn Er
     let mut keyframes = 0usize;
     let mut last: Option<DecodedFrame> = None;
 
-    run_stream(url, |f| {
+    run_stream(url, None::<std::sync::mpsc::Receiver<String>>, |f| {
         got += 1;
         if f.keyframe {
             keyframes += 1;

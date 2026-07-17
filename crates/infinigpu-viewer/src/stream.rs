@@ -10,7 +10,10 @@
 use infinigpu_pixel::{proto, FrameHeader};
 use openh264::formats::YUVSource; // brings `dimensions()` into scope for DecodedYUV
 use std::error::Error;
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tungstenite::stream::MaybeTlsStream;
 use tungstenite::Message;
 
 /// A decoded frame ready to upload to the GPU. `rgba` is tightly packed `width*height*4`
@@ -48,12 +51,27 @@ impl FrameSlot {
 /// Connect to `url` (e.g. `ws://127.0.0.1:8090`) and drive decoding, invoking `on_frame`
 /// for every decoded frame. Blocks until the socket closes, `on_frame` returns `false`,
 /// or an error occurs. Runs on the caller's thread (spawn it for a windowed client).
+///
+/// `input_rx`, if given, is the guest-input back-channel: JSON strings (the compact
+/// infiniPixel input protocol — see the viewer's `input` module) pushed by the window
+/// thread are forwarded to the server as **text** WebSocket messages, which the master
+/// relay injects into the guest over QMP. Frames arrive as **binary**; the two directions
+/// share this one socket. When `input_rx` is present the read is time-boxed so a static
+/// screen (no incoming frames) never stalls outgoing input.
 pub fn run_stream(
     url: &str,
+    input_rx: Option<Receiver<String>>,
     mut on_frame: impl FnMut(DecodedFrame) -> bool,
 ) -> Result<(), Box<dyn Error>> {
     let (mut ws, _resp) = tungstenite::connect(url)?;
     log::info!("infiniPixel: connected to {url}");
+    // Time-box reads so we can interleave outgoing input on the same socket. Without a
+    // pending-input channel we leave the socket blocking (headless decode path).
+    if input_rx.is_some() {
+        if let MaybeTlsStream::Plain(s) = ws.get_ref() {
+            let _ = s.set_read_timeout(Some(Duration::from_millis(16)));
+        }
+    }
     let mut decoder = openh264::decoder::Decoder::new()?;
 
     // Sync discipline: the server may prime a joining client with a cached keyframe that
@@ -71,18 +89,34 @@ pub fn run_stream(
             Err(e) => return Err(Box::new(e)),
         };
         let data = match msg {
-            Message::Binary(b) => b,
+            Message::Binary(b) => {
+                log::debug!("recv binary message: {} bytes", b.len());
+                b
+            }
             Message::Ping(p) => {
+                log::debug!("recv ping: {} bytes", p.len());
                 let _ = ws.send(Message::Pong(p));
                 continue;
             }
-            Message::Close(_) => break,
-            _ => continue,
+            Message::Close(c) => {
+                log::debug!("recv close: {c:?}");
+                break;
+            }
+            other => {
+                log::debug!("recv non-frame message ({} bytes), ignoring", other.len());
+                continue;
+            }
         };
         let Some(hdr) = FrameHeader::parse(&data) else {
             log::warn!("dropped a message with a bad/short infiniPixel header");
             continue;
         };
+        log::debug!(
+            "frame hdr: seq={} keyframe={} au={} bytes",
+            hdr.frame_seq,
+            hdr.is_keyframe(),
+            data.len().saturating_sub(proto::HEADER_LEN)
+        );
         // Until we're synced, ignore everything but a keyframe (feeding a P-frame with no
         // reference just spams decode errors).
         if !synced && !hdr.is_keyframe() {
@@ -94,6 +128,7 @@ pub fn run_stream(
             Ok(Some(yuv)) => {
                 synced = true;
                 let (w, h) = yuv.dimensions();
+                log::debug!("decoded frame seq={} {w}x{h} key={}", hdr.frame_seq, hdr.is_keyframe());
                 let mut rgba = vec![0u8; w * h * 4];
                 yuv.write_rgba8(&mut rgba);
                 let frame = DecodedFrame {

@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 /// The infiniPixel wire protocol constants (kept byte-identical with the JS client).
 pub mod proto {
@@ -569,13 +570,31 @@ struct HubState {
 /// strictly before or strictly after any given keyframe broadcast.
 pub struct Hub {
     state: Mutex<HubState>,
+    /// Set when a client connects so the producer can force a fresh IDR on the next frame.
+    /// A late client is primed with the cached keyframe (instant image), but the live
+    /// P-frames reference frames it never received, so it loses decode sync until the next
+    /// IDR. With idle-skip the encoder's periodic IDR (one per GOP *encoded* frames) can be
+    /// seconds of wall-clock away. Servicing this flag — respawn → first AU is an IDR — lets
+    /// a joining client resync in ~one present instead of one GOP.
+    keyframe_requested: AtomicBool,
 }
 
 impl Hub {
     pub fn new() -> Arc<Self> {
         Arc::new(Hub {
             state: Mutex::new(HubState::default()),
+            keyframe_requested: AtomicBool::new(false),
         })
+    }
+
+    /// Ask the producer to emit a fresh IDR as soon as the next frame is submitted.
+    fn request_keyframe(&self) {
+        self.keyframe_requested.store(true, Ordering::Release);
+    }
+
+    /// Consume a pending keyframe request (true at most once per request).
+    pub fn take_keyframe_request(&self) -> bool {
+        self.keyframe_requested.swap(false, Ordering::AcqRel)
     }
 
     /// Broadcast one already-framed message to every client (dropping dead ones). If
@@ -626,6 +645,9 @@ impl Hub {
             }
             st.clients.push(Client { tx });
         }
+        // The cached keyframe primed above is stale relative to the live P-frame stream;
+        // ask the producer to emit a fresh IDR so this client can decode forward from it.
+        self.request_keyframe();
         log::info!("infiniPixel client connected: {peer}");
         thread::spawn(move || {
             for msg in rx {
@@ -706,6 +728,13 @@ impl Deduper {
 /// device's `submit_bgra` runs on the vfio-user callback thread, where a blocking write
 /// would freeze the guest vCPU (verify finding). Display streaming is inherently lossy,
 /// so coalescing intermediate frames under a slow encoder is the correct behavior.
+/// Result of a deadlined [`Mailbox::take_timeout`].
+enum MailboxTake {
+    Frame(Vec<u8>),
+    Timeout,
+    Closed,
+}
+
 struct Mailbox {
     slot: Mutex<MailboxSlot>,
     cv: Condvar,
@@ -738,6 +767,7 @@ impl Mailbox {
     }
 
     /// Consumer (feeder): block until a frame is available; `None` once closed & drained.
+    #[allow(dead_code)]
     fn take(&self) -> Option<Vec<u8>> {
         let mut s = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -748,6 +778,26 @@ impl Mailbox {
                 return None;
             }
             s = self.cv.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Consumer with an idle deadline: returns the newest frame, or [`MailboxTake::Timeout`]
+    /// if none arrived within `dur` (so the feeder can re-feed the last frame to flush the
+    /// AU ffmpeg is holding), or [`MailboxTake::Closed`] once the producer is done.
+    fn take_timeout(&self, dur: Duration) -> MailboxTake {
+        let mut s = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(f) = s.frame.take() {
+                return MailboxTake::Frame(f);
+            }
+            if s.closed {
+                return MailboxTake::Closed;
+            }
+            let (guard, wt) = self.cv.wait_timeout(s, dur).unwrap_or_else(|e| e.into_inner());
+            s = guard;
+            if s.frame.is_none() && !s.closed && wt.timed_out() {
+                return MailboxTake::Timeout;
+            }
         }
     }
 
@@ -841,6 +891,11 @@ pub struct PixelStreamer {
     /// the next frame's delimiter to emit). When true, the next idle frame is fed once to
     /// flush it — so a change followed by stillness still reaches the client.
     pending_flush: bool,
+    /// Set when a client connects: the next frame respawns the encoder so its first AU is a
+    /// fresh IDR the late client can decode forward from. A same-size respawn KEEPS the
+    /// cached keyframe (see `ensure_encoder`), so a client that joins while the guest is idle
+    /// is still primed with the last valid frame instead of a black screen.
+    force_respawn: bool,
     sent: u64,
     skipped: u64,
 }
@@ -869,6 +924,7 @@ impl PixelStreamer {
             hardware_failed: false,
             dedup: Deduper::default(),
             pending_flush: false,
+            force_respawn: false,
             sent: 0,
             skipped: 0,
         })
@@ -932,10 +988,40 @@ impl PixelStreamer {
             let alive = Arc::clone(&alive);
             let mut sink = sink;
             thread::spawn(move || {
-                while let Some(frame) = mailbox.take() {
-                    if sink.submit_bgra(&frame).is_err() {
-                        alive.store(false, Ordering::Release);
-                        break;
+                // The AUD-delimited AU splitter downstream can only emit an access unit once
+                // the NEXT frame's AUD arrives, so ffmpeg holds the last frame's AU (incl. a
+                // keyframe's SPS/PPS+IDR) until another frame is fed. A guest that presents a
+                // frame then goes fully idle would therefore never flush that AU — the last
+                // visible frame (and the cached keyframe used to prime joiners) would never
+                // reach clients, leaving a late viewer black. So: after a short idle with an
+                // un-flushed frame outstanding, re-feed the last frame ONCE. That makes the
+                // splitter emit the held AU; the re-fed (identical) frame costs ~0 and its own
+                // AU is flushed by the next real frame. One extra frame per idle period keeps
+                // the "idle ⇒ ~0 bits" property intact.
+                let mut last: Option<Vec<u8>> = None;
+                let mut needs_flush = false;
+                loop {
+                    match mailbox.take_timeout(Duration::from_millis(80)) {
+                        MailboxTake::Frame(frame) => {
+                            if sink.submit_bgra(&frame).is_err() {
+                                alive.store(false, Ordering::Release);
+                                break;
+                            }
+                            last = Some(frame);
+                            needs_flush = true;
+                        }
+                        MailboxTake::Timeout => {
+                            if needs_flush {
+                                if let Some(f) = &last {
+                                    if sink.submit_bgra(f).is_err() {
+                                        alive.store(false, Ordering::Release);
+                                        break;
+                                    }
+                                }
+                                needs_flush = false;
+                            }
+                        }
+                        MailboxTake::Closed => break,
                     }
                 }
                 // dropping `sink` closes ffmpeg's stdin
@@ -981,12 +1067,22 @@ impl PixelStreamer {
     }
 
     fn ensure_encoder(&mut self, w: u32, h: u32) -> io::Result<()> {
-        // Reuse only a live session of the right size.
-        if let Some(sess) = self.enc.as_ref() {
-            if sess.w == w && sess.h == h && sess.is_alive() {
-                return Ok(());
+        // A forced respawn (keyframe request) re-creates even a live, right-size session.
+        let force = std::mem::take(&mut self.force_respawn);
+        // Reuse only a live session of the right size (unless a respawn was forced).
+        if !force {
+            if let Some(sess) = self.enc.as_ref() {
+                if sess.w == w && sess.h == h && sess.is_alive() {
+                    return Ok(());
+                }
             }
         }
+        // Whether this respawn changes resolution — the ONLY case where the cached keyframe
+        // (used to prime joiners) becomes invalid and must be dropped. A same-size respawn
+        // keeps it: it is still a decodable IDR, so a client joining before the new encoder's
+        // first IDR flushes — or while the guest is idle and that IDR never flushes — is
+        // primed with a valid frame instead of a black screen.
+        let size_changed = self.enc.as_ref().map(|s| s.w != w || s.h != h).unwrap_or(false);
         // Tear down the old session FIRST — kill ffmpeg and *join its drain thread* — so
         // it can never broadcast a trailing stale-size frame after we reset the keyframe.
         if let Some(old) = self.enc.take() {
@@ -1004,7 +1100,9 @@ impl PixelStreamer {
                 self.hardware_failed = true;
             }
         }
-        self.hub.reset_keyframe();
+        if size_changed {
+            self.hub.reset_keyframe();
+        }
 
         // Prefer hardware unless we've already learned it fails here; on a spawn error
         // with hardware, drop to software once.
@@ -1033,6 +1131,20 @@ impl PixelStreamer {
     /// no encode, no bytes — so a static desktop costs ~0, except that the first idle
     /// frame after a change is fed once to flush the last visible frame to clients.
     pub fn submit_bgra(&mut self, bgra: &[u8], w: u32, h: u32) -> io::Result<()> {
+        // A client just connected: respawn the encoder so its next AU is a fresh IDR the
+        // late client can decode forward from, and push this frame past idle-skip so that IDR
+        // is produced now (not one GOP later). The respawn KEEPS the cached keyframe (same
+        // size), so a client that joins while the guest is idle — where the fresh IDR sits
+        // un-flushed inside ffmpeg's AU splitter forever — is still primed with the last valid
+        // frame rather than a black screen. Serviced even for an unchanged frame.
+        if self.hub.take_keyframe_request() {
+            self.force_respawn = true;
+            self.ensure_encoder(w, h)?;
+            self.dedup.changed(bgra); // seed the dedup baseline with this frame
+            self.pending_flush = true;
+            self.push(bgra);
+            return Ok(());
+        }
         if !self.dedup.changed(bgra) {
             self.skipped += 1;
             if self.pending_flush {

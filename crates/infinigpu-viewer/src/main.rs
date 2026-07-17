@@ -14,6 +14,7 @@
 //! path that runs on a box with no display.
 
 mod headless;
+mod input;
 mod stream;
 mod window;
 
@@ -47,9 +48,17 @@ fn usage() -> ! {
 }
 
 fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // --debug raises the default log level to `debug` so run_stream's per-message trace is
+    // visible (RUST_LOG still overrides). Parsed before logger init since it sets the level.
+    // Use it to tell "connected but no frames arriving" (server/guest side) from "frames
+    // arrive but the window is black" (decode/present side).
+    let debug = args.iter().any(|a| a == "--debug");
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(if debug { "debug" } else { "info" }),
+    )
+    .init();
+
     let mut headless = false;
     let mut frames = 60usize;
     let mut out: Option<String> = None;
@@ -60,6 +69,7 @@ fn main() -> ExitCode {
     while i < args.len() {
         match args[i].as_str() {
             "--headless" => headless = true,
+            "--debug" => {} // consumed above (sets the log level); listed so it isn't "unknown"
             "--frames" => {
                 i += 1;
                 frames = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage());

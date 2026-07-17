@@ -9,13 +9,16 @@
 //! to run. Colour path: openh264 emits RGBA; we upload as BGRA (`B8G8R8A8_UNORM`, the
 //! near-universal swapchain format) by swapping R/B, so blit is a same-format scale.
 
+use crate::input;
 use crate::stream::{run_stream, DecodedFrame, FrameSlot};
 use ash::vk;
 use std::error::Error;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 type R<T> = Result<T, Box<dyn Error>>;
@@ -25,12 +28,16 @@ pub fn run(url: &str) -> R<()> {
     let event_loop = EventLoop::new()?;
     // Continuous redraw — a video client always wants the next frame.
     event_loop.set_control_flow(ControlFlow::Poll);
+    // Guest-input back-channel: window events → the stream thread → the server WebSocket.
+    let (input_tx, input_rx) = channel::<String>();
     let mut app = App {
         url: url.to_string(),
         window: None,
         vk: None,
         slot: FrameSlot::new(),
         net_started: false,
+        input_tx,
+        input_rx: Some(input_rx),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -42,6 +49,20 @@ struct App {
     vk: Option<VkViewer>,
     slot: Arc<FrameSlot>,
     net_started: bool,
+    /// Sends encoded input messages to the stream thread (which forwards them to the server).
+    input_tx: Sender<String>,
+    /// Moved into the stream thread on first `resumed()`.
+    input_rx: Option<Receiver<String>>,
+}
+
+impl App {
+    /// Forward one encoded input message to the server (best-effort — a full/closed channel
+    /// just drops it, exactly like a dropped video frame).
+    fn send_input(&self, msg: Option<String>) {
+        if let Some(m) = msg {
+            let _ = self.input_tx.send(m);
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -72,8 +93,9 @@ impl ApplicationHandler for App {
             let url = self.url.clone();
             let slot = Arc::clone(&self.slot);
             let proxy = window.clone();
+            let input_rx = self.input_rx.take();
             std::thread::spawn(move || {
-                let r = run_stream(&url, |f| {
+                let r = run_stream(&url, input_rx, |f| {
                     slot.put(f);
                     proxy.request_redraw(); // wake the render loop
                     true
@@ -101,6 +123,37 @@ impl ApplicationHandler for App {
                         log::error!("draw failed: {e}");
                     }
                     win.request_redraw(); // keep presenting (frame or not)
+                }
+            }
+            // ---- guest input: forwarded to the server only while the pointer is in the
+            // window (CursorMoved / MouseInput / MouseWheel fire only then) and the window
+            // has focus (KeyboardInput). No extra gating needed — winit already scopes them.
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(win) = self.window.as_ref() {
+                    let size = win.inner_size();
+                    if size.width > 0 && size.height > 0 {
+                        let x = position.x / size.width as f64;
+                        let y = position.y / size.height as f64;
+                        self.send_input(Some(input::mouse_move(x, y)));
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.send_input(input::mouse_button(button, state == ElementState::Pressed));
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                };
+                self.send_input(input::wheel(dy));
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                // Skip auto-repeat: send one down + the release; the guest repeats a held key.
+                if !event.repeat {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        self.send_input(input::key(code, event.state == ElementState::Pressed));
+                    }
                 }
             }
             _ => {}

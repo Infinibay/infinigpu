@@ -14,29 +14,48 @@ SRC=/src
 OUT=/out
 QEMU_PREFIX=/opt/qemu-vfio-user
 
-echo ">> publishing vfio-user QEMU → ${OUT}"
 mkdir -p "${OUT}/bin" "${OUT}/lib"
-cp -a "${QEMU_PREFIX}/." "${OUT}/"
+
+# Publish QEMU + its non-glibc shared-lib closure ONCE. QEMU is image-cached and only
+# rebuilds when QEMU_VER changes, so on the common device-only rebuild we skip it — which
+# also avoids `Text file busy` (ETXTBSY) when a GPU VM is running: the in-use QEMU binary
+# and its mmap'd libs cannot be overwritten in place. Force a re-publish by deleting
+# ${OUT}/bin/qemu-system-x86_64 (or wiping the volume).
+if [ ! -x "${OUT}/bin/qemu-system-x86_64" ]; then
+  echo ">> publishing vfio-user QEMU → ${OUT}"
+  cp -a "${QEMU_PREFIX}/." "${OUT}/"
+  echo ">> bundling non-glibc shared-lib closure → ${OUT}/lib"
+  { ldd "${OUT}/bin/qemu-system-x86_64" || true; } \
+    | awk '/=> \//{print $3}' | sort -u | while read -r so; do
+      case "${so}" in
+        # glibc + the runtime loader: always resolve from the container, never bundle.
+        */libc.so.*|*/libm.so.*|*/libpthread.so.*|*/libdl.so.*|*/librt.so.*|*/libresolv.so.*|*/ld-linux*) : ;;
+        *) cp -Lv "${so}" "${OUT}/lib/" || true ;;
+      esac
+    done
+  patchelf --set-rpath '$ORIGIN/../lib' "${OUT}/bin/qemu-system-x86_64" || true
+else
+  echo ">> vfio-user QEMU already published — skipping (device-only rebuild; a running VM keeps its binary)"
+fi
 
 echo ">> building infinigpu-device (release, bookworm ABI)…"
 cd "${SRC}"
 export CARGO_TARGET_DIR=/target
 cargo build --release -p infinigpu-device
-install -Dm0755 /target/release/infinigpu-device "${OUT}/bin/infinigpu-device"
 
-echo ">> bundling non-glibc shared-lib closure → ${OUT}/lib"
-{ ldd "${OUT}/bin/qemu-system-x86_64" || true; ldd "${OUT}/bin/infinigpu-device" || true; } \
-  | awk '/=> \//{print $3}' | sort -u | while read -r so; do
-    case "${so}" in
-      # glibc + the runtime loader: always resolve from the container, never bundle.
-      */libc.so.*|*/libm.so.*|*/libpthread.so.*|*/libdl.so.*|*/librt.so.*|*/libresolv.so.*|*/ld-linux*) : ;;
-      *) cp -Lv "${so}" "${OUT}/lib/" || true ;;
-    esac
-  done
-
-echo ">> rpath-patching binaries to \$ORIGIN/../lib (self-contained, no LD_LIBRARY_PATH)"
-patchelf --set-rpath '$ORIGIN/../lib' "${OUT}/bin/qemu-system-x86_64" || true
-patchelf --set-rpath '$ORIGIN/../lib' "${OUT}/bin/infinigpu-device" || true
+# Publish the device via a temp file + atomic rename so a running device server (which has
+# the old binary mmap'd) is never overwritten in place — rename gives the live process its
+# old inode and the next spawn the new one. Bundle any NEW non-glibc dep the device grows.
+echo ">> bundling device shared-lib closure → ${OUT}/lib"
+ldd /target/release/infinigpu-device | awk '/=> \//{print $3}' | sort -u | while read -r so; do
+  case "${so}" in
+    */libc.so.*|*/libm.so.*|*/libpthread.so.*|*/libdl.so.*|*/librt.so.*|*/libresolv.so.*|*/ld-linux*) : ;;
+    *) [ -e "${OUT}/lib/$(basename "${so}")" ] || cp -Lv "${so}" "${OUT}/lib/" || true ;;
+  esac
+done
+install -m0755 /target/release/infinigpu-device "${OUT}/bin/.infinigpu-device.new"
+patchelf --set-rpath '$ORIGIN/../lib' "${OUT}/bin/.infinigpu-device.new" || true
+mv -f "${OUT}/bin/.infinigpu-device.new" "${OUT}/bin/infinigpu-device"
 
 test -x "${OUT}/bin/qemu-system-x86_64" || { echo "!! QEMU missing in output"; exit 1; }
 test -x "${OUT}/bin/infinigpu-device"   || { echo "!! device binary missing in output"; exit 1; }
