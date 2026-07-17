@@ -117,7 +117,8 @@ the per-VM device-server lifecycle, the `Department` GPU policy fields + `GpuBro
 | NVML real capacity + per-process VRAM attribution (broker admits against measured VRAM) | ✅ working |
 | Per-VM jailed replay *process* (the isolation half of ADR-0003) | ⏳ next |
 | Infinibay backend/infinization wiring (per [`docs/INTEGRATION.md`](docs/INTEGRATION.md)) | ⏳ blueprint ready |
-| Windows guest (IddCx → WDDM, DXVK/vkd3d) | ⏳ Phase 2–3 |
+| Windows guest — IddCx indirect-display **skeleton** (guest/windows, unbuilt — needs a WDK/Windows env) | 🧩 skeleton |
+| Windows guest — KMDF PCI companion + WDDM render miniport (DXVK/vkd3d) | ⏳ Phase 2–3 |
 
 **Honest risk** (see [`docs/RISKS.md`](docs/RISKS.md)): as a *commodity multi-tenant SLA product on
 GA102* this is a **NO-GO** (a severe Xid forces a device-wide GPU reset with no MIG). It is a **GO**

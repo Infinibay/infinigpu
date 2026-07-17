@@ -1,0 +1,55 @@
+; infinigpu-idd.inf — install information for the infinigpu IddCx indirect display driver.
+; ⚠ VALIDATE ON WINDOWS — not tested. UMDF/IddCx indirect display class. A production
+; package must be attestation-signed (or WHQL); test-signing is dev-only.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = infinigpu-idd.cat
+DriverVer   = ; set by stampinf / build
+PnpLockdown = 1
+
+[Manufacturer]
+%ProviderName% = Standard,NT$ARCH$.10.0...16299
+
+; The device is surfaced by the KMDF PCI companion (infinigpu-kmdf) as a child, OR installed
+; as a root-enumerated software device for bring-up. ⚠ pick one; hardware id must match.
+[Standard.NT$ARCH$.10.0...16299]
+%DeviceName% = infinigpu_Install, Root\infinigpu-idd
+
+[infinigpu_Install.NT]
+CopyFiles = infinigpu_CopyFiles
+
+[infinigpu_CopyFiles]
+infinigpu-idd.dll
+
+[infinigpu_Install.NT.Wdf]
+UmdfService              = infinigpu-idd, infinigpu_Service
+UmdfServiceOrder         = infinigpu-idd
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfFileObjectPolicy     = AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction  = Copy
+
+[infinigpu_Service]
+UmdfLibraryVersion = $UMDFVERSION$
+ServiceBinary      = %13%\infinigpu-idd.dll
+DriverCLSID        = {a4a3d0f0-1111-2222-3333-444455556666} ; ⚠ generate your own CLSID
+
+[infinigpu_Install.NT.Services]
+AddService = ,0x00000002
+
+[SourceDisksFiles]
+infinigpu-idd.dll = 1
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[DestinationDirs]
+infinigpu_CopyFiles = 13 ; DIRID_DRIVER_STORE
+
+[Strings]
+ProviderName = "Infinibay LLC"
+DeviceName   = "infinigpu virtual display"
+DiskName     = "infinigpu-idd Installation Media"

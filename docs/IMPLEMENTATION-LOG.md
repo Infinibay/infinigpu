@@ -506,6 +506,28 @@ crate so the GPU-agnostic `infinigpu-sched` never links a vendor lib:
 GPU fault blast-radius of one VM (not the whole device) both fall out. The `serve_with_broker` entry
 point and the GPU-agnostic sched crate already anticipate the split.
 
+### 2026-07-17 — 🪟 Windows guest: IddCx indirect-display skeleton (unbuilt)
+
+Owner asked to write the Windows guest skeleton even though there's no Windows/WDK env here to
+compile or validate it — so `guest/windows/` is an **explicitly-unbuilt** starting point, every
+Windows-specific assumption marked `⚠ validate on Windows`. Architecture (in the dir README):
+the Windows desktop reaches our device through **two** pieces, because the framework that
+captures the desktop (IddCx, user-mode) can't touch our PCI device (kernel-mode):
+- **`infinigpu-idd`** (this skeleton, C++ UMDF/IddCx): registers a virtual monitor, and its
+  swap-chain processor thread acquires each composited desktop frame
+  (`IddCxSwapChainReleaseAndAcquireBuffer`), copies it to a CPU-readable D3D11 staging texture,
+  maps it, and hands the BGRA bytes to `HostLink::SubmitFrame`. Files: `Driver.cpp`,
+  `HostLink.h`, `infinigpu-idd.inf`, `infinigpu-idd.vcxproj`.
+- **`infinigpu-kmdf`** (documented, not written): the KMDF companion that binds the PCI device,
+  maps BAR0, owns the scanout framebuffer, and issues `DISPLAY_SCANOUT` — the direct analogue of
+  the Linux driver's page-flip, speaking the **same** `infinigpu-abi` wire contract. `HostLink`
+  is the seam (a real IOCTL impl + a bring-up stub that drops frames so the IddCx loop is
+  observable without the companion).
+
+This is the "IddCx display-only first" rung; the WDDM render miniport (DXVK/vkd3d → our device)
+is Phase 2–3. Nothing here is compiled — a Windows dev completes it: build with the WDK, write
+the KMDF companion, sign, and wire the backend serve/install path (like infiniservice).
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against
