@@ -83,9 +83,31 @@ pub fn run_stream(
     let mut synced = false;
 
     loop {
+        // Forward any pending guest input on the SAME socket first, so a static screen —
+        // where the time-boxed reads below just keep timing out — still delivers mouse and
+        // keyboard promptly (bounded ~16ms latency). Non-blocking drain; the window thread is
+        // the producer. Frames are binary, input is text; the two directions share the socket.
+        if let Some(rx) = &input_rx {
+            while let Ok(js) = rx.try_recv() {
+                if let Err(e) = ws.send(Message::Text(js.into())) {
+                    log::debug!("infiniPixel: input send failed: {e}");
+                }
+            }
+        }
+
         let msg = match ws.read() {
             Ok(m) => m,
             Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => break,
+            // Time-boxed read (input interleaving) with no frame ready yet: NOT an error —
+            // loop back to drain input + retry. tungstenite buffers any partial frame, so a
+            // large keyframe split across several timeouts resumes cleanly. This arm only
+            // fires when `input_rx` set the read timeout above (headless path stays blocking).
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
             Err(e) => return Err(Box::new(e)),
         };
         let data = match msg {
