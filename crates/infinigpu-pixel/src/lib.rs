@@ -43,6 +43,9 @@ pub mod proto {
     pub mod codec {
         pub const H264: u8 = 1;
         pub const HEVC: u8 = 2;
+        /// Reserved for AV1. AV1 is OBU-framed (no Annex-B start codes / AUDs), so it
+        /// needs a different splitter than [`super::super::AuSplitter`] — not yet wired.
+        pub const AV1: u8 = 3;
     }
     pub mod flags {
         /// This access unit is a keyframe (contains SPS/PPS + IDR) — a client may
@@ -63,6 +66,34 @@ impl Codec {
         match self {
             Codec::H264 => proto::codec::H264,
             Codec::Hevc => proto::codec::HEVC,
+        }
+    }
+
+    /// The NAL unit type of this codec's access-unit delimiter (what the splitter cuts
+    /// on). H.264 AUD = 9; HEVC AUD = 35.
+    fn aud_type(self) -> u8 {
+        match self {
+            Codec::H264 => 9,
+            Codec::Hevc => 35,
+        }
+    }
+
+    /// NAL unit type from the byte after a `00 00 01` start code. H.264 has a 1-byte NAL
+    /// header (`type = b & 0x1F`); HEVC a 2-byte header (`type = (b >> 1) & 0x3F`).
+    fn nal_type(self, byte_after_startcode: u8) -> u8 {
+        match self {
+            Codec::H264 => byte_after_startcode & 0x1F,
+            Codec::Hevc => (byte_after_startcode >> 1) & 0x3F,
+        }
+    }
+
+    /// Whether a NAL unit type marks a keyframe / decodable stream-start for this codec.
+    /// H.264: IDR(5) or SPS(7). HEVC: IDR_W_RADL(19)/IDR_N_LP(20)/CRA(21) or
+    /// VPS(32)/SPS(33)/PPS(34).
+    fn is_keyframe_nal(self, t: u8) -> bool {
+        match self {
+            Codec::H264 => t == 5 || t == 7,
+            Codec::Hevc => matches!(t, 19 | 20 | 21 | 32 | 33 | 34),
         }
     }
 }
@@ -161,12 +192,13 @@ impl FrameHeader {
 
 // ------------------------------- Annex-B AU splitting -------------------------------
 
-/// Find the next access-unit delimiter (start code + AUD NAL, type 9) at or after
+/// Find the next access-unit delimiter (start code + this codec's AUD NAL) at or after
 /// `from`, returning the index of its `00 00 01`.
-fn find_aud(buf: &[u8], from: usize) -> Option<usize> {
+fn find_aud(buf: &[u8], from: usize, codec: Codec) -> Option<usize> {
+    let aud = codec.aud_type();
     let mut i = from;
     while i + 3 < buf.len() {
-        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 && (buf[i + 3] & 0x1F) == 9 {
+        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 && codec.nal_type(buf[i + 3]) == aud {
             return Some(i);
         }
         i += 1;
@@ -174,13 +206,13 @@ fn find_aud(buf: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// True if the access unit contains an IDR (NAL type 5) or SPS (7) — i.e. a keyframe.
-fn au_is_keyframe(au: &[u8]) -> bool {
+/// True if the access unit contains a keyframe NAL for `codec` (H.264 IDR/SPS; HEVC
+/// IDR/CRA or VPS/SPS/PPS).
+fn au_is_keyframe(au: &[u8], codec: Codec) -> bool {
     let mut i = 0;
     while i + 3 < au.len() {
         if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
-            let t = au[i + 3] & 0x1F;
-            if t == 5 || t == 7 {
+            if codec.is_keyframe_nal(codec.nal_type(au[i + 3])) {
                 return true;
             }
             i += 3;
@@ -192,17 +224,21 @@ fn au_is_keyframe(au: &[u8]) -> bool {
 }
 
 /// Splits a raw Annex-B byte stream (with an AUD before every access unit, courtesy of
-/// the `h264_metadata=aud=insert` bitstream filter) into complete access units.
-#[derive(Default)]
+/// the `{h264,hevc}_metadata=aud=insert` bitstream filter) into complete access units.
 struct AuSplitter {
     buf: Vec<u8>,
+    codec: Codec,
 }
 
 impl AuSplitter {
+    fn new(codec: Codec) -> Self {
+        AuSplitter { buf: Vec::new(), codec }
+    }
+
     fn push(&mut self, incoming: &[u8], mut emit: impl FnMut(Vec<u8>)) {
         self.buf.extend_from_slice(incoming);
         // Drop any leading bytes before the first AUD.
-        match find_aud(&self.buf, 0) {
+        match find_aud(&self.buf, 0, self.codec) {
             Some(0) => {}
             Some(first) => {
                 self.buf.drain(0..first);
@@ -210,7 +246,7 @@ impl AuSplitter {
             None => return,
         }
         // buf[0] is now an AUD. Emit [AUD_n .. AUD_{n+1}) for every complete AU.
-        while let Some(next) = find_aud(&self.buf, 4) {
+        while let Some(next) = find_aud(&self.buf, 4, self.codec) {
             let au: Vec<u8> = self.buf.drain(0..next).collect();
             emit(au);
         }
@@ -224,7 +260,7 @@ impl AuSplitter {
         // After `push`, buf is either empty or a single complete AU: `[AUD_last .. end]`
         // (all leading junk drained, no trailing AUD left). Emit it only if it is a real
         // AU — an AUD plus at least one following NAL — not a bare/partial delimiter.
-        if self.buf.len() > 6 && find_aud(&self.buf, 0) == Some(0) {
+        if self.buf.len() > 6 && find_aud(&self.buf, 0, self.codec) == Some(0) {
             emit(std::mem::take(&mut self.buf));
         } else {
             self.buf.clear();
@@ -261,8 +297,30 @@ pub struct EncoderConfig {
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
-    /// Prefer `h264_nvenc`; fall back to `libx264` if the hardware encoder fails.
+    /// Prefer the NVENC hardware encoder; fall back to the software encoder if it fails.
     pub prefer_hardware: bool,
+    /// H.264 (universal fallback) or HEVC (better compression, `hevc_nvenc`).
+    pub codec: Codec,
+    /// Use NVENC **Periodic Intra Refresh** (a rolling refresh wave) instead of periodic
+    /// IDR frames — smoother bitrate, no IDR spikes (ADR-0009 v1). Note: with intra-refresh
+    /// there are no mid-stream IDRs, so a late-joining keyframe-gated client can only
+    /// resync after a full refresh cycle; keep it **off** (the default) when clients join
+    /// mid-stream, on for a single long-lived viewer. Hardware only.
+    pub intra_refresh: bool,
+}
+
+impl Default for EncoderConfig {
+    fn default() -> Self {
+        EncoderConfig {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            bitrate_kbps: 8000,
+            prefer_hardware: true,
+            codec: Codec::H264,
+            intra_refresh: false,
+        }
+    }
 }
 
 impl Encoder {
@@ -281,19 +339,39 @@ impl Encoder {
         let stdout = child.stdout.take().expect("piped stdout");
 
         let (tx, rx) = channel();
-        thread::spawn(move || Self::reader_loop(stdout, tx));
+        let codec = cfg.codec;
+        thread::spawn(move || Self::reader_loop(stdout, tx, codec));
 
         Ok(Encoder {
             child: Some(child),
             stdin,
             rx: Some(rx),
-            codec: Codec::H264,
+            codec,
             hardware,
         })
     }
 
     fn ffmpeg_args(cfg: &EncoderConfig, hardware: bool) -> Vec<String> {
-        let gop = (cfg.fps * 2).max(2); // periodic IDR every ~2s (v0; intra-refresh is v1)
+        let gop = (cfg.fps * 2).max(2); // periodic IDR every ~2s (unless intra-refresh)
+        // Per-codec: NVENC encoder, software fallback, the AUD-insert metadata bsf, the
+        // software params key, and the raw-bitstream muxer.
+        let (nvenc, sw_enc, meta_bsf, sw_params_key, muxer) = match cfg.codec {
+            Codec::H264 => (
+                "h264_nvenc",
+                "libx264",
+                "h264_metadata=aud=insert",
+                "-x264-params",
+                "h264",
+            ),
+            Codec::Hevc => (
+                "hevc_nvenc",
+                "libx265",
+                "hevc_metadata=aud=insert",
+                "-x265-params",
+                "hevc",
+            ),
+        };
+        let bitrate = format!("{}k", cfg.bitrate_kbps);
         let mut a: Vec<String> = vec![
             "-hide_banner", "-loglevel", "error",
             "-f", "rawvideo", "-pix_fmt", "bgra",
@@ -307,21 +385,26 @@ impl Encoder {
         .collect();
 
         if hardware {
-            a.extend(
-                [
-                    "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull",
-                    "-rc", "cbr", "-b:v", &format!("{}k", cfg.bitrate_kbps),
-                    "-bf", "0", "-g", &gop.to_string(), "-forced-idr", "1", "-delay", "0",
-                ]
-                .into_iter()
-                .map(String::from),
-            );
+            let mut hw: Vec<String> = [
+                "-c:v", nvenc, "-preset", "p1", "-tune", "ull",
+                "-rc", "cbr", "-b:v", &bitrate, "-bf", "0", "-delay", "0",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            if cfg.intra_refresh {
+                // Rolling refresh instead of IDRs: no mid-stream keyframes, smoother rate.
+                hw.extend(["-intra-refresh", "1", "-g", &gop.to_string()].map(String::from));
+            } else {
+                hw.extend(["-g", &gop.to_string(), "-forced-idr", "1"].map(String::from));
+            }
+            a.extend(hw);
         } else {
             a.extend(
                 [
-                    "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-                    "-x264-params", "bframes=0:scenecut=0",
-                    "-b:v", &format!("{}k", cfg.bitrate_kbps), "-g", &gop.to_string(),
+                    "-c:v", sw_enc, "-preset", "ultrafast", "-tune", "zerolatency",
+                    sw_params_key, "bframes=0:scenecut=0",
+                    "-b:v", &bitrate, "-g", &gop.to_string(),
                 ]
                 .into_iter()
                 .map(String::from),
@@ -329,21 +412,21 @@ impl Encoder {
         }
         // AUD before each AU so the reader can split cleanly; raw Annex-B on stdout.
         a.extend(
-            ["-bsf:v", "h264_metadata=aud=insert", "-f", "h264", "-"]
+            ["-bsf:v", meta_bsf, "-f", muxer, "-"]
                 .into_iter()
                 .map(String::from),
         );
         a
     }
 
-    fn reader_loop(mut stdout: std::process::ChildStdout, tx: Sender<EncodedAu>) {
-        let mut splitter = AuSplitter::default();
+    fn reader_loop(mut stdout: std::process::ChildStdout, tx: Sender<EncodedAu>, codec: Codec) {
+        let mut splitter = AuSplitter::new(codec);
         let mut seq: u64 = 0;
         let mut chunk = [0u8; 64 * 1024];
         // `Fn` (captures nothing) so both the streaming loop and the final flush can
         // reuse it while each takes its own mutable borrow of `seq`.
         let send_au = |au: Vec<u8>, seq: &mut u64, tx: &Sender<EncodedAu>| {
-            let keyframe = au_is_keyframe(&au);
+            let keyframe = au_is_keyframe(&au, codec);
             let s = *seq;
             *seq += 1;
             let _ = tx.send(EncodedAu {
@@ -432,8 +515,12 @@ impl infinigpu_hal::MediaEncoder for Encoder {
             // NVENC on the GPU vs. libx264 on the CPU.
             vendor: if self.hardware { Vendor::Nvidia } else { Vendor::Software },
             hardware: self.hardware,
-            // v0 encodes H.264 (the universal fallback); HEVC/AV1 are negotiated later.
-            encode: vec![VideoCodec::H264],
+            // The codec this encoder is actually configured for (H.264 universal fallback,
+            // or HEVC). AV1 is not yet wired (OBU framing).
+            encode: vec![match self.codec {
+                Codec::H264 => VideoCodec::H264,
+                Codec::Hevc => VideoCodec::Hevc,
+            }],
             low_latency: true,
             // GA102 has a single NVENC block — a scarce, first-class admission resource
             // (ADR-0007). Software encode is bounded by CPU, not a fixed engine count.
@@ -735,6 +822,10 @@ pub struct PixelStreamer {
     hub: Arc<Hub>,
     fps: u32,
     bitrate_kbps: u32,
+    /// Codec for spawned encoders (H.264 default; HEVC for better compression).
+    codec: Codec,
+    /// Use NVENC intra-refresh instead of periodic IDRs (see [`EncoderConfig::intra_refresh`]).
+    intra_refresh: bool,
     /// The current encoder session (sized to the last frame), if any.
     enc: Option<EncoderSession>,
     /// Latched once a hardware NVENC encoder is shown not to work on this host, so every
@@ -768,6 +859,8 @@ impl PixelStreamer {
             hub,
             fps,
             bitrate_kbps,
+            codec: Codec::H264,
+            intra_refresh: false,
             enc: None,
             hardware_failed: false,
             dedup: Deduper::default(),
@@ -775,6 +868,21 @@ impl PixelStreamer {
             sent: 0,
             skipped: 0,
         })
+    }
+
+    /// Select the codec for future encoders (H.264 default; HEVC = better compression,
+    /// decodable by the browser/ffmpeg path — the native openh264 client is H.264-only).
+    /// Takes effect on the next encoder (re)creation.
+    pub fn with_codec(mut self, codec: Codec) -> Self {
+        self.codec = codec;
+        self
+    }
+
+    /// Enable NVENC intra-refresh (smoother bitrate, no IDR spikes). Off by default —
+    /// see [`EncoderConfig::intra_refresh`] for the late-join caveat.
+    pub fn with_intra_refresh(mut self, on: bool) -> Self {
+        self.intra_refresh = on;
+        self
     }
 
     /// Convenience for a fixed-size producer: bind + prime the encoder for `w`×`h`.
@@ -793,6 +901,9 @@ impl PixelStreamer {
             fps: self.fps,
             bitrate_kbps: self.bitrate_kbps,
             prefer_hardware: hardware,
+            codec: self.codec,
+            // Intra-refresh is a hardware-only NVENC feature; software falls back to IDRs.
+            intra_refresh: self.intra_refresh && hardware,
         };
         let mut enc = Encoder::spawn(&cfg)?;
         let sink = enc
@@ -1070,13 +1181,13 @@ mod tests {
         // trailing AUD so the 2nd AU is terminated
         stream.extend_from_slice(&aud);
 
-        let mut splitter = AuSplitter::default();
+        let mut splitter = AuSplitter::new(Codec::H264);
         let mut aus: Vec<Vec<u8>> = Vec::new();
         splitter.push(&stream, |au| aus.push(au));
 
         assert_eq!(aus.len(), 2, "expected two complete access units");
-        assert!(!au_is_keyframe(&aus[0]), "first AU is a plain slice");
-        assert!(au_is_keyframe(&aus[1]), "second AU carries an SPS → keyframe");
+        assert!(!au_is_keyframe(&aus[0], Codec::H264), "first AU is a plain slice");
+        assert!(au_is_keyframe(&aus[1], Codec::H264), "second AU carries an SPS → keyframe");
     }
 
     #[test]
@@ -1106,20 +1217,49 @@ mod tests {
         stream.extend_from_slice(&aud);
         stream.extend_from_slice(&idr);
 
-        let mut splitter = AuSplitter::default();
+        let mut splitter = AuSplitter::new(Codec::H264);
         let mut aus: Vec<Vec<u8>> = Vec::new();
         splitter.push(&stream, |au| aus.push(au));
         assert_eq!(aus.len(), 1, "push emits only the delimited first AU");
 
         splitter.flush(|au| aus.push(au));
         assert_eq!(aus.len(), 2, "flush emits the held final AU");
-        assert!(au_is_keyframe(&aus[1]), "the flushed final AU is the IDR");
+        assert!(au_is_keyframe(&aus[1], Codec::H264), "the flushed final AU is the IDR");
+    }
+
+    #[test]
+    fn au_splitter_hevc_splits_and_detects_keyframe() {
+        // HEVC NAL header is 2 bytes; type = (first byte >> 1) & 0x3F. AUD=35 (0x46),
+        // TRAIL_R=1 (0x02), VPS=32 (0x40), IDR_W_RADL=19 (0x26).
+        let aud = [0u8, 0, 0, 1, 0x46, 0x01];
+        let trail = [0u8, 0, 0, 1, 0x02, 0x01, 0xAA]; // non-keyframe slice
+        let vps = [0u8, 0, 0, 1, 0x40, 0x01, 0x0c]; // VPS → keyframe marker
+        let idr = [0u8, 0, 0, 1, 0x26, 0x01, 0xBB]; // IDR_W_RADL
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&aud);
+        stream.extend_from_slice(&trail);
+        stream.extend_from_slice(&aud);
+        stream.extend_from_slice(&vps);
+        stream.extend_from_slice(&idr);
+        stream.extend_from_slice(&aud); // terminator
+
+        let mut splitter = AuSplitter::new(Codec::Hevc);
+        let mut aus: Vec<Vec<u8>> = Vec::new();
+        splitter.push(&stream, |au| aus.push(au));
+        assert_eq!(aus.len(), 2, "two HEVC access units");
+        assert!(!au_is_keyframe(&aus[0], Codec::Hevc), "first HEVC AU is a plain trailing slice");
+        assert!(au_is_keyframe(&aus[1], Codec::Hevc), "second HEVC AU has VPS+IDR → keyframe");
+        // The H.264 splitter must NOT match HEVC's AUD (35), so it sees no AUs here.
+        let mut h264 = AuSplitter::new(Codec::H264);
+        let mut none: Vec<Vec<u8>> = Vec::new();
+        h264.push(&stream, |au| none.push(au));
+        assert!(none.is_empty(), "H.264 splitter ignores HEVC AUDs");
     }
 
     #[test]
     fn au_splitter_flush_ignores_bare_delimiter() {
         // A lone AUD (no following NAL) is not a real AU — flush must not emit it.
-        let mut splitter = AuSplitter::default();
+        let mut splitter = AuSplitter::new(Codec::H264);
         let mut aus: Vec<Vec<u8>> = Vec::new();
         splitter.push(&[0u8, 0, 0, 1, 9, 0x10], |au| aus.push(au));
         splitter.flush(|au| aus.push(au));
@@ -1151,13 +1291,13 @@ mod tests {
         full.extend_from_slice(&slice);
         full.extend_from_slice(&aud); // terminator
 
-        let mut splitter = AuSplitter::default();
+        let mut splitter = AuSplitter::new(Codec::H264);
         let mut aus: Vec<Vec<u8>> = Vec::new();
         // Feed one byte at a time to stress the incremental scanner.
         for b in &full {
             splitter.push(&[*b], |au| aus.push(au));
         }
         assert_eq!(aus.len(), 1);
-        assert!(au_is_keyframe(&aus[0]));
+        assert!(au_is_keyframe(&aus[0], Codec::H264));
     }
 }

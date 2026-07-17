@@ -111,7 +111,8 @@ the per-VM device-server lifecycle, the `Department` GPU policy fields + `GpuBro
 | Phase-0 loop, DRM/KMS display, cbindgen ABI guard | ✅ working |
 | Multi-VM broker (admission + weighted fair-share), multi-ring, vendor HAL | ✅ working |
 | infiniPixel v0 (NVENC H.264 + owned protocol + WebCodecs) + idle-skip + device wiring | ✅ working |
-| infiniPixel v1 (damage-rect hybrid, intra-refresh, HEVC/AV1, WebTransport, perceptual/foveation) | ⏳ next |
+| infiniPixel: **HEVC codec** + **NVENC intra-refresh** (codec-generic AU splitter) | ✅ working |
+| infiniPixel v1 remainder (damage-rect hybrid, AV1 OBU framing, WebTransport, perceptual/foveation) | ⏳ next |
 | Per-VM jailed replay *process* + NVML attribution (ADR-0003) | ⏳ next |
 | Infinibay backend/infinization wiring (per [`docs/INTEGRATION.md`](docs/INTEGRATION.md)) | ⏳ blueprint ready |
 | Windows guest (IddCx → WDDM, DXVK/vkd3d) | ⏳ Phase 2–3 |

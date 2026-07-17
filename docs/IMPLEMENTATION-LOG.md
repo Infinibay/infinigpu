@@ -463,6 +463,29 @@ Video/NVDEC is the v1 upgrade behind the same seam). The `FrameHeader` wire cont
   RGBA, writes a PPM. The **windowed** path (winit + Vulkan swapchain) is compile- and clippy-clean but
   needs a Wayland/Win32 session to run — validate on a desktop with `cargo run -p infinigpu-viewer -- --port <P>`.
 
+### 2026-07-17 — 🎞️ infiniPixel v1 (part): HEVC codec + NVENC intra-refresh
+
+First slice of infiniPixel v1 (ADR-0009). The AU splitter and keyframe detection were H.264-
+specific (AUD NAL 9, 1-byte NAL header, IDR/SPS); they are now **codec-generic**, driven by a
+`Codec` that knows each codec's AUD type, NAL-header width, and keyframe NAL set:
+- **HEVC** (`hevc_nvenc` / `libx265`, `hevc_metadata=aud=insert`): AUD = 35, 2-byte NAL header
+  (`type = (b >> 1) & 0x3F`), keyframe = IDR_W_RADL/IDR_N_LP/CRA (19/20/21) or VPS/SPS/PPS
+  (32/33/34). Validated end-to-end: streamed HEVC carries wire codec-byte 2 and ffmpeg decodes
+  our framed AUs to a PNG; a unit test checks HEVC split + keyframe detection and that the H.264
+  splitter correctly ignores HEVC AUDs. HEVC is decodable by the browser (WebCodecs) / ffmpeg path;
+  the native openh264 client stays H.264 (codec negotiation picks per client).
+- **NVENC intra-refresh** (`-intra-refresh 1`): a rolling refresh wave instead of periodic IDRs —
+  smoother bitrate, no IDR spikes. Opt-in (`PixelStreamer::with_intra_refresh`), default off, because
+  without mid-stream IDRs a late keyframe-gated client can only resync after a full refresh cycle;
+  it's for a single long-lived viewer. Hardware-only (software falls back to IDRs).
+- `EncoderConfig` gained `codec` + `intra_refresh` (with a `Default`); `PixelStreamer` gained
+  `with_codec()` / `with_intra_refresh()` builders; `pixel_demo` gained `--codec h264|hevc` and
+  `--intra-refresh`. `proto::codec::AV1 = 3` is reserved.
+
+**Still to do for infiniPixel v1:** AV1 (OBU framing — no start codes, needs a different splitter),
+damage-rect hybrid (use the guest damage map instead of the full-frame idle hash), WebTransport/QUIC
+transport, and the perceptual/foveation QP layer.
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against
