@@ -566,7 +566,7 @@ impl InfinigpuBackend {
         // infiniPixel: encode this framebuffer on NVENC and stream it to any browsers.
         if streaming {
             self.stream_frame(&bgra, w as u32, h as u32);
-            if self.present_count % 60 == 0 {
+            if self.present_count.is_multiple_of(60) {
                 if let Some(p) = &self.pixel {
                     let (sent, skipped) = p.stats();
                     info!("infiniPixel: {sent} frames encoded, {skipped} idle-skipped (unchanged)");
@@ -584,7 +584,15 @@ impl InfinigpuBackend {
     /// both stream correctly.
     fn stream_frame(&mut self, bgra: &[u8], w: u32, h: u32) {
         if let Some(p) = self.pixel.as_mut() {
-            let _ = p.submit_bgra(bgra, w, h);
+            // submit_bgra is now non-blocking (latest-wins mailbox), so this never stalls
+            // the vfio-user callback thread on encode. An Err means the encoder couldn't
+            // be (re)spawned at all — surface it (rate-limited) instead of silently
+            // dropping a dead stream (verify finding).
+            if let Err(e) = p.submit_bgra(bgra, w, h) {
+                if self.present_count.is_multiple_of(60) {
+                    log::warn!("infiniPixel: frame submit failed ({e}); stream may be down");
+                }
+            }
         }
     }
 
@@ -615,9 +623,19 @@ impl InfinigpuBackend {
         // Validate guest-controlled geometry BEFORE the GPU sees it (fail-closed;
         // mirrors present_scanout). Keeps an overflowing width×height from ever
         // panicking inside the shared run-lock and bricking the fleet (verify finding).
+        // The byte count is computed with checked_mul: `width*height*4` on hostile u32
+        // dimensions overflows u64 (panicking under debug overflow-checks, silently
+        // wrapping past the cap under release) — so an overflow must map to "reject",
+        // not to a multiply. Each dimension is also bounded directly so the extent
+        // handed to Vulkan is capped here, not only by the downstream driver's limit.
+        let bytes = (cp.width as u64)
+            .checked_mul(cp.height as u64)
+            .and_then(|px| px.checked_mul(4));
         if cp.width == 0
             || cp.height == 0
-            || (cp.width as u64 * cp.height as u64 * 4) > 64 * 1024 * 1024
+            || cp.width > 16384
+            || cp.height > 16384
+            || bytes.is_none_or(|b| b > 64 * 1024 * 1024)
         {
             log::error!("render_clear: bad geometry {}x{}", cp.width, cp.height);
             return;
@@ -843,9 +861,11 @@ mod tests {
         ctrl::CMD_RING_CFG + ctx * CMD_RING_STRIDE + ctrl::CMD_RING_RETIRED_LO
     }
 
+    // Compile-time invariant: multi-ring must serve >1 context.
+    const _: () = assert!(NUM_CONTEXTS >= 2, "multi-ring must serve >1 context");
+
     #[test]
     fn advertises_multiple_command_rings() {
-        assert!(NUM_CONTEXTS >= 2, "multi-ring must serve >1 context");
         let mut b = InfinigpuBackend::new();
         assert_eq!(b.bar0_read_u32(ctrl::NUM_CONTEXTS), NUM_CONTEXTS as u32);
     }

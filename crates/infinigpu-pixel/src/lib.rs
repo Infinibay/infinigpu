@@ -27,8 +27,9 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 /// The infiniPixel wire protocol constants (kept byte-identical with the JS client).
@@ -182,6 +183,21 @@ impl AuSplitter {
             emit(au);
         }
     }
+
+    /// Emit the final buffered access unit. `push` always holds the most-recent AU back
+    /// because it needs the *next* frame's AUD to delimit it; on end-of-stream (ffmpeg
+    /// exit or a resolution-change teardown) that held AU would otherwise be lost. Call
+    /// this once the input is done so the last encoded frame still reaches clients.
+    fn flush(&mut self, mut emit: impl FnMut(Vec<u8>)) {
+        // After `push`, buf is either empty or a single complete AU: `[AUD_last .. end]`
+        // (all leading junk drained, no trailing AUD left). Emit it only if it is a real
+        // AU — an AUD plus at least one following NAL — not a bare/partial delimiter.
+        if self.buf.len() > 6 && find_aud(&self.buf, 0) == Some(0) {
+            emit(std::mem::take(&mut self.buf));
+        } else {
+            self.buf.clear();
+        }
+    }
 }
 
 // ----------------------------------- Encoder ----------------------------------------
@@ -196,9 +212,12 @@ impl AuSplitter {
 /// project's own NVENC/Vulkan-Video FFI backend is still to come (a codec *backend*,
 /// per the ADR-0008 vendor HAL — not the protocol).
 pub struct Encoder {
-    child: Child,
+    /// `Option` so a caller can `take_child` and own the reap/kill itself (the
+    /// [`PixelStreamer`] session does this so it can `kill()` a wedged ffmpeg — see the
+    /// note on [`Encoder::take_child`]). When still present, `Drop` kills + reaps.
+    child: Option<Child>,
     stdin: Option<ChildStdin>,
-    rx: Receiver<EncodedAu>,
+    rx: Option<Receiver<EncodedAu>>,
     codec: Codec,
     hardware: bool,
 }
@@ -233,9 +252,9 @@ impl Encoder {
         thread::spawn(move || Self::reader_loop(stdout, tx));
 
         Ok(Encoder {
-            child,
+            child: Some(child),
             stdin,
-            rx,
+            rx: Some(rx),
             codec: Codec::H264,
             hardware,
         })
@@ -289,22 +308,28 @@ impl Encoder {
         let mut splitter = AuSplitter::default();
         let mut seq: u64 = 0;
         let mut chunk = [0u8; 64 * 1024];
+        // `Fn` (captures nothing) so both the streaming loop and the final flush can
+        // reuse it while each takes its own mutable borrow of `seq`.
+        let send_au = |au: Vec<u8>, seq: &mut u64, tx: &Sender<EncodedAu>| {
+            let keyframe = au_is_keyframe(&au);
+            let s = *seq;
+            *seq += 1;
+            let _ = tx.send(EncodedAu {
+                data: au,
+                keyframe,
+                seq: s,
+            });
+        };
         loop {
             match stdout.read(&mut chunk) {
                 Ok(0) => break, // ffmpeg exited
-                Ok(n) => splitter.push(&chunk[..n], |au| {
-                    let keyframe = au_is_keyframe(&au);
-                    let s = seq;
-                    seq += 1;
-                    let _ = tx.send(EncodedAu {
-                        data: au,
-                        keyframe,
-                        seq: s,
-                    });
-                }),
+                Ok(n) => splitter.push(&chunk[..n], |au| send_au(au, &mut seq, &tx)),
                 Err(_) => break,
             }
         }
+        // Emit the last AU the splitter was holding for a delimiter, so the final frame
+        // before EOF (process exit or resolution-change teardown) isn't dropped.
+        splitter.flush(|au| send_au(au, &mut seq, &tx));
     }
 
     /// Push one tightly-packed BGRA frame (`width*height*4` bytes) to the encoder.
@@ -323,13 +348,27 @@ impl Encoder {
         self.stdin.take().map(|stdin| FrameSink { stdin })
     }
 
-    /// Block for the next encoded access unit (None when the encoder exits).
+    /// Move the AU receiver out so a drain thread can own it directly — leaving the
+    /// [`Child`] on the caller's side, so the caller (not a parked drain thread) can
+    /// `kill()` a wedged ffmpeg. Pairs with [`Encoder::take_child`].
+    pub fn take_rx(&mut self) -> Option<Receiver<EncodedAu>> {
+        self.rx.take()
+    }
+
+    /// Move the child process handle out so the caller owns kill/reap. Once taken, this
+    /// `Encoder`'s `Drop` no longer touches the process.
+    pub fn take_child(&mut self) -> Option<Child> {
+        self.child.take()
+    }
+
+    /// Block for the next encoded access unit (None when the encoder exits or the
+    /// receiver was moved out via [`Encoder::take_rx`]).
     pub fn recv(&self) -> Option<EncodedAu> {
-        self.rx.recv().ok()
+        self.rx.as_ref().and_then(|rx| rx.recv().ok())
     }
 
     pub fn try_recv(&self) -> Option<EncodedAu> {
-        self.rx.try_recv().ok()
+        self.rx.as_ref().and_then(|rx| rx.try_recv().ok())
     }
 
     pub fn codec(&self) -> Codec {
@@ -343,9 +382,14 @@ impl Encoder {
 
 impl Drop for Encoder {
     fn drop(&mut self) {
-        // Close stdin so ffmpeg flushes + exits, then reap.
+        // Close stdin so ffmpeg flushes + exits, then kill (in case it wedged and won't
+        // exit on stdin close) + reap. A session that took the child via `take_child`
+        // owns this itself, so `child` is `None` here and Drop is a no-op.
         self.stdin.take();
-        let _ = self.child.wait();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -384,43 +428,58 @@ struct Client {
     tx: Sender<Vec<u8>>,
 }
 
+/// Client list + the last keyframe, under **one** lock so that priming a joining client
+/// and broadcasting a keyframe are mutually atomic (below).
+#[derive(Default)]
+struct HubState {
+    clients: Vec<Client>,
+    last_keyframe: Option<Vec<u8>>,
+}
+
 /// Fan-out of encoded frames to all connected WebSocket clients. A newly-connected
 /// client is primed with the most recent keyframe so its decoder can start immediately.
+///
+/// `clients` and `last_keyframe` live under a **single** mutex: a race between them
+/// would let a client be primed with keyframe K1, then miss K2 (stored + sent to the
+/// already-listed clients only) yet be inserted just after — decoding P-frames against a
+/// reference it never received until the next IDR. One lock makes a joining client land
+/// strictly before or strictly after any given keyframe broadcast.
 pub struct Hub {
-    clients: Mutex<Vec<Client>>,
-    last_keyframe: Mutex<Option<Vec<u8>>>,
+    state: Mutex<HubState>,
 }
 
 impl Hub {
     pub fn new() -> Arc<Self> {
         Arc::new(Hub {
-            clients: Mutex::new(Vec::new()),
-            last_keyframe: Mutex::new(None),
+            state: Mutex::new(HubState::default()),
         })
     }
 
     /// Broadcast one already-framed message to every client (dropping dead ones). If
-    /// this AU is a keyframe, cache it for priming future clients.
+    /// this AU is a keyframe, cache it for priming future clients — atomically with the
+    /// send, so no joining client can straddle the store/send boundary.
     pub fn broadcast(&self, msg: Vec<u8>, keyframe: bool) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if keyframe {
-            *self.last_keyframe.lock().unwrap() = Some(msg.clone());
+            st.last_keyframe = Some(msg.clone());
         }
-        let mut clients = self.clients.lock().unwrap();
-        clients.retain(|c| c.tx.send(msg.clone()).is_ok());
+        // Sends are non-blocking (unbounded std mpsc), so holding the lock across them
+        // adds no stall while keeping prime+insert vs. store+send serialized.
+        st.clients.retain(|c| c.tx.send(msg.clone()).is_ok());
     }
 
     /// Forget the cached keyframe (call when the encoder is re-created for a new
     /// resolution, so a newly-connecting client isn't primed with a stale-size frame).
     pub fn reset_keyframe(&self) {
-        *self.last_keyframe.lock().unwrap() = None;
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).last_keyframe = None;
     }
 
     pub fn client_count(&self) -> usize {
-        self.clients.lock().unwrap().len()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).clients.len()
     }
 
-    /// Accept-loop: register a new WebSocket client, priming it with the last keyframe,
-    /// and spawn its send thread. Runs the tungstenite handshake on `stream`.
+    /// Register a new WebSocket client, priming it with the last keyframe, and spawn its
+    /// send thread. Runs the tungstenite handshake on `stream`.
     fn register(self: &Arc<Self>, stream: TcpStream) {
         let peer = stream
             .peer_addr()
@@ -434,15 +493,20 @@ impl Hub {
             }
         };
         let (tx, rx) = channel::<Vec<u8>>();
-        // Prime with the last keyframe so the decoder can start immediately.
-        if let Some(k) = self.last_keyframe.lock().unwrap().clone() {
-            let _ = tx.send(k);
+        // Prime + insert under the one lock, so this client is atomic w.r.t. broadcast:
+        // it is primed with whatever keyframe is current AND joins the client list before
+        // the next lock release — never primed with K1 but inserted after K2 was sent.
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(k) = st.last_keyframe.clone() {
+                let _ = tx.send(k);
+            }
+            st.clients.push(Client { tx });
         }
-        self.clients.lock().unwrap().push(Client { tx });
         log::info!("infiniPixel client connected: {peer}");
         thread::spawn(move || {
             for msg in rx {
-                if ws.send(tungstenite::Message::Binary(msg.into())).is_err() {
+                if ws.send(tungstenite::Message::Binary(msg)).is_err() {
                     break;
                 }
             }
@@ -451,15 +515,22 @@ impl Hub {
         });
     }
 
-    /// Bind a WebSocket server on `addr` and accept clients into this hub forever.
-    pub fn serve(self: &Arc<Self>, addr: &str) -> io::Result<()> {
-        let listener = TcpListener::bind(addr)?;
-        log::info!("infiniPixel WebSocket server on ws://{addr}");
-        let hub = Arc::clone(self);
+    /// Accept clients into this hub forever from an already-bound listener. Split from
+    /// the bind so callers can surface `EADDRINUSE` synchronously (see [`Hub::serve`]).
+    fn accept_loop(self: Arc<Self>, listener: TcpListener) {
         for stream in listener.incoming().flatten() {
-            let hub = Arc::clone(&hub);
+            let hub = Arc::clone(&self);
             thread::spawn(move || hub.register(stream));
         }
+    }
+
+    /// Bind a WebSocket server on `addr` and accept clients into this hub forever. The
+    /// bind is synchronous, so a port conflict is returned to the caller rather than
+    /// swallowed on a background thread.
+    pub fn serve(self: Arc<Self>, addr: &str) -> io::Result<()> {
+        let listener = TcpListener::bind(addr)?;
+        log::info!("infiniPixel WebSocket server on ws://{addr}");
+        self.accept_loop(listener);
         Ok(())
     }
 }
@@ -503,44 +574,172 @@ impl Deduper {
     }
 }
 
+// ------------------------------- Latest-frame mailbox -------------------------------
+
+/// A single-slot, latest-frame-wins hand-off from the (frame-producing) caller thread to
+/// the encoder feeder thread. `put` never blocks and coalesces: if a frame is already
+/// pending, it is dropped in favour of the newer one. This is what keeps a slow or
+/// wedged ffmpeg from applying back-pressure up the call chain — critical because the
+/// device's `submit_bgra` runs on the vfio-user callback thread, where a blocking write
+/// would freeze the guest vCPU (verify finding). Display streaming is inherently lossy,
+/// so coalescing intermediate frames under a slow encoder is the correct behavior.
+struct Mailbox {
+    slot: Mutex<MailboxSlot>,
+    cv: Condvar,
+}
+
+struct MailboxSlot {
+    frame: Option<Vec<u8>>,
+    closed: bool,
+}
+
+impl Mailbox {
+    fn new() -> Arc<Self> {
+        Arc::new(Mailbox {
+            slot: Mutex::new(MailboxSlot {
+                frame: None,
+                closed: false,
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// Producer: publish the newest frame (dropping any still-pending one). Non-blocking.
+    fn put(&self, frame: Vec<u8>) {
+        let mut s = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if s.closed {
+            return;
+        }
+        s.frame = Some(frame);
+        self.cv.notify_one();
+    }
+
+    /// Consumer (feeder): block until a frame is available; `None` once closed & drained.
+    fn take(&self) -> Option<Vec<u8>> {
+        let mut s = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(f) = s.frame.take() {
+                return Some(f);
+            }
+            if s.closed {
+                return None;
+            }
+            s = self.cv.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Signal the feeder to stop; it wakes, sees no frame, and exits.
+    fn close(&self) {
+        let mut s = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        s.closed = true;
+        s.frame = None;
+        self.cv.notify_all();
+    }
+}
+
+// ------------------------------- Encoder session ------------------------------------
+
+/// One live ffmpeg encoder for a fixed `w`×`h`, with its two helper threads:
+/// - a **feeder** that owns the [`FrameSink`] and does the blocking `write_all`, fed by
+///   a latest-wins [`Mailbox`] so the producer never blocks;
+/// - a **drain** that reads encoded AUs off the [`Encoder`] receiver and broadcasts them.
+///
+/// The [`Child`] handle stays here (not moved into a thread), so [`EncoderSession::shutdown`]
+/// can `kill()` a wedged ffmpeg — otherwise the drain thread would park forever in `recv()`
+/// and neither thread nor process would ever be reaped (verify findings).
+struct EncoderSession {
+    w: u32,
+    h: u32,
+    hardware: bool,
+    mailbox: Arc<Mailbox>,
+    child: Option<Child>,
+    /// Cleared when either helper thread ends (write error, or ffmpeg exit) — i.e. the
+    /// encoder is dead and must be re-created before it can accept more frames.
+    alive: Arc<AtomicBool>,
+    /// Count of AUs the drain thread actually broadcast — used to detect a hardware
+    /// encoder that spawned but produced nothing (→ fall back to software).
+    produced: Arc<AtomicU64>,
+    feeder: Option<thread::JoinHandle<()>>,
+    drain: Option<thread::JoinHandle<()>>,
+}
+
+impl EncoderSession {
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    /// Publish a frame to the encoder without blocking the caller (latest-wins).
+    fn submit(&self, bgra: &[u8]) {
+        self.mailbox.put(bgra.to_vec());
+    }
+
+    /// Kill ffmpeg and join both helper threads. After this returns, the drain thread has
+    /// stopped, so it can no longer broadcast a stale-size frame onto the shared hub.
+    /// Returns whether this session ever produced output.
+    fn shutdown(mut self) -> bool {
+        self.mailbox.close(); // feeder wakes, drops the sink (closes ffmpeg stdin)
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill(); // guarantee a wedged ffmpeg dies → stdout EOF
+            let _ = child.wait(); // reap
+        }
+        if let Some(f) = self.feeder.take() {
+            let _ = f.join();
+        }
+        if let Some(d) = self.drain.take() {
+            let _ = d.join();
+        }
+        self.produced.load(Ordering::Acquire) > 0
+    }
+}
+
 // ---------------------------------- Streamer ----------------------------------------
 
-/// One-call infiniPixel stream: a persistent WebSocket [`Hub`] plus an [`Encoder`] that
-/// is created (and **re-created on a resolution change**) to match the frames pushed to
-/// it. Push BGRA frames with [`PixelStreamer::submit_bgra`]; connected browsers decode
-/// them live. The server binds the port once, so a resize doesn't drop clients.
+/// One-call infiniPixel stream: a persistent WebSocket [`Hub`] plus an [`EncoderSession`]
+/// that is created (and **re-created on a resolution change or encoder death**) to match
+/// the frames pushed to it. Push BGRA frames with [`PixelStreamer::submit_bgra`];
+/// connected browsers decode them live. The server binds the port once, so a resize
+/// doesn't drop clients.
 pub struct PixelStreamer {
     hub: Arc<Hub>,
     fps: u32,
     bitrate_kbps: u32,
-    /// The current encoder sink + the (w,h) it is configured for.
-    enc: Option<(FrameSink, u32, u32)>,
+    /// The current encoder session (sized to the last frame), if any.
+    enc: Option<EncoderSession>,
+    /// Latched once a hardware NVENC encoder is shown not to work on this host, so every
+    /// subsequent encoder is spawned as software x264 instead of failing the same way.
+    hardware_failed: bool,
     /// Idle-skip: drop frames identical to the previous one.
     dedup: Deduper,
+    /// The last *changed* frame is still buffered inside ffmpeg's AU splitter (it needs
+    /// the next frame's delimiter to emit). When true, the next idle frame is fed once to
+    /// flush it — so a change followed by stillness still reaches the client.
+    pending_flush: bool,
     sent: u64,
     skipped: u64,
 }
 
 impl PixelStreamer {
-    /// Bind the WebSocket server on `0.0.0.0:port`. The encoder is created lazily on
-    /// the first [`submit_bgra`], sized to that frame.
+    /// Bind the WebSocket server on `0.0.0.0:port` (synchronously — a port conflict is
+    /// returned, not swallowed). The encoder is created lazily on the first
+    /// [`submit_bgra`](PixelStreamer::submit_bgra), sized to that frame.
     pub fn new(fps: u32, bitrate_kbps: u32, port: u16) -> io::Result<Self> {
         let hub = Hub::new();
+        // Bind here (not on the spawned thread) so EADDRINUSE surfaces to the caller and
+        // "serving on ws://…" is only logged on a genuinely bound socket.
+        let listener = TcpListener::bind(("0.0.0.0", port))?;
+        log::info!("infiniPixel WebSocket server on ws://0.0.0.0:{port}");
         {
             let hub = Arc::clone(&hub);
-            let addr = format!("0.0.0.0:{port}");
-            thread::spawn(move || {
-                if let Err(e) = hub.serve(&addr) {
-                    log::error!("infiniPixel server on :{port} failed: {e}");
-                }
-            });
+            thread::spawn(move || hub.accept_loop(listener));
         }
         Ok(PixelStreamer {
             hub,
             fps,
             bitrate_kbps,
             enc: None,
+            hardware_failed: false,
             dedup: Deduper::default(),
+            pending_flush: false,
             sent: 0,
             skipped: 0,
         })
@@ -553,60 +752,163 @@ impl PixelStreamer {
         Ok(s)
     }
 
-    fn ensure_encoder(&mut self, w: u32, h: u32) -> io::Result<()> {
-        if self.enc.as_ref().map(|(_, ew, eh)| (*ew, *eh)) == Some((w, h)) {
-            return Ok(());
-        }
-        // A resolution change: drop the old sink (its ffmpeg exits, its drain thread
-        // ends) and forget the stale-size keyframe, then spin a new encoder onto the
-        // same persistent hub.
-        self.enc = None;
-        self.hub.reset_keyframe();
-
+    /// Spawn a fresh encoder session for `w`×`h`, wiring its feeder (mailbox → ffmpeg
+    /// stdin) and drain (ffmpeg AUs → hub) threads. Does not touch `self.enc`.
+    fn spawn_session(&self, w: u32, h: u32, hardware: bool) -> io::Result<EncoderSession> {
         let cfg = EncoderConfig {
             width: w,
             height: h,
             fps: self.fps,
             bitrate_kbps: self.bitrate_kbps,
-            prefer_hardware: true,
+            prefer_hardware: hardware,
         };
         let mut enc = Encoder::spawn(&cfg)?;
         let sink = enc
             .take_sink()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "encoder sink missing"))?;
-        let hub = Arc::clone(&self.hub);
+            .ok_or_else(|| io::Error::other("encoder sink missing"))?;
+        let rx = enc
+            .take_rx()
+            .ok_or_else(|| io::Error::other("encoder rx missing"))?;
+        let child = enc.take_child();
         let codec = enc.codec().wire();
-        let us_per_frame = 1_000_000u64 / self.fps.max(1) as u64;
-        thread::spawn(move || {
-            while let Some(au) = enc.recv() {
-                let flags = if au.keyframe { proto::flags::KEYFRAME } else { 0 };
-                let hdr = FrameHeader {
-                    flags,
-                    codec,
-                    frame_seq: au.seq as u32,
-                    width: w as u16,
-                    height: h as u16,
-                    pts_us: au.seq * us_per_frame,
-                    payload_len: au.data.len() as u32,
-                };
-                hub.broadcast(hdr.message(&au.data), au.keyframe);
+        // `enc` (an empty shell now) drops here — its Drop is a no-op since child/rx/stdin
+        // were all taken.
+
+        let mailbox = Mailbox::new();
+        let alive = Arc::new(AtomicBool::new(true));
+        let produced = Arc::new(AtomicU64::new(0));
+
+        // Feeder: own the sink; blocking-write the newest frame; die (marking !alive) if
+        // ffmpeg's pipe breaks. This blocking write is off the caller's thread by design.
+        let feeder = {
+            let mailbox = Arc::clone(&mailbox);
+            let alive = Arc::clone(&alive);
+            let mut sink = sink;
+            thread::spawn(move || {
+                while let Some(frame) = mailbox.take() {
+                    if sink.submit_bgra(&frame).is_err() {
+                        alive.store(false, Ordering::Release);
+                        break;
+                    }
+                }
+                // dropping `sink` closes ffmpeg's stdin
+            })
+        };
+
+        // Drain: broadcast encoded AUs to the persistent hub; mark !alive on ffmpeg exit.
+        let drain = {
+            let hub = Arc::clone(&self.hub);
+            let alive = Arc::clone(&alive);
+            let produced = Arc::clone(&produced);
+            let us_per_frame = 1_000_000u64 / self.fps.max(1) as u64;
+            thread::spawn(move || {
+                while let Ok(au) = rx.recv() {
+                    produced.fetch_add(1, Ordering::Release);
+                    let flags = if au.keyframe { proto::flags::KEYFRAME } else { 0 };
+                    let hdr = FrameHeader {
+                        flags,
+                        codec,
+                        frame_seq: au.seq as u32,
+                        width: w as u16,
+                        height: h as u16,
+                        pts_us: au.seq * us_per_frame,
+                        payload_len: au.data.len() as u32,
+                    };
+                    hub.broadcast(hdr.message(&au.data), au.keyframe);
+                }
+                alive.store(false, Ordering::Release);
+            })
+        };
+
+        Ok(EncoderSession {
+            w,
+            h,
+            hardware,
+            mailbox,
+            child,
+            alive,
+            produced,
+            feeder: Some(feeder),
+            drain: Some(drain),
+        })
+    }
+
+    fn ensure_encoder(&mut self, w: u32, h: u32) -> io::Result<()> {
+        // Reuse only a live session of the right size.
+        if let Some(sess) = self.enc.as_ref() {
+            if sess.w == w && sess.h == h && sess.is_alive() {
+                return Ok(());
             }
-        });
-        self.enc = Some((sink, w, h));
+        }
+        // Tear down the old session FIRST — kill ffmpeg and *join its drain thread* — so
+        // it can never broadcast a trailing stale-size frame after we reset the keyframe.
+        if let Some(old) = self.enc.take() {
+            let was_hardware = old.hardware;
+            // Distinguish "the encoder died on its own" (NVENC broken) from "we tore down
+            // a healthy encoder for a resize": only the former should latch software.
+            let died = !old.is_alive();
+            let produced_output = old.shutdown();
+            // A hardware encoder that died without ever producing output means NVENC is
+            // unusable here (no engine, session cap hit, driver mismatch): latch software.
+            if was_hardware && died && !produced_output && !self.hardware_failed {
+                log::warn!(
+                    "infiniPixel: hardware NVENC produced no output — falling back to software x264"
+                );
+                self.hardware_failed = true;
+            }
+        }
+        self.hub.reset_keyframe();
+
+        // Prefer hardware unless we've already learned it fails here; on a spawn error
+        // with hardware, drop to software once.
+        let hardware = !self.hardware_failed;
+        let session = match self.spawn_session(w, h, hardware) {
+            Ok(s) => s,
+            Err(e) if hardware => {
+                log::warn!(
+                    "infiniPixel: hardware encoder spawn failed ({e}); falling back to software"
+                );
+                self.hardware_failed = true;
+                self.spawn_session(w, h, false)?
+            }
+            Err(e) => return Err(e),
+        };
+        self.enc = Some(session);
+        // A brand-new encoder needs its startup keyframe: force the next frame through
+        // even if it is byte-identical to the pre-respawn one.
+        self.dedup = Deduper::default();
+        self.pending_flush = false;
         Ok(())
     }
 
-    /// Submit one tightly-packed `w`×`h` BGRA frame; (re)creates the encoder if the
-    /// size changed since the last frame. An unchanged frame is **skipped** (idle-skip)
-    /// — no encode, no bytes — so a static desktop costs ~0.
+    /// Submit one tightly-packed `w`×`h` BGRA frame; (re)creates the encoder if the size
+    /// changed or the previous one died. An unchanged frame is **skipped** (idle-skip) —
+    /// no encode, no bytes — so a static desktop costs ~0, except that the first idle
+    /// frame after a change is fed once to flush the last visible frame to clients.
     pub fn submit_bgra(&mut self, bgra: &[u8], w: u32, h: u32) -> io::Result<()> {
         if !self.dedup.changed(bgra) {
             self.skipped += 1;
+            if self.pending_flush {
+                // Feed this identical frame once so ffmpeg emits the delimiter that
+                // flushes the last *changed* AU out to clients; then go quiet.
+                self.pending_flush = false;
+                self.ensure_encoder(w, h)?;
+                self.push(bgra);
+            }
             return Ok(());
         }
         self.ensure_encoder(w, h)?;
-        self.sent += 1;
-        self.enc.as_mut().unwrap().0.submit_bgra(bgra)
+        self.pending_flush = true;
+        self.push(bgra);
+        Ok(())
+    }
+
+    /// Hand a frame to the current session (non-blocking) and count it.
+    fn push(&mut self, bgra: &[u8]) {
+        if let Some(sess) = self.enc.as_ref() {
+            self.sent += 1;
+            sess.submit(bgra);
+        }
     }
 
     /// `(frames encoded, frames skipped as unchanged)`.
@@ -742,6 +1044,56 @@ mod tests {
         assert!(d.changed(&b), "a different frame re-encodes");
         assert!(!d.changed(&b), "then skipped again");
         assert!(d.changed(&a), "back to a is a change");
+    }
+
+    #[test]
+    fn au_splitter_flush_emits_final_held_au() {
+        // Two AUs but NO trailing AUD: push emits only the first (the 2nd is held back
+        // waiting for a delimiter). flush() must then emit the held final AU, or the last
+        // frame before EOF/resize would be silently dropped (verify finding).
+        let aud = [0u8, 0, 0, 1, 9, 0x10];
+        let slice = [0u8, 0, 0, 1, 0x61, 0xAA, 0xBB];
+        let idr = [0u8, 0, 0, 1, 0x65, 0xCC, 0xDD]; // IDR (type 5) → keyframe
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&aud);
+        stream.extend_from_slice(&slice);
+        stream.extend_from_slice(&aud);
+        stream.extend_from_slice(&idr);
+
+        let mut splitter = AuSplitter::default();
+        let mut aus: Vec<Vec<u8>> = Vec::new();
+        splitter.push(&stream, |au| aus.push(au));
+        assert_eq!(aus.len(), 1, "push emits only the delimited first AU");
+
+        splitter.flush(|au| aus.push(au));
+        assert_eq!(aus.len(), 2, "flush emits the held final AU");
+        assert!(au_is_keyframe(&aus[1]), "the flushed final AU is the IDR");
+    }
+
+    #[test]
+    fn au_splitter_flush_ignores_bare_delimiter() {
+        // A lone AUD (no following NAL) is not a real AU — flush must not emit it.
+        let mut splitter = AuSplitter::default();
+        let mut aus: Vec<Vec<u8>> = Vec::new();
+        splitter.push(&[0u8, 0, 0, 1, 9, 0x10], |au| aus.push(au));
+        splitter.flush(|au| aus.push(au));
+        assert!(aus.is_empty(), "a bare AUD must not be emitted as an AU");
+    }
+
+    #[test]
+    fn mailbox_coalesces_to_latest_frame() {
+        // put never blocks and keeps only the newest frame; take drains it. This is what
+        // keeps a slow encoder from stalling the caller.
+        let mb = Mailbox::new();
+        mb.put(vec![1]);
+        mb.put(vec![2]);
+        mb.put(vec![3]); // older pending frames dropped in favour of the newest
+        assert_eq!(mb.take(), Some(vec![3]), "take yields the latest put");
+        // close() is teardown: it discards any pending frame and unblocks the feeder,
+        // which then drops its sink — we're about to kill ffmpeg, so a last frame is moot.
+        mb.put(vec![4]);
+        mb.close();
+        assert_eq!(mb.take(), None, "close discards the pending frame and returns None");
     }
 
     #[test]

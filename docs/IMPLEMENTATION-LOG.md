@@ -348,6 +348,56 @@ is unchanged (verified: `INFINIGPU-KMS: PASS`). Added `ctx_block()` to route the
 register window; `reset_state` clears all rings. 4 GPU-free unit tests
 (advertises 8 rings, independent per-ring bases, ring-0 legacy+block retired mirroring, reset).
 
+### 2026-07-17 — 🛡️ adversarial verification pass: 8 confirmed fixes (infiniPixel + device)
+
+A cross-stack adversarial review (10 findings raised, **8 confirmed real**, high-confidence)
+of the new Phase-1 code found genuine concurrency/lifecycle/security defects in the encoder
+datapath — none in the happy path the demos exercise, all in the failure/edge behavior a real
+VDI fleet hits. All fixed, each with a regression signal:
+
+- **[HIGH] Encoder back-pressure froze the guest vCPU.** `submit_bgra` ran on the vfio-user
+  callback thread and did a *blocking* `write_all` into ffmpeg's stdin; a slow/wedged encoder
+  stalled the reply-wait → the guest's MMIO (and vCPU) hung. Fixed with a single-slot,
+  **latest-frame-wins `Mailbox`** + a dedicated feeder thread that owns the blocking write.
+  The producer never blocks and coalesces under load (display is lossy by nature). Validated:
+  the headless round-trip still decodes 60/60 AUs.
+- **[MED] No NVENC→software fallback; a dead same-size encoder never recovered.** A non-NVENC
+  host (or the 2nd concurrent stream past GA102's single NVENC session) spawned ffmpeg, failed
+  codec init, exited — and the stream stayed silently black forever. Now each session tracks
+  `alive`/`produced`; a hardware encoder that **dies without output** latches a `hardware_failed`
+  flag and the next spawn uses libx264. Validated **live** by hiding the GPU
+  (`CUDA_VISIBLE_DEVICES=""`): the client still receives frames over the software path and the
+  fallback is logged. The latch is gated on *died-on-its-own* (not a healthy resize teardown).
+- **[MED] Resolution-change teardown raced the old drain thread.** `enc = None` dropped only the
+  sink; the old drain thread kept running and could re-broadcast a stale-size frame *after*
+  `reset_keyframe()`. Fixed: `EncoderSession::shutdown()` kills ffmpeg and **joins** the drain
+  thread before the new encoder + keyframe reset — the old session can no longer touch the hub.
+- **[MED] Last frame before idle/EOF was dropped + the stream trailed one AU.** ffmpeg's
+  AUD-delimited output means the splitter holds the most-recent AU until the *next* one starts;
+  on EOF (shutdown/resize) it was lost, and a change-then-stillness never emitted the last visible
+  frame. Fixed with `AuSplitter::flush()` (emit the held AU on EOF) + a `pending_flush` re-feed
+  that pushes one identical frame after a change so the delimiter flushes the real frame out.
+- **[MED] `render_clear_present` geometry cap overflowed `u64`.** `width*height*4` on hostile
+  u32 dims overflowed → *panic* under debug overflow-checks (guest-triggered device-thread crash)
+  and silent *wrap past the cap* under release. Fixed with `checked_mul` (overflow ⇒ reject) plus
+  a direct per-dimension bound (≤16384), mirroring `present_scanout`.
+- **[LOW] Hub prime+insert wasn't atomic w.r.t. broadcast.** A client could be primed with
+  keyframe K1 yet inserted just after K2 was sent → it decoded P-frames against a reference it
+  never got until the next IDR. Collapsed the two mutexes into one `HubState` so a joining client
+  lands strictly before or after any keyframe broadcast.
+- **[LOW] `Encoder::Drop` never `kill()`d ffmpeg.** A wedged ffmpeg left the drain thread parked
+  in `recv()`, so Drop was never even reached → process + fds + threads leaked, once per resize.
+  Fixed by keeping the `Child` on the session side and `kill()`+`wait()`+`join()` on shutdown
+  (and `Drop` now kills too on the standalone path).
+- **[LOW] Eager WebSocket bind couldn't fail.** `TcpListener::bind` ran on a spawned thread, so
+  `EADDRINUSE` was swallowed and `new()` returned `Ok` with a dead server. Bind is now synchronous
+  in `PixelStreamer::new`, so a port conflict is a real `io::Error`.
+
+Also: the device layer now logs (rate-limited) a failed `submit_bgra` instead of `let _ = …`.
+Net: **+3 unit tests (37 total, all green), clippy clean, debug+release build clean.** The
+verification methodology mirrors the earlier scheduler pass — parallel critics → per-finding
+adversarial verification → fix only what survives.
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against
