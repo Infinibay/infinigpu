@@ -53,6 +53,18 @@ if [ -d "${INFINIBAY_BASE_DIR:-/opt/infinibay}" ]; then
   tar -czf "${GD_BASE}/source.tar.gz" -C "${SRC}/guest/linux" \
     infinigpu.c Makefile dkms.conf install.sh
   echo ">> staged Linux guest driver → ${GD_BASE}/source.tar.gz"
+
+  # Stage the native viewer (desktop client) for the Settings download. Reuse a
+  # host-built binary if one is present under the mounted source tree; the
+  # in-container cross-build is a follow-up. Non-fatal — viewer download 404s until staged.
+  VW_BASE="${INFINIBAY_BASE_DIR:-/opt/infinibay}/gpu-viewer/linux"
+  if [ -x "${SRC}/target/release/infinigpu-viewer" ]; then
+    mkdir -p "${VW_BASE}"
+    install -m 0755 "${SRC}/target/release/infinigpu-viewer" "${VW_BASE}/infinigpu-viewer"
+    echo ">> staged Linux viewer (host build) → ${VW_BASE}/infinigpu-viewer"
+  else
+    echo ">> (no host-built infinigpu-viewer at ${SRC}/target/release; viewer download will 404 until built)"
+  fi
 else
-  echo ">> (infinibay_base not mounted; skipped staging the guest driver tarball)"
+  echo ">> (infinibay_base not mounted; skipped staging the guest driver + viewer)"
 fi
