@@ -11,18 +11,20 @@
 # a raw `docker compose` on this host delegates to legacy docker-compose v1, which
 # can't parse these files). This file documents WHAT that override does.
 #
-# ── HOST PREREQUISITES ───────────────────────────────────────────────────────
-#  1. NVIDIA driver + nvidia-container-toolkit. `iby up --gpu` auto-generates the
-#     CDI spec (sudo, with an explanation); or do it yourself / inspect it:
-#        iby gpu setup      #  ==  sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-#        iby gpu status     #  shows CDI + QEMU + binary readiness
-#  2. A QEMU with vfio-user-pci built to /opt/qemu-vfio-user (needs sudo to install):
-#        ( cd repos/infinigpu && ./scripts/build-qemu-vfio-user.sh )
-#     NOTE: this bind-mounts that host QEMU into the container; it must be ABI-
-#     compatible with the container's libc/glib. If it isn't, build QEMU with the
-#     same base image instead of bind-mounting the host build.
-#  3. The device-server binary built (no root):
-#        ( cd repos/infinigpu && cargo build --release -p infinigpu-device )
+# ── HOW THE ARTIFACTS ARE PROVIDED ───────────────────────────────────────────
+# The vfio-user QEMU + the device server are built by the `infinigpu-builder`
+# service (below) against the SAME base as the backend image (Debian bookworm,
+# glibc 2.36) and published into the `infinigpu_build` volume, which the backend
+# mounts read-only at /opt/qemu-vfio-user. A HOST build is the wrong ABI (host
+# QEMU needs glibc ≥2.38; host-cargo device ≥2.39) and would not run in-container.
+# `iby up --gpu` builds them automatically when the volume is empty (like it does
+# for the infiniservice agent); `iby gpu build` does it on demand.
+#
+# ── HOST PREREQUISITE ────────────────────────────────────────────────────────
+#  NVIDIA driver + nvidia-container-toolkit. `iby up --gpu` auto-generates the CDI
+#  spec (sudo, with an explanation); or inspect it yourself:
+#     iby gpu setup      #  ==  sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+#     iby gpu status     #  shows CDI + built-artifact readiness
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -40,6 +42,8 @@ services:
       # infinization invokes THIS QEMU (has the vfio-user-pci client) for ALL VMs;
       # it is a superset, so non-GPU VMs run on it identically.
       INFINIZATION_QEMU_BINARY: /opt/qemu-vfio-user/bin/qemu-system-x86_64
+      # The device server infinization spawns per GPU VM (published into the volume).
+      INFINIGPU_DEVICE_BIN: /opt/qemu-vfio-user/bin/infinigpu-device
       # Host VRAM the broker admits against (one A5000 ≈ 24564 MB; keep a reserve).
       INFINIGPU_HOST_VRAM_MB: ${INFINIGPU_HOST_VRAM_MB:-24000}
       INFINIGPU_HOST_VRAM_RESERVE_MB: ${INFINIGPU_HOST_VRAM_RESERVE_MB:-2000}
@@ -49,10 +53,29 @@ services:
       INFINIPIXEL_PROXY_PORT_MAX: "6139"
     ports:
       # Publish the infiniPixel relay so the viewer/browser can reach it off-host.
-      - "6120-6139:6120-6139"
+      # Honor PORT_BIND (loopback-only / pinned-NIC), matching the base compose.
+      - "${PORT_BIND:-0.0.0.0}:6120-6139:6120-6139"
     volumes:
-      # The vfio-user QEMU (built to /opt/qemu-vfio-user on the host — see prereq 2).
-      - /opt/qemu-vfio-user:/opt/qemu-vfio-user:ro
-      # The device-server binary, dropped on PATH so infinization spawns it by name
-      # (its default is `infinigpu-device`; override with INFINIGPU_DEVICE_BIN).
-      - ${REPOS_DIR:-./repos}/infinigpu/target/release/infinigpu-device:/usr/local/bin/infinigpu-device:ro
+      # The container-native render artifacts (vfio-user QEMU + device binary +
+      # its bundled lib closure), built by infinigpu-builder into this volume.
+      - infinigpu_build:/opt/qemu-vfio-user:ro
+
+  # Builds the vfio-user QEMU + infinigpu-device against the backend's ABI and
+  # publishes them into infinigpu_build. NOT started by default (slow, GPU-only).
+  # Driven by `iby up --gpu` (when the volume is empty) / `iby gpu build`.
+  infinigpu-builder:
+    profiles: ["builders"]
+    build:
+      context: ${REPOS_DIR:-./repos}/infinigpu
+      dockerfile: deploy/Dockerfile.builder
+    image: infinibay/dev-infinigpu-builder
+    volumes:
+      - ${REPOS_DIR:-./repos}/infinigpu:/src
+      - infinigpu_build:/out
+      - infinigpu_target:/target
+      - infinigpu_cargo:/usr/local/cargo/registry
+
+volumes:
+  infinigpu_build:
+  infinigpu_target:
+  infinigpu_cargo:
