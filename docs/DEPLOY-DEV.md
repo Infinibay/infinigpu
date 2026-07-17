@@ -29,30 +29,41 @@ Then the GPU GraphQL surface is live and usable (still no real GPU yet):
 
 This is enough to verify policy + admission plumbing before touching hardware.
 
-## Stage B — the render path (root, one-time host prep)
+## Stage B — the render path (driven by `iby`)
 
-1. **NVIDIA in the container (CDI).**
-   ```bash
-   sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-   nvidia-ctk cdi list            # expect nvidia.com/gpu=all
-   ```
-2. **QEMU with vfio-user-pci** (QEMU ≥ 10.1.1):
+**`iby` owns the GPU setup.** It auto-detects the NVIDIA GPU, generates the CDI
+spec if missing (explaining the step + asking sudo — it does NOT blacklist your
+driver; infinigpu is API-remoting, the host keeps the driver), composes in the
+GPU override, and warns about any missing build. Check readiness anytime:
+
+```bash
+iby gpu status      # GPU / CDI / vfio-user QEMU / device binary / override
+iby doctor          # includes the GPU section
+```
+
+Two one-time host builds `iby` can't do for you (it warns if absent):
+
+1. **QEMU with vfio-user-pci** (QEMU ≥ 10.1.1):
    ```bash
    ( cd repos/infinigpu && ./scripts/build-qemu-vfio-user.sh )   # → /opt/qemu-vfio-user
    ```
-3. **The device-server binary** (no root):
+2. **The device-server binary** (no root):
    ```bash
    ( cd repos/infinigpu && cargo build --release -p infinigpu-device )
    ```
-4. **Bring the stack up with the GPU override** (adds the GPU device, the
-   vfio-user QEMU, the binary, and publishes the infiniPixel relay ports):
-   ```bash
-   docker compose --env-file .env.docker \
-     -f docker-compose.yml -f docker-compose.kvm.yml \
-     -f repos/infinigpu/deploy/docker-compose.gpu.yml up -d
-   ```
-   (See `deploy/docker-compose.gpu.yml` for the env/volumes and the non-CDI
-   fallback. `iby` does not yet wire this override — drive compose directly for now.)
+
+Then bring the stack up with GPU support. Down-first avoids a port clash on
+recreate (podman-compose doesn't stop the old container before starting the new):
+
+```bash
+iby down
+iby up --gpu -d       # ensures CDI, adds the override, migrates, starts
+```
+
+`iby up --gpu` composes in `repos/infinigpu/deploy/docker-compose.gpu.yml`
+automatically — you never run raw `docker compose` (your `docker compose` shim
+delegates to the legacy docker-compose v1, which can't parse these files; `iby`
+uses `podman-compose`).
 
 ## Stage C — enable a department + create a GPU VM
 

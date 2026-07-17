@@ -7,16 +7,15 @@
 # Opt-in end to end: only VMs whose department has `gpuEnabled` get a virtual GPU,
 # so this override is inert for every other VM.
 #
-# Run from the lxd repo root (where docker-compose.yml lives):
-#   docker compose --env-file .env.docker \
-#     -f docker-compose.yml -f docker-compose.kvm.yml \
-#     -f repos/infinigpu/deploy/docker-compose.gpu.yml up
+# DON'T run this by hand — `iby up --gpu` composes it in (it uses podman-compose;
+# a raw `docker compose` on this host delegates to legacy docker-compose v1, which
+# can't parse these files). This file documents WHAT that override does.
 #
-# ── HOST PREREQUISITES (root, one-time) ──────────────────────────────────────
-#  1. NVIDIA driver + nvidia-container-toolkit, with a CDI spec generated so the
-#     (podman) runtime can inject the GPU + userspace libs (libnvidia-encode, …):
-#        sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-#        nvidia-ctk cdi list        # verify nvidia.com/gpu=all is listed
+# ── HOST PREREQUISITES ───────────────────────────────────────────────────────
+#  1. NVIDIA driver + nvidia-container-toolkit. `iby up --gpu` auto-generates the
+#     CDI spec (sudo, with an explanation); or do it yourself / inspect it:
+#        iby gpu setup      #  ==  sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+#        iby gpu status     #  shows CDI + QEMU + binary readiness
 #  2. A QEMU with vfio-user-pci built to /opt/qemu-vfio-user (needs sudo to install):
 #        ( cd repos/infinigpu && ./scripts/build-qemu-vfio-user.sh )
 #     NOTE: this bind-mounts that host QEMU into the container; it must be ABI-
