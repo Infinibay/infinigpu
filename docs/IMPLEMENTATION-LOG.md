@@ -398,6 +398,43 @@ Net: **+3 unit tests (37 total, all green), clippy clean, debug+release build cl
 verification methodology mirrors the earlier scheduler pass — parallel critics → per-finding
 adversarial verification → fix only what survives.
 
+### 2026-07-17 — 🔺 replay: real shader execution + dma-buf/fd export (Phase-0 Step 5+)
+
+`infinigpu-replay` did only a fixed-function `render_clear` (a render-pass CLEAR). Now it also
+runs **actual shaders on the SMs** and can **export the rendered GPU memory as an fd** for
+zero-copy hand-off — the two pieces ADR-0002/0003 need before a jailed per-VM replay process can
+feed the presenter/encoder without a host copy.
+
+- **`render_triangle(w,h,bg)`** builds a graphics pipeline from our own SPIR-V and issues a bare
+  `draw(3,1,0,0)` (no vertex buffers — positions/colours come from `gl_VertexIndex` in the shader),
+  then reads the frame back through the same submit→fence→copy path as `render_clear`. Live on the
+  **A5000**: centre pixel bright, corners = background, **182 distinct colours** in a 32×32 sample
+  (a clear yields ~1) — proof of real per-fragment interpolation, not fixed-function fill.
+- **`export_triangle_dmabuf(w,h)`** renders into a device-local buffer allocated with
+  `VkExportMemoryAllocateInfo` and exports its memory via `vkGetMemoryFdKHR`. Prefers a Linux
+  **dma-buf** handle (`VK_EXT_external_memory_dma_buf`), falls back to an **opaque fd**
+  (`VK_KHR_external_memory_fd`) when the driver doesn't advertise dma-buf. The fd is owned by an
+  `OwnedFd` (closed on drop). On this host's NVIDIA proprietary driver: opaque-fd, 1 MiB
+  (512×512×4) — the extensions are enabled **only when advertised**, so `open()` never regresses on
+  a card that lacks them (`can_export()` reports availability).
+- **Shaders as data, no build-time toolchain.** The two entry points (`vs_main`/`fs_main`) are
+  authored in WGSL and compiled to SPIR-V once with `naga` (pure-Rust), then checked in as a `u32`
+  array in `src/shaders.rs` — the crate keeps zero new dependencies. The WGSL:
+
+  ```wgsl
+  struct VOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };
+  @vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
+    var p = array<vec2<f32>,3>(vec2(0.0,-0.6), vec2(0.6,0.6), vec2(-0.6,0.6));
+    var c = array<vec3<f32>,3>(vec3(1.0,0.15,0.15), vec3(0.15,1.0,0.15), vec3(0.15,0.15,1.0));
+    var o: VOut; o.pos = vec4<f32>(p[vi],0.0,1.0); o.color = c[vi]; return o;
+  }
+  @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> { return vec4<f32>(in.color,1.0); }
+  ```
+
+  Regenerate: `naga::back::spv::write_vec` over `naga::front::wgsl::parse_str(WGSL)` (features
+  `wgsl-in`,`spv-out`), dump the words. Verify with `cargo run -p infinigpu-replay --bin
+  infinigpu-replay-triangle` (renders + exports + saves a PPM).
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against

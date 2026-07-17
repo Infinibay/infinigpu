@@ -16,3 +16,7 @@ infinigpu-abi = { path = "../infinigpu-abi" }
 [[bin]]
 name = "infinigpu-replay-smoke"
 path = "src/bin/smoke.rs"
+
+[[bin]]
+name = "infinigpu-replay-triangle"
+path = "src/bin/triangle.rs"

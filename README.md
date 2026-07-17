@@ -55,7 +55,7 @@ to a browser — through our own stack, no libvirt, no vGPU license:
 | `crates/infinigpu-abi` | Rust (`no_std`) | Wire ABI: PCI identity, BAR0 register map, zerocopy framing. Single source of truth (→ C header via cbindgen). |
 | `crates/infinigpu-ring` | Rust (`no_std`) | SPSC command ring + seqno completion; `loom`-verified ordering. |
 | `crates/infinigpu-hal` | Rust (pure) | Vendor HAL (ADR-0008): `GpuBackend`/`MediaEncoder` capability traits. |
-| `crates/infinigpu-replay` | Rust (`ash`) | Headless Vulkan render backend — runs on the physical GPU. |
+| `crates/infinigpu-replay` | Rust (`ash`) | Headless Vulkan render backend — runs on the physical GPU: fixed-function clear, a **shader-executed** triangle (our SPIR-V), and **dma-buf/opaque-fd export** for zero-copy hand-off. |
 | `crates/infinigpu-sched` | Rust | The GPU broker "brain" (ADR-0007): admission, VRAM ledger, token-bucket weighted fair-share, watchdog. |
 | `crates/infinigpu-pixel` | Rust | infiniPixel (ADR-0009): NVENC/H.264 encode, owned protocol, WebSocket, idle-skip. |
 | `crates/infinigpu-device` | Rust | The vfio-user PCI device server (ADR-0001) — config space, BAR0, DMA, MSI-X; ties broker + replay + pixel together. |
@@ -79,6 +79,7 @@ make -C guest/linux    # the guest DRM/KMS kernel module (against the running ke
 # host-only proofs (no QEMU):
 cargo run -p infinigpu-device --bin infinigpu-pipeline-demo   # guest ring → A5000 render → DMA back
 cargo run -p infinigpu-device --bin infinigpu-broker-demo     # 2 VMs share the A5000, weighted fair-share
+cargo run -p infinigpu-replay --bin infinigpu-replay-triangle # shader-executed triangle + dma-buf/opaque-fd export
 cargo run -p infinigpu-pixel  --bin infinigpu-pixel-demo      # NVENC → infiniPixel (open client/infinipixel.html)
 
 # full-stack, boot a real guest under QEMU:
