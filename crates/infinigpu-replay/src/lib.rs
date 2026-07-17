@@ -18,9 +18,12 @@ use std::os::fd::{FromRawFd, OwnedFd};
 
 mod shaders;
 
+pub mod process;
+
 type R<T> = Result<T, Box<dyn Error>>;
 
 /// A rendered frame read back from the GPU into host memory.
+#[derive(Debug)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,

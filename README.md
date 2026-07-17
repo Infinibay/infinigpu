@@ -81,6 +81,7 @@ make -C guest/linux    # the guest DRM/KMS kernel module (against the running ke
 # host-only proofs (no QEMU):
 cargo run -p infinigpu-device --bin infinigpu-pipeline-demo   # guest ring → A5000 render → DMA back
 cargo run -p infinigpu-device --bin infinigpu-broker-demo     # 2 VMs share the A5000, weighted fair-share
+cargo run -p infinigpu-device --bin infinigpu-jailed-replay-demo  # replay in a jailed process per VM + per-pid NVML VRAM
 cargo run -p infinigpu-replay --bin infinigpu-replay-triangle # shader-executed triangle + dma-buf/opaque-fd export
 cargo run -p infinigpu-pixel  --bin infinigpu-pixel-demo      # NVENC → infiniPixel (open client/infinipixel.html)
 
@@ -115,7 +116,7 @@ the per-VM device-server lifecycle, the `Department` GPU policy fields + `GpuBro
 | infiniPixel: **HEVC codec** + **NVENC intra-refresh** (codec-generic AU splitter) | ✅ working |
 | infiniPixel v1 remainder (damage-rect hybrid, AV1 OBU framing, WebTransport, perceptual/foveation) | ⏳ next |
 | NVML real capacity + per-process VRAM attribution (broker admits against measured VRAM) | ✅ working |
-| Per-VM jailed replay *process* (the isolation half of ADR-0003) | ⏳ next |
+| Per-VM jailed replay *process* over IPC + per-pid NVML attribution (ADR-0003 isolation) | ✅ working |
 | Infinibay backend/infinization wiring (per [`docs/INTEGRATION.md`](docs/INTEGRATION.md)) | ⏳ blueprint ready |
 | Windows guest — IddCx indirect-display **skeleton** (guest/windows, unbuilt — needs a WDK/Windows env) | 🧩 skeleton |
 | Windows guest — KMDF PCI companion + WDDM render miniport (DXVK/vkd3d) | ⏳ Phase 2–3 |

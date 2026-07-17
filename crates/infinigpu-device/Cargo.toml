@@ -37,3 +37,9 @@ path = "src/bin/pipeline_demo.rs"
 [[bin]]
 name = "infinigpu-broker-demo"
 path = "src/bin/broker_demo.rs"
+
+# The ADR-0003 isolation half: spawn the replay as a jailed process per VM, render
+# over IPC, and attribute its VRAM via NVML. Requires a GPU; no QEMU.
+[[bin]]
+name = "infinigpu-jailed-replay-demo"
+path = "src/bin/jailed_replay_demo.rs"

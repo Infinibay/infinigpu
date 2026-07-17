@@ -12,10 +12,18 @@ rust-version.workspace = true
 infinigpu-hal = { path = "../infinigpu-hal" }
 ash = { workspace = true }
 infinigpu-abi = { path = "../infinigpu-abi" }
+# setrlimit for the per-VM jailed replay process (ADR-0003).
+libc = { workspace = true }
 
 [[bin]]
 name = "infinigpu-replay-smoke"
 path = "src/bin/smoke.rs"
+
+# The per-VM jailed replay process (ADR-0003): one process per VM, renders over a UNIX
+# socket, so a GPU fault's blast radius is one VM and NVML attributes VRAM per pid.
+[[bin]]
+name = "infinigpu-replay-server"
+path = "src/bin/replay_server.rs"
 
 [[bin]]
 name = "infinigpu-replay-triangle"

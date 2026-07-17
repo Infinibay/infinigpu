@@ -737,6 +737,7 @@ dependencies = [
  "ash",
  "infinigpu-abi",
  "infinigpu-hal",
+ "libc",
 ]
 
 [[package]]

@@ -528,6 +528,25 @@ This is the "IddCx display-only first" rung; the WDDM render miniport (DXVK/vkd3
 is Phase 2–3. Nothing here is compiled — a Windows dev completes it: build with the WDK, write
 the KMDF companion, sign, and wire the backend serve/install path (like infiniservice).
 
+### 2026-07-17 — 🔒 per-VM jailed replay *process* (ADR-0003 isolation half)
+
+The replay ran in-process in the device (shared context, shared fate). Now it can run **one
+jailed process per VM**, which is the whole point of ADR-0003:
+- **Blast radius = one VM.** A GPU fault / driver crash kills *that* replay process, not the
+  device serving every VM.
+- **Exact attribution.** Each replay process is one pid, so NVML attributes its VRAM per-VM
+  (no estimate) — the payoff the `infinigpu-nvml` per-process API was built for.
+
+`infinigpu-replay::process` is a small length-prefixed protocol over a UNIX socket:
+`infinigpu-replay-server` applies a `setrlimit` jail (no core dumps of VRAM, capped fds/procs —
+namespaces + seccomp are the documented hardening step; we deliberately don't cap `RLIMIT_AS`,
+which breaks GPU drivers), opens one `HostGpu`, and serves `RenderRequest::{Clear,Triangle}`; the
+`ReplayProcess` client spawns + talks to it and exposes the pid. Validated end-to-end on the A5000
+(`infinigpu-jailed-replay-demo`): the child process rendered a clear (exact `[0,153,204,255]`) and a
+shader triangle (gradient) over IPC, and **NVML attributed 8 MB VRAM to that pid** — per-VM
+accounting that was empty (nothing held a context) before. 4 GPU-free protocol round-trip tests.
+The device keeps its in-process path; the process path is the opt-in isolation upgrade.
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against
