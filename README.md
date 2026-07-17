@@ -101,10 +101,12 @@ A one-time readable-kernel copy is needed for the guest tests:
 
 ## How it plugs into Infinibay
 
-infinigpu is the graphics peer to `infinization`/`infiniservice`. The concrete wiring (QEMU argv,
-the per-VM device-server lifecycle, the `Department` GPU policy fields + `GpuBrokerService`, and the
-`encoded-console-stream` service beside `SpiceProxyService`) is specified in
-[`docs/INTEGRATION.md`](docs/INTEGRATION.md) — ready to implement as a gated, opt-in feature.
+infinigpu is the graphics peer to `infinization`/`infiniservice`. The wiring (QEMU argv, the per-VM
+device-server lifecycle, the `Department` GPU policy fields + `GpuBrokerService`, and the
+`encoded-console-stream` relay beside `SpiceProxyService`) is specified in
+[`docs/INTEGRATION.md`](docs/INTEGRATION.md) and **implemented** across the app repos as a gated,
+opt-in feature (on `feat/infinigpu-integration` in backend + infinization). To turn it on in the dev
+stack and render a real GPU VM viewed with the native client, follow [`docs/DEPLOY-DEV.md`](docs/DEPLOY-DEV.md).
 
 ## Status vs. roadmap
 
@@ -118,7 +120,7 @@ the per-VM device-server lifecycle, the `Department` GPU policy fields + `GpuBro
 | infiniPixel AV1 (OBU framing) | ⏸ needs an Ada+ host — the A5000 is AV1 **decode**-only (no NVENC AV1) |
 | NVML real capacity + per-process VRAM attribution (broker admits against measured VRAM) | ✅ working |
 | Per-VM jailed replay *process* over IPC + per-pid NVML attribution (ADR-0003 isolation) | ✅ working |
-| Infinibay backend/infinization wiring (per [`docs/INTEGRATION.md`](docs/INTEGRATION.md)) | ⏳ blueprint ready |
+| Infinibay wiring — GPU policy + broker admission + per-VM device lifecycle + infiniPixel console relay (rungs 1–3, [`docs/DEPLOY-DEV.md`](docs/DEPLOY-DEV.md)) | ✅ implemented (gated, opt-in) |
 | Windows guest — IddCx indirect-display **skeleton** (guest/windows, unbuilt — needs a WDK/Windows env) | 🧩 skeleton |
 | Windows guest — KMDF PCI companion + WDDM render miniport (DXVK/vkd3d) | ⏳ Phase 2–3 |
 

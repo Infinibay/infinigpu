@@ -1,0 +1,59 @@
+# Infinibay — infinigpu virtual-GPU override (LINUX + NVIDIA host, on top of KVM)
+#
+# Composes ON TOP of the lxd dev stack's base + KVM overrides to give the backend
+# container the three things the infinigpu render path needs: NVIDIA GPU access,
+# a QEMU with the vfio-user-pci client, and the infinigpu-device server binary.
+#
+# Opt-in end to end: only VMs whose department has `gpuEnabled` get a virtual GPU,
+# so this override is inert for every other VM.
+#
+# Run from the lxd repo root (where docker-compose.yml lives):
+#   docker compose --env-file .env.docker \
+#     -f docker-compose.yml -f docker-compose.kvm.yml \
+#     -f repos/infinigpu/deploy/docker-compose.gpu.yml up
+#
+# ── HOST PREREQUISITES (root, one-time) ──────────────────────────────────────
+#  1. NVIDIA driver + nvidia-container-toolkit, with a CDI spec generated so the
+#     (podman) runtime can inject the GPU + userspace libs (libnvidia-encode, …):
+#        sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+#        nvidia-ctk cdi list        # verify nvidia.com/gpu=all is listed
+#  2. A QEMU with vfio-user-pci built to /opt/qemu-vfio-user (needs sudo to install):
+#        ( cd repos/infinigpu && ./scripts/build-qemu-vfio-user.sh )
+#     NOTE: this bind-mounts that host QEMU into the container; it must be ABI-
+#     compatible with the container's libc/glib. If it isn't, build QEMU with the
+#     same base image instead of bind-mounting the host build.
+#  3. The device-server binary built (no root):
+#        ( cd repos/infinigpu && cargo build --release -p infinigpu-device )
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  backend:
+    devices:
+      # Expose all NVIDIA GPUs via CDI (needs the toolkit + /etc/cdi spec above).
+      # If your runtime doesn't do CDI, replace with explicit device nodes:
+      #   - "/dev/dri:/dev/dri"
+      #   - "/dev/nvidia0:/dev/nvidia0"
+      #   - "/dev/nvidiactl:/dev/nvidiactl"
+      #   - "/dev/nvidia-uvm:/dev/nvidia-uvm"
+      # …and inject the NVIDIA userspace libs some other way (toolkit hook / mounts).
+      - "nvidia.com/gpu=all"
+    environment:
+      # infinization invokes THIS QEMU (has the vfio-user-pci client) for ALL VMs;
+      # it is a superset, so non-GPU VMs run on it identically.
+      INFINIZATION_QEMU_BINARY: /opt/qemu-vfio-user/bin/qemu-system-x86_64
+      # Host VRAM the broker admits against (one A5000 ≈ 24564 MB; keep a reserve).
+      INFINIGPU_HOST_VRAM_MB: ${INFINIGPU_HOST_VRAM_MB:-24000}
+      INFINIGPU_HOST_VRAM_RESERVE_MB: ${INFINIGPU_HOST_VRAM_RESERVE_MB:-2000}
+      # infiniPixel remote-display relay range (published below). The native
+      # infinigpu viewer connects to ws://<host>:<one of these> (see gpuConsoleStream).
+      INFINIPIXEL_PROXY_PORT_MIN: "6120"
+      INFINIPIXEL_PROXY_PORT_MAX: "6139"
+    ports:
+      # Publish the infiniPixel relay so the viewer/browser can reach it off-host.
+      - "6120-6139:6120-6139"
+    volumes:
+      # The vfio-user QEMU (built to /opt/qemu-vfio-user on the host — see prereq 2).
+      - /opt/qemu-vfio-user:/opt/qemu-vfio-user:ro
+      # The device-server binary, dropped on PATH so infinization spawns it by name
+      # (its default is `infinigpu-device`; override with INFINIGPU_DEVICE_BIN).
+      - ${REPOS_DIR:-./repos}/infinigpu/target/release/infinigpu-device:/usr/local/bin/infinigpu-device:ro
