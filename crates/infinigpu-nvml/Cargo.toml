@@ -1,0 +1,17 @@
+[package]
+name = "infinigpu-nvml"
+description = "NVML-backed GPU capacity + per-process attribution for the infinigpu broker (ADR-0003/0007). NVIDIA-specific, kept out of the GPU-agnostic scheduler."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "infinigpu-nvml-probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+# Safe wrapper over libnvidia-ml (loaded at runtime); NVIDIA-only.
+nvml-wrapper = "0.12"

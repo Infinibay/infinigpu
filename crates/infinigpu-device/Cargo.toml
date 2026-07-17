@@ -14,6 +14,7 @@ infinigpu-replay = { path = "../infinigpu-replay" }
 infinigpu-sched = { path = "../infinigpu-sched" }
 infinigpu-pixel = { path = "../infinigpu-pixel" }
 infinigpu-hal = { path = "../infinigpu-hal" }
+infinigpu-nvml = { path = "../infinigpu-nvml" }
 zerocopy = { workspace = true }
 vfio_user = { workspace = true }
 vfio-bindings = { workspace = true }

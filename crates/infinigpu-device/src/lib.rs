@@ -181,11 +181,39 @@ impl Default for InfinigpuBackend {
     }
 }
 
+/// Build a [`BrokerConfig`] from **real** GPU capacity via NVML, falling back to the
+/// default (fixed) capacity when NVML is unavailable (no NVIDIA driver / CI). This makes
+/// admission count the GPU's actual total VRAM instead of a hardcoded guess — the
+/// measured-capacity half of ADR-0003/0007. Per-VM VRAM attribution (each jailed replay
+/// process → its pid's VRAM via `infinigpu_nvml::NvmlProbe::process_vram`) layers on top
+/// once the replay runs as a separate process.
+pub fn broker_config_from_nvml() -> BrokerConfig {
+    let mut cfg = BrokerConfig::default();
+    match infinigpu_nvml::NvmlProbe::open().and_then(|p| p.snapshot(0)) {
+        Ok(s) => {
+            cfg.total_vram_mb = s.total_mb;
+            info!(
+                "broker capacity from NVML: {} — {} MB total, {} MB free, {} enc-sessions",
+                s.name,
+                s.total_mb,
+                s.free_mb,
+                s.encoder_sessions.map(|n| n.to_string()).unwrap_or_else(|| "n/a".into()),
+            );
+        }
+        Err(e) => info!(
+            "NVML unavailable ({e}); broker uses default capacity {} MB",
+            cfg.total_vram_mb
+        ),
+    }
+    cfg
+}
+
 impl InfinigpuBackend {
-    /// Standalone single-VM backend: its own default broker + GPU context. Used by the
-    /// single-socket `infinigpu-device` binary and the in-process demos/tests.
+    /// Standalone single-VM backend with its own broker (real NVML capacity when
+    /// available) and GPU context. Used by the single-socket `infinigpu-device` binary
+    /// and the in-process demos/tests.
     pub fn new() -> Self {
-        let broker = GpuBroker::with_real_clock(BrokerConfig::default());
+        let broker = GpuBroker::with_real_clock(broker_config_from_nvml());
         Self::with_broker(broker, SharedGpu::new(), VmConfig::new("vm", 1, 4096))
     }
 

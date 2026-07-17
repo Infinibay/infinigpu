@@ -57,6 +57,7 @@ to a browser — through our own stack, no libvirt, no vGPU license:
 | `crates/infinigpu-hal` | Rust (pure) | Vendor HAL (ADR-0008): `GpuBackend`/`MediaEncoder` capability traits. |
 | `crates/infinigpu-replay` | Rust (`ash`) | Headless Vulkan render backend — runs on the physical GPU: fixed-function clear, a **shader-executed** triangle (our SPIR-V), and **dma-buf/opaque-fd export** for zero-copy hand-off. |
 | `crates/infinigpu-sched` | Rust | The GPU broker "brain" (ADR-0007): admission, VRAM ledger, token-bucket weighted fair-share, watchdog. |
+| `crates/infinigpu-nvml` | Rust | NVML-backed **real** GPU capacity (free/total VRAM, encoder sessions) + per-process VRAM attribution (ADR-0003). NVIDIA-only; keeps the broker vendor-agnostic. |
 | `crates/infinigpu-pixel` | Rust | infiniPixel (ADR-0009): NVENC/H.264 encode, owned protocol, WebSocket, idle-skip. |
 | `crates/infinigpu-device` | Rust | The vfio-user PCI device server (ADR-0001) — config space, BAR0, DMA, MSI-X; ties broker + replay + pixel together. |
 | `crates/infinigpu-viewer` | Rust | **Native desktop client** (the virt-viewer replacement, **no GTK/Qt**): `winit` (Wayland/Win32) + Vulkan (`ash`, swapchain + blit) + `openh264` decode + WebSocket. |
@@ -113,7 +114,8 @@ the per-VM device-server lifecycle, the `Department` GPU policy fields + `GpuBro
 | infiniPixel v0 (NVENC H.264 + owned protocol + WebCodecs) + idle-skip + device wiring | ✅ working |
 | infiniPixel: **HEVC codec** + **NVENC intra-refresh** (codec-generic AU splitter) | ✅ working |
 | infiniPixel v1 remainder (damage-rect hybrid, AV1 OBU framing, WebTransport, perceptual/foveation) | ⏳ next |
-| Per-VM jailed replay *process* + NVML attribution (ADR-0003) | ⏳ next |
+| NVML real capacity + per-process VRAM attribution (broker admits against measured VRAM) | ✅ working |
+| Per-VM jailed replay *process* (the isolation half of ADR-0003) | ⏳ next |
 | Infinibay backend/infinization wiring (per [`docs/INTEGRATION.md`](docs/INTEGRATION.md)) | ⏳ blueprint ready |
 | Windows guest (IddCx → WDDM, DXVK/vkd3d) | ⏳ Phase 2–3 |
 

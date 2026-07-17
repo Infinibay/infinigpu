@@ -486,6 +486,26 @@ specific (AUD NAL 9, 1-byte NAL header, IDR/SPS); they are now **codec-generic**
 damage-rect hybrid (use the guest damage map instead of the full-frame idle hash), WebTransport/QUIC
 transport, and the perceptual/foveation QP layer.
 
+### 2026-07-17 — 📊 NVML real capacity + per-process attribution (ADR-0003 measurement half)
+
+The broker had to be handed a `total_vram_mb` as *policy* (default 24 GiB "one A5000"); admission
+counted a guess. New crate **`infinigpu-nvml`** turns that into a **measurement** — kept in its own
+crate so the GPU-agnostic `infinigpu-sched` never links a vendor lib:
+- `NvmlProbe::snapshot(i)` → real total/used/free VRAM, SM + memory utilization, graphics-process
+  count, and **active NVENC encode sessions** (the scarce GA102 admission resource, ADR-0007).
+- `NvmlProbe::process_vram(i)` → per-pid VRAM attribution — the ADR-0003 mechanism: once the replay
+  runs as a **jailed process per VM** (one pid per VM), NVML attributes each VM's GPU memory exactly,
+  replacing the fixed per-VM estimate.
+- `infinigpu-device`'s `broker_config_from_nvml()` sets the broker's capacity from NVML (fail-open to
+  the default when NVML is absent — CI/no-GPU), so `InfinigpuBackend::new()` now admits against the
+  GPU's *actual* VRAM. Verified live: `broker capacity from NVML: NVIDIA RTX A5000 — 24564 MB total,
+  24239 MB free, 0 enc-sessions`. `infinigpu-nvml-probe` prints all GPUs' capacity + per-process VRAM.
+
+**Still to do (the isolation half):** run the replay as a separate, jailed process per VM
+(namespaces/seccomp/rlimits) with the device RPC-ing to it — then per-process NVML attribution and a
+GPU fault blast-radius of one VM (not the whole device) both fall out. The `serve_with_broker` entry
+point and the GPU-agnostic sched crate already anticipate the split.
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against
