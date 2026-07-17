@@ -8,6 +8,7 @@ members = [
     "crates/infinigpu-sched",
     "crates/infinigpu-pixel",
     "crates/infinigpu-device",
+    "crates/infinigpu-viewer",
 ]
 
 # Crates added as their Phase-0 step comes online:

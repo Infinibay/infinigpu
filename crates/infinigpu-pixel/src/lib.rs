@@ -125,6 +125,38 @@ impl FrameHeader {
         m.extend_from_slice(au);
         m
     }
+
+    /// Parse a [`FrameHeader`] from the first [`proto::HEADER_LEN`] bytes of a wire
+    /// message (the access unit follows). The **client** side of the same contract
+    /// [`to_bytes`](Self::to_bytes) writes — kept here so both ends share one source of
+    /// truth. Returns `None` if the buffer is too short or the magic doesn't match.
+    pub fn parse(buf: &[u8]) -> Option<FrameHeader> {
+        if buf.len() < proto::HEADER_LEN {
+            return None;
+        }
+        let u32le = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        let u16le = |o: usize| u16::from_le_bytes([buf[o], buf[o + 1]]);
+        if u32le(0) != proto::MAGIC {
+            return None;
+        }
+        Some(FrameHeader {
+            flags: buf[5],
+            codec: buf[6],
+            frame_seq: u32le(8),
+            width: u16le(12),
+            height: u16le(14),
+            pts_us: u64::from_le_bytes([
+                buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+            ]),
+            payload_len: u32le(24),
+        })
+    }
+
+    /// Whether this access unit is a keyframe (SPS/PPS + IDR) — a client may start
+    /// decoding here.
+    pub fn is_keyframe(&self) -> bool {
+        self.flags & proto::flags::KEYFRAME != 0
+    }
 }
 
 // ------------------------------- Annex-B AU splitting -------------------------------
@@ -1007,6 +1039,20 @@ mod tests {
             0x0011_2233_4455_6677
         );
         assert_eq!(u32::from_le_bytes([b[24], b[25], b[26], b[27]]), 4096);
+
+        // parse() is the client half of the same contract → must round-trip to_bytes().
+        let p = FrameHeader::parse(&b).expect("parse a valid header");
+        assert_eq!(p.flags, h.flags);
+        assert_eq!(p.codec, h.codec);
+        assert_eq!(p.frame_seq, 0x0102_0304);
+        assert_eq!(p.width, 1280);
+        assert_eq!(p.height, 720);
+        assert_eq!(p.pts_us, 0x0011_2233_4455_6677);
+        assert_eq!(p.payload_len, 4096);
+        assert!(p.is_keyframe());
+        // Bad magic / short buffer → None.
+        assert!(FrameHeader::parse(&[0u8; proto::HEADER_LEN]).is_none());
+        assert!(FrameHeader::parse(&b[..10]).is_none());
     }
 
     #[test]

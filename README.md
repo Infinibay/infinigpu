@@ -59,6 +59,7 @@ to a browser — through our own stack, no libvirt, no vGPU license:
 | `crates/infinigpu-sched` | Rust | The GPU broker "brain" (ADR-0007): admission, VRAM ledger, token-bucket weighted fair-share, watchdog. |
 | `crates/infinigpu-pixel` | Rust | infiniPixel (ADR-0009): NVENC/H.264 encode, owned protocol, WebSocket, idle-skip. |
 | `crates/infinigpu-device` | Rust | The vfio-user PCI device server (ADR-0001) — config space, BAR0, DMA, MSI-X; ties broker + replay + pixel together. |
+| `crates/infinigpu-viewer` | Rust | **Native desktop client** (the virt-viewer replacement, **no GTK/Qt**): `winit` (Wayland/Win32) + Vulkan (`ash`, swapchain + blit) + `openh264` decode + WebSocket. |
 | `guest/linux/infinigpu.c` | C | The in-guest **DRM/KMS** display driver (ADR-0005; dual MIT/GPL — the DRM stack is `EXPORT_SYMBOL_GPL`). |
 | `client/infinipixel.html` | JS | Browser WebCodecs viewer for the infiniPixel stream. |
 
@@ -86,6 +87,11 @@ cargo run -p infinigpu-pixel  --bin infinigpu-pixel-demo      # NVENC → infini
 ./scripts/guest-kms-test.sh          # DRM/KMS: /dev/dri/card0 + fbcon on our framebuffer
 ./scripts/guest-kms-pixel-test.sh    # the whole path: guest console → NVENC → infiniPixel → decoded H.264
 ./scripts/infinipixel-test.sh        # headless infiniPixel round-trip (Node client + ffmpeg decode)
+./scripts/viewer-headless-test.sh    # the NATIVE client decodes the stream headless (winit+Vulkan window needs a display)
+
+# native desktop client (needs a Wayland/Win32 display for the window):
+cargo run -p infinigpu-viewer -- --port 8090            # connect + show in a window
+cargo run -p infinigpu-viewer -- --headless --frames 60 # decode-only, no display (CI/dev)
 ```
 
 A one-time readable-kernel copy is needed for the guest tests:

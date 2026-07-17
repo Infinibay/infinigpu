@@ -1,0 +1,30 @@
+[package]
+name = "infinigpu-viewer"
+description = "Native infiniPixel desktop client (winit + Vulkan + openh264) — the virt-viewer replacement, no GTK/Qt."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "infinigpu-viewer"
+path = "src/main.rs"
+
+[dependencies]
+infinigpu-pixel = { path = "../infinigpu-pixel" }
+# WebSocket client — same crate/version the server uses (one wire contract).
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+# H.264 software decode: BSD, embeddable, no external binary (what Firefox ships).
+# GPU decode (Vulkan Video / NVDEC) is the v1 upgrade behind the same Decoder API.
+openh264 = "0.6"
+log = "0.4"
+env_logger = "0.11"
+# Windowing (native: Wayland on Linux, Win32 on Windows) — NOT GTK/Qt. X11 disabled per
+# owner. wayland-dlopen so no libwayland is needed at build time.
+winit = { version = "0.30", default-features = false, features = ["wayland", "wayland-dlopen", "rwh_06"] }
+# Vulkan presentation (swapchain + vkCmdBlitImage) — consistent with infinigpu-replay.
+ash = { workspace = true }
+ash-window = "0.13"
+raw-window-handle = "0.6"

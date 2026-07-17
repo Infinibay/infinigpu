@@ -435,6 +435,34 @@ feed the presenter/encoder without a host copy.
   `wgsl-in`,`spv-out`), dump the words. Verify with `cargo run -p infinigpu-replay --bin
   infinigpu-replay-triangle` (renders + exports + saves a PPM).
 
+### 2026-07-17 — 🖥️ native desktop client `infinigpu-viewer` (no GTK/Qt)
+
+A native infiniPixel client — the `virt-viewer` replacement — deliberately built **without GTK
+or Qt** (owner: GTK is arcaic, Qt is huge + license-incompatible). Stack: **`winit`** for native
+windowing (Wayland on Linux per owner — X11 disabled; Win32 on Windows — neither is GTK/Qt),
+**`ash`/Vulkan** for presentation (swapchain + `vkCmdBlitImage`, which scales the frame to the
+window with no pipeline/shaders), **`tungstenite`** for the WebSocket, and **`openh264`** for H.264
+decode (a small, embeddable, BSD codec — no external ffmpeg on the client; GPU decode via Vulkan
+Video/NVDEC is the v1 upgrade behind the same seam). The `FrameHeader` wire contract gained a
+`parse()`/`is_keyframe()` half in `infinigpu-pixel` so client and server share one source of truth.
+
+- **Colour path:** openh264 emits RGBA; the viewer uploads BGRA (`B8G8R8A8_UNORM`, the near-universal
+  swapchain format) by swapping R/B, so the blit is a same-format scale. Net+decode runs on a worker
+  thread feeding the render loop via a latest-wins `FrameSlot` (decode jitter never stalls present).
+- **Bug the strict native decoder exposed (and fixed):** openh264 is far stricter than ffmpeg/WebCodecs.
+  A late-joining client is primed by the server with a cached keyframe that is then followed by a *gap*
+  (the P-frames between that keyframe and "now" were sent before we connected) → the next P-frame
+  references a frame we never got → `dsRefLost`, cascading to `dsNoParamSets`. Diagnosed by dumping the
+  NAL structure: periodic IDRs fire every 2 s and are self-contained (`AUD,SPS,PPS,SEI,IDR`), but the
+  prime/live seam has a gap. **Fix (client-side, correct layering):** sync discipline — only begin
+  decoding at a keyframe, and on any decode error drop back to waiting for the next keyframe (which
+  begins a run we receive contiguously). A late client thus resyncs at the next periodic IDR. Verified:
+  3× late-connect (post-IDR) runs → **0 decode errors, clean frames** each.
+- **Validated headless here** (this box has no display): `scripts/viewer-headless-test.sh` runs the real
+  client in `--headless` mode against the streamer — connects, parses our header, decodes 40 frames to
+  RGBA, writes a PPM. The **windowed** path (winit + Vulkan swapchain) is compile- and clippy-clean but
+  needs a Wayland/Win32 session to run — validate on a desktop with `cargo run -p infinigpu-viewer -- --port <P>`.
+
 ### Immediate next steps
 
 - **Step 1 (device):** write the `infinigpu-device` vfio-user `ServerBackend` against
