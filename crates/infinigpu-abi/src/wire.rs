@@ -241,6 +241,28 @@ pub struct ResourceCreateBlob {
     pub size: u64,
 }
 
+/// `RESOURCE_ATTACH_BACKING` body — a fixed header followed by `num_entries` [`MemEntry`]s (the
+/// guest-physical segments that back a blob). The host records them in its per-VM `ResourceTable`
+/// and later resolves each through the IOVA table before any dereference. `num_entries` is bounded
+/// by the host (fail-closed) so a hostile guest can't force an unbounded read.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct AttachBacking {
+    pub res_id: u32,
+    /// Number of [`MemEntry`]s that follow this header in the payload.
+    pub num_entries: u32,
+}
+
+/// One guest-physical backing segment (follows an [`AttachBacking`] header). Mirrors virtio-gpu's
+/// `virtio_gpu_mem_entry`: an address + length pair. `length` sums (overflow-checked host-side)
+/// must cover the blob's declared size.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct MemEntry {
+    pub addr: u64,
+    pub length: u64,
+}
+
 /// `RESOURCE_MAP_BLOB` body.
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]

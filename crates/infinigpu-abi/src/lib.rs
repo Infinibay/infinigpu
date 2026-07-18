@@ -51,6 +51,12 @@ mod layout_asserts {
     const _: () = assert!(size_of::<Negotiate>() == 16);
     const _: () = assert!(size_of::<CtxCreate>() == 16);
     const _: () = assert!(size_of::<ResourceCreateBlob>() == 24);
+    // AttachBacking header (8B) + a MemEntry array (16B each, addr@0/length@8) — padding-free so a
+    // `[MemEntry]` reads directly out of the payload after the header.
+    const _: () = assert!(size_of::<AttachBacking>() == 8);
+    const _: () = assert!(size_of::<MemEntry>() == 16);
+    const _: () = assert!(offset_of!(MemEntry, length) == 8);
+    const _: () = assert!(align_of::<MemEntry>() == 8);
     const _: () = assert!(size_of::<MapBlob>() == 16);
     const _: () = assert!(size_of::<SubmitCmd>() == 40);
     const _: () = assert!(offset_of!(SubmitCmd, seqno) == 16);
@@ -97,7 +103,7 @@ mod tests {
             abi_version(),
             (u32::from(ABI_MAJOR) << 16) | u32::from(ABI_MINOR)
         );
-        assert_eq!(abi_version(), 0x0000_0003);
+        assert_eq!(abi_version(), 0x0000_0004);
     }
 
     #[test]

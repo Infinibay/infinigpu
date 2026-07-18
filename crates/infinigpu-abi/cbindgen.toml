@@ -14,7 +14,7 @@ item_types = ["structs"]
 exclude = ["DEV_MAGIC", "RESET"]
 include = [
   "Descriptor", "MsgHeader", "RingGeometry",
-  "Negotiate", "CtxCreate", "ResourceCreateBlob", "MapBlob",
+  "Negotiate", "CtxCreate", "ResourceCreateBlob", "AttachBacking", "MemEntry", "MapBlob",
   "SubmitCmd", "Fence", "SetScanoutBlob", "ResourceFlush", "ClearPresent",
   "ScanoutPresent", "ScanoutPresentDamaged", "CursorUpdate",
 ]

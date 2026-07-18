@@ -41,5 +41,9 @@ _Static_assert(offsetof(struct CursorUpdate, _reserved) == 40, "CursorUpdate._re
 _Static_assert(sizeof(struct ResourceCreateBlob) == 24, "ResourceCreateBlob size");
 _Static_assert(sizeof(struct SetScanoutBlob) == 24, "SetScanoutBlob size");
 _Static_assert(sizeof(struct ResourceFlush) == 24, "ResourceFlush size");
+/* AttachBacking header + MemEntry array — RESOURCE_ATTACH_BACKING payload (ABI 0.4). */
+_Static_assert(sizeof(struct AttachBacking) == 8, "AttachBacking size");
+_Static_assert(sizeof(struct MemEntry) == 16, "MemEntry size");
+_Static_assert(offsetof(struct MemEntry, length) == 8, "MemEntry.length offset");
 
 int main(void) { return 0; }

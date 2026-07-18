@@ -95,11 +95,16 @@ the pivot that makes everything after it reusable for 3D.
 > and now the **two-phase bounded drainer** (`drain.rs`: `pop_batch` + `ring_over_shared` +
 > `retire_over_shared`, 6 tests including the full push-N → pop-bounded → retire cycle over one
 > shared page — the ADR's *biggest structural risk*, the `repr(C)` viewer + the borrow split,
-> proven with owned buffers standing in for the sparse-mmap page). **Remaining (needs QEMU + guest
-> KMD):** the `build_regions(index_fd)` sparse-mmap **transport** (a vfio-user region — only
-> exercisable under QEMU), the `RESOURCE_CREATE_BLOB/ATTACH_BACKING/SET_SCANOUT_BLOB/RESOURCE_FLUSH`
-> `execute_descriptor` phase-2 dispatch wiring into `process_ring`, and the guest registering each
-> dumb FB once + flipping via `RESOURCE_FLUSH`. The PR3 CPU-patch path stays the live fallback.
+> proven with owned buffers standing in for the sparse-mmap page). The **phase-2 dispatch** is also
+> built + tested: `dispatch.rs`'s `execute_resource` decodes
+> `RESOURCE_CREATE_BLOB/ATTACH_BACKING/SET_SCANOUT_BLOB/RESOURCE_FLUSH/RESOURCE_DESTROY` into the
+> `ResourceTable` fail-closed (6 tests: full lifecycle, unknown/un-backed flush, short payloads,
+> hostile entry count, dup/oversized, non-resource pass-through), backed by the additive
+> `AttachBacking`+`MemEntry` ABI (0.4, layout-asserted + C-conformance green). **Remaining (needs
+> QEMU + guest KMD):** the `build_regions(index_fd)` sparse-mmap **transport** (a vfio-user region —
+> only exercisable under QEMU), wiring `drain`→`execute_resource`→the resource-backed present into
+> the live `process_ring` (+ `host_ptr` backing resolve), and the guest registering each dumb FB
+> once + flipping via `RESOURCE_FLUSH`. The PR3 CPU-patch path stays the live fallback.
 
 - `infinigpu-ring` becomes a device dep; `#[repr(C)]` on `Indices` + `Indices::from_ptr` so the
   loom-verified SPSC pop/retire/len runs over the shared page. New `index.rs`

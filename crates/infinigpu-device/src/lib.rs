@@ -14,6 +14,7 @@
 //! validated **before** QEMU exists.
 
 mod config;
+pub mod dispatch;
 pub mod dma;
 pub mod drain;
 pub mod resource;
