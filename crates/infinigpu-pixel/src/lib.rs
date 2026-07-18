@@ -595,9 +595,10 @@ impl ClientQueue {
         })
     }
 
-    /// Producer (broadcast side): enqueue one framed message. Returns `true` if the caller
-    /// must force a fresh IDR — i.e. we just shed a backlog and need a keyframe to resync
-    /// this client.
+    /// Producer (broadcast side): enqueue one framed message. Returns `true` if this client
+    /// just shed its backlog (overflow). The caller uses that only for observability — the
+    /// client resyncs on its own at the next periodic IDR; forcing one would respawn ffmpeg on
+    /// the vfio-user callback thread and stall the guest (see `Hub::broadcast`).
     fn push(&self, msg: Vec<u8>, keyframe: bool) -> bool {
         let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if q.closed {
@@ -712,25 +713,32 @@ impl Hub {
             st.last_keyframe = Some(msg.clone());
         }
         // Enqueue into each client's BOUNDED queue (non-blocking). A client whose send thread
-        // has died (blocking `ws.send` failed) is evicted. If any client's queue overflowed —
-        // the viewer is under-draining — it shed its backlog to the next keyframe, so ask the
-        // producer to emit a fresh IDR: the shed client then resyncs in ~one frame instead of
-        // waiting for the next periodic IDR. Holding the lock across the pushes is fine — each
-        // push only touches that client's own mutex briefly and never blocks.
-        let mut need_idr = false;
+        // has died (blocking `ws.send` failed) is evicted. A client that sheds its backlog
+        // (overflow) is left to resync on its own — we deliberately do NOT force a fresh IDR
+        // here (see below). Holding the lock across the pushes is fine — each push only touches
+        // that client's own mutex briefly and never blocks.
+        let mut shed = false;
         st.clients.retain(|c| {
             if !c.alive.load(Ordering::Acquire) {
                 c.q.close();
                 return false;
             }
             if c.q.push(msg.clone(), keyframe) {
-                need_idr = true;
+                shed = true;
             }
             true
         });
         drop(st);
-        if need_idr {
-            self.request_keyframe();
+        // A shed client is NOT force-resynced. Forcing a fresh IDR means respawning ffmpeg
+        // (`ensure_encoder`: kill+wait+join+spawn), which runs INLINE on the vfio-user callback
+        // thread — it blocks the guest's non-posted scanout doorbell, parks the vCPU holding
+        // QEMU's BQL, and stalls the QMP monitor into multi-second cursor/input freezes
+        // (mouse-lag-hunt rank 1/2: a slow viewer re-armed this every 500ms). A shed client
+        // instead resyncs at the encoder's existing ~2s periodic IDR (`-g fps*2 -forced-idr 1`),
+        // which costs the callback thread nothing. On a healthy LAN a client rarely sheds; when
+        // it does, ≤2s of stale video for that one client beats freezing every VM's cursor.
+        if shed {
+            log::debug!("infiniPixel: slow client shed its backlog; resyncs at next periodic IDR");
         }
     }
 

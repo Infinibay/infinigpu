@@ -591,6 +591,14 @@ impl InfinigpuBackend {
             let _ = self.write_ppm(&dir.join("latest.ppm"), w, h, &rgb);
         }
 
+        // Publish completion FIRST — the guest's framebuffer has already been fully consumed
+        // (DMA-read + converted into `bgra`/`rgb` above), so retire this ring's seqno and let
+        // the guest's non-posted scanout doorbell return immediately, BEFORE the encode handoff.
+        // This keeps the guest vCPU (and QEMU's BQL) from being parked across any downstream
+        // streamer cost, which would stall the QMP monitor and freeze input (mouse-lag-hunt).
+        // (The guest polls this retired register; the MSI-X is raised by the doorbell handler.)
+        self.ring_retired[ctx] = seqno;
+
         // infiniPixel: encode this framebuffer on NVENC and stream it to any browsers.
         if streaming {
             self.stream_frame(&bgra, w as u32, h as u32);
@@ -601,10 +609,6 @@ impl InfinigpuBackend {
                 }
             }
         }
-
-        // Publish completion (guest polls this ring's retired register; the MSI-X is
-        // raised by the doorbell handler).
-        self.ring_retired[ctx] = seqno;
     }
 
     /// Feed one presented frame to the infiniPixel stream. The streamer (re)sizes its
