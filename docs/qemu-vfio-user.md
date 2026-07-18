@@ -28,21 +28,45 @@ That covers the device's config space + DMA-map/unmap + region setup against rea
 the device is passed as JSON so the nested `SocketAddress` parses:
 `-device '{"driver":"vfio-user-pci","socket":{"type":"unix","path":"<sock>"}}'`.
 
-## Boot — guest `.ko` against the live device (needs a readable kernel)
+## Boot — guest `.ko` against the live device — **VERIFIED PASS**
 
 ```
-(cd guest/linux && make)                                  # build the module for THIS kernel
-sudo install -m0644 /boot/vmlinuz-$(uname -r) /tmp/vmlinuz   # a readable copy (distro image is root-0600)
-scripts/qemu-vfio-user-boot.sh boot --kernel /tmp/vmlinuz
+(cd guest/linux && make)                                       # build the module for THIS kernel
+scripts/qemu-vfio-user-boot.sh boot --kernel <readable-vmlinuz>
 ```
 
-Boots a minimal busybox initramfs that `insmod infinigpu.ko ring_drainer=1` and dumps the guest
-`dmesg`, so the **guest driver's probe** (ring alloc + `CMD_RING_BASE/SIZE/INDEX` programming) and —
-once fbcon attaches — the `RESOURCE_FLUSH` present path run against the live device. This is the one
-PR4 piece no off-hardware harness covers: the guest *kernel* driving its DMA-coherent ring against a
-real device. Use the kernel matching `uname -r` (the `.ko` is built against it) so the module loads.
+Boots a minimal busybox initramfs that loads infinigpu's DRM dep modules (resolved from
+`modules.dep`, decompressed from the world-readable `/usr/lib/modules` tree) + `insmod
+infinigpu.ko ring_drainer=1`, then dumps the guest `dmesg`. This is the one PR4 piece no off-hardware
+harness covers: the guest *kernel* driving its DMA-coherent ring against a real device. Use the
+kernel matching `uname -r` (the `.ko`'s vermagic must match).
 
-**The only thing blocking a fully-autonomous run is read access to the distro kernel image**
-(`/boot/vmlinuz-*` is mode `0600 root`); the `sudo install` above is the single privileged step.
-Everything else — the device server, the initramfs, the QEMU invocation — the script does itself,
-and the smoke path proves the device end works with real QEMU.
+**Verified PASS** (guest 6.14.0-37 against the live device over QEMU 10.1.5):
+
+```
+infinigpu 0000:00:03.0: infinigpu magic=0x49475055 abi=0x4 caps=0x3c
+infinigpu 0000:00:03.0: infinigpu: PR4 ring drainer enabled (cap=16)
+[drm] Initialized infinigpu 1.0.0 for 0000:00:03.0 on minor 0
+infinigpu 0000:00:03.0: [drm] fb0: infinigpudrmfb frame buffer device
+infinigpu 0000:00:03.0: INFINIGPU-KMS: registered /dev/dri/card0 (2D accel on, cursor plane off)
+```
+
+The guest read the device identity/ABI/caps over vfio-user, **programmed the PR4 ring registers**
+(`CMD_RING_BASE_LO/HI`, `CMD_RING_SIZE` — confirmed as `BAR0 write off=0x0100/0x0104/0x0108` in the
+device server log — and `CMD_RING_INDEX`, since probe completed), and brought up DRM/KMS + fbdev
+against the live device. The device's broker even sized itself from the real A5000 via NVML. So the
+**guest driver's probe + ring-drainer activation is runtime-validated end-to-end**.
+
+*Caveat:* driving a `RESOURCE_FLUSH` present round-trip needs a real page-flip source (a compositor,
+`modetest`, or fbcon damage) — a minimal busybox guest that only `dd`s to `/dev/fb0` doesn't reliably
+flip before power-down, and the single-connection device server exits on the guest's shutdown
+`Broken pipe`. The present path itself is validated separately by `tests/pr4_vfio_user.rs` (a real
+`RESOURCE_FLUSH` drained + presented over vfio-user). A fuller guest rootfs would close this last
+loop; it isn't a correctness gap.
+
+### Getting a readable kernel
+
+The distro image `/boot/vmlinuz-*` is mode `0600 root`. Provide a readable copy — either a cached
+one (e.g. `~/.cache/infinigpu/vmlinuz`) or `sudo install -m0644 /boot/vmlinuz-$(uname -r)
+/tmp/vmlinuz`. Everything else — device server, DRM-dep resolution, initramfs, QEMU — the script
+does itself.

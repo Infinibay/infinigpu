@@ -88,23 +88,72 @@ fi
 KO="$ROOT/guest/linux/infinigpu.ko"
 [ -r "$KO" ] || die "build the guest module first: (cd guest/linux && make)"
 
-echo ">> building a minimal initramfs (busybox + infinigpu.ko)"
+echo ">> building a minimal initramfs (busybox + infinigpu.ko + DRM deps)"
 IR="$WORK/initramfs"
-mkdir -p "$IR"/{bin,proc,sys,dev}
+mkdir -p "$IR"/{bin,proc,sys,dev,lib}
 cp "$BUSYBOX" "$IR/bin/busybox"
 for a in sh mount insmod dmesg sleep poweroff cat grep; do ln -sf busybox "$IR/bin/$a"; done
 cp "$KO" "$IR/infinigpu.ko"
+
+# infinigpu.ko depends on out-of-kernel-module DRM helpers (drm_dma_helper etc.); the rest of DRM
+# is built into this kernel. Resolve infinigpu's module deps + their modules.dep closure, decompress
+# each into the initramfs, and record the load order (deepest deps first). Only decompressible
+# (readable) modules are included — the distro tree is world-readable even when vmlinuz is not.
+MODDIR="/usr/lib/modules/$(uname -r)"
+DEPFILE="$MODDIR/modules.dep"
+declare -A SEEN=()
+LOAD_ORDER=()
+resolve() {  # recursively append $1's deps then $1 to LOAD_ORDER (dedup)
+  local m="$1"
+  [ -n "${SEEN[$m]:-}" ] && return
+  SEEN[$m]=1
+  local line rel deps d
+  line="$(grep -E "/(${m})\.ko(\.zst)?:" "$DEPFILE" | head -1 || true)"
+  rel="${line%%:*}"
+  deps="${line#*:}"
+  for d in $deps; do resolve "$(basename "$d" | sed 's/\.ko.*//')"; done
+  [ -n "$rel" ] && LOAD_ORDER+=("$MODDIR/$rel")
+}
+for dep in $(modinfo "$KO" 2>/dev/null | sed -n 's/^depends: *//p' | tr ',' ' '); do
+  resolve "$dep"
+done
+LOAD_LINES=""
+for zf in "${LOAD_ORDER[@]}"; do
+  base="$(basename "$zf" | sed 's/\.ko.*//')"
+  if zstd -dcq "$zf" >"$IR/lib/$base.ko" 2>/dev/null; then
+    LOAD_LINES="${LOAD_LINES}insmod /lib/$base.ko || echo \"GUEST: dep $base failed\""$'\n'
+    echo "   + dep module: $base"
+  fi
+done
+
 cat >"$IR/init" <<EOF
 #!/bin/sh
 export PATH=/bin
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev 2>/dev/null
+echo "GUEST: loading DRM dep modules"
+${LOAD_LINES}
 echo "GUEST: loading infinigpu.ko (ring_drainer=$RING_DRAINER)"
 insmod /infinigpu.ko ring_drainer=$RING_DRAINER || echo "GUEST: insmod FAILED"
 sleep 1
+echo "GUEST: forcing framebuffer flips (exercises the present/RESOURCE_FLUSH path)"
+if [ -e /dev/fb0 ]; then
+  # Interleave fb writes with waits so the drm_fbdev_dma deferred-IO worker flushes the dirty
+  # pages (→ igpu_flush_damaged → RESOURCE_FLUSH) before we power down.
+  for n in 1 2 3 4 5; do
+    dd if=/dev/zero of=/dev/fb0 bs=8192 count=64 conv=notrunc 2>/dev/null
+    dd if=/dev/urandom of=/dev/fb0 bs=8192 count=64 conv=notrunc 2>/dev/null
+    sync; sleep 1
+  done
+else
+  echo "GUEST: no /dev/fb0"
+fi
+sleep 2
 echo "==== INFINIGPU DMESG ===="
-dmesg | grep -i infinigpu || echo "GUEST: no infinigpu dmesg lines"
+dmesg | grep -iE "infinigpu|drm" | tail -40 || echo "GUEST: no infinigpu dmesg lines"
+echo "==== DRI NODES ===="
+ls -l /dev/dri /dev/fb0 2>/dev/null || echo "(no /dev/dri)"
 echo "==== END ===="
 poweroff -f
 EOF
