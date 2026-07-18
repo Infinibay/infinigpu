@@ -136,6 +136,13 @@ the pivot that makes everything after it reusable for 3D.
 - **Device seam (MANDATORY, lands WITH the GPU move):** per-VM latest-wins Mailbox on the
   callback thread + a per-VM worker thread running `self.ticket.run(|| convert_present(...))` —
   so the broker throttle never runs on the vfio-user thread.
+  - *Status (seam built + tested, consumer hardware-gated):* the latest-wins hand-off is shipped —
+    `mailbox.rs` (`Sender::post` never blocks + coalesces to the freshest frame + hands back the
+    stale one; `Receiver::recv` blocks the worker; close/drop shutdown), 7 tests incl. the
+    anti-bufferbloat "1000 posts → worker sees only the latest" and "recv blocks until post". This
+    is the exact mechanism that keeps GPU work off the vfio-user callback thread (the `f14ad69`
+    mouse-lag class). **Remaining (needs the A5000):** the per-VM worker thread wiring + the
+    `convert_present` GPU body it drives.
 - **Accept:** `convert_present_roundtrip` unit (known XRGB & RGBA rects → assert readback BGRA;
   a second small-damage present leaves the undamaged region byte-identical); E2E: `nvidia-smi
   dmon` GPU util rises on present while host CPU/present drops; colors correct; the callback

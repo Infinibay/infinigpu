@@ -17,6 +17,7 @@ mod config;
 pub mod dispatch;
 pub mod dma;
 pub mod drain;
+pub mod mailbox;
 pub mod resource;
 
 use dma::DmaTable;
