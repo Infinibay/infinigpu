@@ -98,13 +98,27 @@ the pivot that makes everything after it reusable for 3D.
 > proven with owned buffers standing in for the sparse-mmap page). The **phase-2 dispatch** is also
 > built + tested: `dispatch.rs`'s `execute_resource` decodes
 > `RESOURCE_CREATE_BLOB/ATTACH_BACKING/SET_SCANOUT_BLOB/RESOURCE_FLUSH/RESOURCE_DESTROY` into the
-> `ResourceTable` fail-closed (6 tests: full lifecycle, unknown/un-backed flush, short payloads,
-> hostile entry count, dup/oversized, non-resource pass-through), backed by the additive
-> `AttachBacking`+`MemEntry` ABI (0.4, layout-asserted + C-conformance green). **Remaining (needs
-> QEMU + guest KMD):** the `build_regions(index_fd)` sparse-mmap **transport** (a vfio-user region —
-> only exercisable under QEMU), wiring `drain`→`execute_resource`→the resource-backed present into
-> the live `process_ring` (+ `host_ptr` backing resolve), and the guest registering each dumb FB
-> once + flipping via `RESOURCE_FLUSH`. The PR3 CPU-patch path stays the live fallback.
+> `ResourceTable` fail-closed (6 tests), backed by the additive `AttachBacking`+`MemEntry` ABI (0.4,
+> layout-asserted + C-conformance green).
+>
+> **And the live wiring is now landed + tested off-hardware (no QEMU needed).** A **DMA-resident
+> ring** (index page + descriptor array in guest RAM, addressed by the new `CMD_RING_INDEX` /
+> `CMD_RING_BASE` / `CMD_RING_SIZE` registers; non-zero `CMD_RING_INDEX` switches a ctx to the
+> drainer, zero keeps the Phase-0 single-descriptor fallback) is driven by `process_ring`→`drain_ctx`
+> (two-phase: pop under the ring view → `execute_descriptor` under `&mut self` → retire on the shared
+> page). `RESOURCE_FLUSH` routes to `present_resource_flush`, which resolves the blob's phase-1
+> single-segment backing and reuses the damage-present path. The **PR4 accept criterion** is a green
+> unit test (`pr4_real_ring_drain_presents_a_blob_resource`): over a memfd standing in for guest RAM,
+> it programs the ring via BAR0, publishes CREATE_BLOB→ATTACH_BACKING→SET_SCANOUT_BLOB→RESOURCE_FLUSH
+> through the SPSC producer, rings the doorbell, and asserts `head==tail` + `seqno_retired==N` +
+> resource/scanout registered + the presented BGRA matches the blob + per-VM isolation + fail-closed
+> on an unknown resource.
+>
+> **Remaining (genuinely hardware/guest-gated):** the `build_regions(index_fd)` **sparse-mmap BAR2
+> transport** (a zero-copy optimization over today's DMA-resident ring — only exercisable/needed
+> under QEMU), multi-segment scatter-gather backing (phase-1 takes the single-segment shortcut), and
+> the **guest KMD** actually programming the ring + registering each dumb FB + flipping via
+> `RESOURCE_FLUSH` (needs a rebuilt `.ko` + QEMU). The PR3 CPU-patch path stays the live fallback.
 
 - `infinigpu-ring` becomes a device dep; `#[repr(C)]` on `Indices` + `Indices::from_ptr` so the
   loom-verified SPSC pop/retire/len runs over the shared page. New `index.rs`

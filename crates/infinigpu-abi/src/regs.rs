@@ -63,6 +63,15 @@ pub mod ctrl {
     /// at the fixed [`CMD_RING0_RETIRED_LO`] for the Phase-0 single-ring guest driver.
     pub const CMD_RING_RETIRED_LO: u64 = 0x14;
     pub const CMD_RING_RETIRED_HI: u64 = 0x18;
+    /// Guest-physical address (IOVA) of this ring's [`crate::wire::RingIndices`] page. When
+    /// **non-zero**, the device drives ring `i` as a **real SPSC descriptor ring** (2D-ADR PR4):
+    /// the descriptor array is at [`CMD_RING_BASE_LO`]/`_HI` with [`CMD_RING_SIZE`] entries, and the
+    /// host runs the loom-verified two-phase bounded drainer over this page. When **zero**, ring `i`
+    /// stays on the Phase-0 single-descriptor path (`CMD_RING_BASE` points at one descriptor). This
+    /// is the DMA-resident transport (index page in guest RAM); the sparse-mmap BAR2 variant is a
+    /// later zero-copy optimization that reuses the same drainer.
+    pub const CMD_RING_INDEX_LO: u64 = 0x1C;
+    pub const CMD_RING_INDEX_HI: u64 = 0x20;
 }
 
 /// Shared, directly-mmapped index page (`0x2000..0x2FFF`): one

@@ -27,12 +27,12 @@ pub const PCI_CLASS_DISPLAY_VGA: u32 = 0x0003_0000; // 0x030000
 pub const DEV_MAGIC: u32 = 0x4947_5055;
 
 pub const ABI_MAJOR: u16 = 0;
-/// Bumped 1→2 for the additive 2D-accel wire (`DISPLAY_SCANOUT_DAMAGE` + `ScanoutPresentDamaged`
-/// + `DISPLAY_ACCEL`/`CAP_DISPLAY_2D`), then 2→3 for the additive cursor-plane wire (`CursorUpdate`
-/// + `cursor_flags` + `caps::CURSOR_PLANE`, reserving `msg_type::MEDIA_REGION`), then 3→4 for the
-/// additive blob-backing wire (`AttachBacking` + `MemEntry` — the `RESOURCE_ATTACH_BACKING` payload
-/// the PR4 ring drainer records into the per-VM `ResourceTable`). Purely additive at each step: a
-/// peer that doesn't negotiate the new caps never sends/accepts the new messages.
+/// Minor-version history (each step purely additive — a peer that doesn't negotiate the new caps
+/// never sends or accepts the new messages). v2 added the 2D-accel wire (`DISPLAY_SCANOUT_DAMAGE`,
+/// `ScanoutPresentDamaged`, `DISPLAY_ACCEL`/`CAP_DISPLAY_2D`). v3 added the cursor-plane wire
+/// (`CursorUpdate`, `cursor_flags`, `caps::CURSOR_PLANE`, reserving `msg_type::MEDIA_REGION`). v4
+/// added the blob-backing wire (`AttachBacking`, `MemEntry` — the `RESOURCE_ATTACH_BACKING` payload
+/// the PR4 ring drainer records into the per-VM `ResourceTable`).
 pub const ABI_MINOR: u16 = 4;
 
 /// Packed `ABI_VERSION` register value (`major << 16 | minor`).

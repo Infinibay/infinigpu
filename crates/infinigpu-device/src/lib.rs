@@ -228,6 +228,15 @@ pub struct InfinigpuBackend {
     /// Per-context highest retired seqno (completion sync via trapped read). Ring 0 is
     /// also mirrored at the fixed `CMD_RING0_RETIRED` register for the Phase-0 driver.
     ring_retired: Vec<u64>,
+    /// Per-context `RingIndices`-page IOVA (`CMD_RING_INDEX`). Non-zero switches ring `ctx` to the
+    /// PR4 real drainer (`drain_ctx`); zero keeps the Phase-0 single-descriptor path.
+    ring_index: Vec<u64>,
+    /// Per-context descriptor-ring capacity in entries (`CMD_RING_SIZE`; power of two). Only used on
+    /// the real-drainer path.
+    ring_cap: Vec<u32>,
+    /// Per-VM host-side blob resource table (PR4). Populated by the `RESOURCE_*` ring messages;
+    /// the resource-backed present (`RESOURCE_FLUSH`) resolves a blob's backing through `dma`.
+    resources: resource::ResourceTable,
     /// The GPU broker (ADR-0007): admission + fair-share scheduling. Shared across
     /// every VM's backend so they cooperatively share one physical GPU.
     broker: Arc<GpuBroker>,
@@ -366,6 +375,9 @@ impl InfinigpuBackend {
             dbg_dma_addr: 0,
             ring_base: vec![0; NUM_CONTEXTS],
             ring_retired: vec![0; NUM_CONTEXTS],
+            ring_index: vec![0; NUM_CONTEXTS],
+            ring_cap: vec![0; NUM_CONTEXTS],
+            resources: resource::ResourceTable::new(),
             broker,
             shared_gpu,
             vm_config,
@@ -457,6 +469,10 @@ impl InfinigpuBackend {
         self.admission_denied = false;
         self.ring_base.iter_mut().for_each(|b| *b = 0);
         self.ring_retired.iter_mut().for_each(|r| *r = 0);
+        self.ring_index.iter_mut().for_each(|i| *i = 0);
+        self.ring_cap.iter_mut().for_each(|c| *c = 0);
+        // Blob resources are per-generation; the guest re-creates them after a reset.
+        self.resources.clear();
         // Drop the persistent damage surface: after a reset the guest re-negotiates and
         // sends a fresh full-frame present, so a retained buffer would only risk staleness.
         self.last_scanout = None;
@@ -494,8 +510,11 @@ impl InfinigpuBackend {
             return match field {
                 CMD_RING_BASE_LO => (self.ring_base[ctx] & 0xFFFF_FFFF) as u32,
                 CMD_RING_BASE_HI => (self.ring_base[ctx] >> 32) as u32,
+                CMD_RING_SIZE => self.ring_cap[ctx],
                 CMD_RING_RETIRED_LO => (self.ring_retired[ctx] & 0xFFFF_FFFF) as u32,
                 CMD_RING_RETIRED_HI => (self.ring_retired[ctx] >> 32) as u32,
+                CMD_RING_INDEX_LO => (self.ring_index[ctx] & 0xFFFF_FFFF) as u32,
+                CMD_RING_INDEX_HI => (self.ring_index[ctx] >> 32) as u32,
                 _ => 0,
             };
         }
@@ -550,6 +569,13 @@ impl InfinigpuBackend {
                 }
                 CMD_RING_BASE_HI => {
                     self.ring_base[ctx] = (self.ring_base[ctx] & 0xFFFF_FFFF) | (u64::from(val) << 32)
+                }
+                CMD_RING_SIZE => self.ring_cap[ctx] = val,
+                CMD_RING_INDEX_LO => {
+                    self.ring_index[ctx] = (self.ring_index[ctx] & !0xFFFF_FFFF) | u64::from(val)
+                }
+                CMD_RING_INDEX_HI => {
+                    self.ring_index[ctx] = (self.ring_index[ctx] & 0xFFFF_FFFF) | (u64::from(val) << 32)
                 }
                 _ => {}
             }
@@ -623,6 +649,14 @@ impl InfinigpuBackend {
             ScanoutPresentDamaged, SubmitCmd,
         };
         use zerocopy::FromBytes;
+
+        // PR4: when the guest has programmed a RingIndices page for this ctx, drive it as a real
+        // SPSC descriptor ring (bounded two-phase drain + RESOURCE_* dispatch). Otherwise fall
+        // through to the Phase-0 single-descriptor path below.
+        if self.ring_index[ctx] != 0 {
+            self.drain_ctx(ctx);
+            return;
+        }
 
         let base = self.ring_base[ctx];
         log::debug!("process_ring ctx={ctx} base={base:#x}");
@@ -706,6 +740,153 @@ impl InfinigpuBackend {
             }
             other => log::warn!("unsupported encoding {:#x}", other),
         }
+    }
+
+    /// PR4 real-ring drainer for context `ctx` (`docs/adr/2D-ACCEL-IMPLEMENTATION.md`). Runs the
+    /// loom-verified SPSC [`infinigpu_ring::Ring`] over the guest-shared, DMA-resident index page +
+    /// descriptor array (addressed by `CMD_RING_INDEX` / `CMD_RING_BASE` / `CMD_RING_SIZE`), in the
+    /// two-phase bounded shape (`drain.rs`): **phase 1** pops a batch (≤ capacity) under the ring
+    /// view then drops it; **phase 2** executes each descriptor under `&mut self`; **phase 3**
+    /// retires the highest seqno on the shared page (+ the host-side register mirror) so the guest's
+    /// fences resolve. Fail-closed throughout: bad geometry, an unmapped page, or a malformed
+    /// descriptor is logged + skipped — never a stall, never an out-of-bounds read.
+    fn drain_ctx(&mut self, ctx: usize) {
+        use infinigpu_abi::wire::{Descriptor, RingIndices};
+
+        let index_iova = self.ring_index[ctx];
+        let desc_iova = self.ring_base[ctx];
+        let cap = self.ring_cap[ctx] as usize;
+        if desc_iova == 0 || cap == 0 || !cap.is_power_of_two() {
+            log::error!("drain ctx={ctx}: bad ring geometry (base={desc_iova:#x} cap={cap})");
+            return;
+        }
+        // Resolve the shared ring memory to host pointers (fail-closed bounds check). `host_ptr`
+        // returns raw pointers, not a borrow of `self`, so descriptor execution can take `&mut self`
+        // afterwards; the pointers stay valid because a ring drain never unmaps DMA.
+        let idx_bytes = core::mem::size_of::<RingIndices>();
+        let desc_bytes = cap * core::mem::size_of::<Descriptor>();
+        let (index_ptr, desc_ptr) = unsafe {
+            match (self.dma.host_ptr(index_iova, idx_bytes), self.dma.host_ptr(desc_iova, desc_bytes)) {
+                (Some(i), Some(d)) => (i as *const u8, d as *const u8),
+                _ => {
+                    log::error!("drain ctx={ctx}: ring memory not fully mapped");
+                    return;
+                }
+            }
+        };
+
+        // Admission gate (fail-closed), once per drain: a VM the broker didn't admit runs nothing.
+        if !self.ensure_admitted() {
+            return;
+        }
+
+        // Phase 1: pop a bounded batch, then drop the ring view (releases the shared-page pointers).
+        let drained = {
+            let ring = match unsafe { drain::ring_over_shared(index_ptr, desc_ptr, cap) } {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("drain ctx={ctx}: ring view rejected: {e:?}");
+                    return;
+                }
+            };
+            drain::pop_batch(&ring, cap)
+        };
+
+        // Phase 2: execute each descriptor under &mut self (DMA reads, resource-table mutation,
+        // present). Bounded by the batch size (≤ capacity).
+        for desc in &drained.descriptors {
+            self.execute_descriptor(ctx, desc);
+        }
+
+        // Phase 3: publish the highest retired seqno on the shared index page + mirror it in the
+        // host-side register (the doorbell handler raises the completion vector).
+        if drained.highest_seqno > 0 {
+            let _ = unsafe {
+                drain::retire_over_shared(index_ptr, desc_ptr, cap, drained.highest_seqno)
+            };
+            self.ring_retired[ctx] = drained.highest_seqno;
+        }
+    }
+
+    /// Phase 2 of the drain: execute one descriptor. DMA-reads its payload (at
+    /// `ring_base + data_offset`, bounded to 64 MiB) and dispatches the `RESOURCE_*` op into the
+    /// per-VM [`resource::ResourceTable`] (`dispatch::execute_resource`); a validated `RESOURCE_FLUSH`
+    /// routes to the resource-backed present. Every malformed/rejected input is logged + dropped.
+    fn execute_descriptor(&mut self, ctx: usize, desc: &infinigpu_abi::wire::Descriptor) {
+        use crate::dispatch::{execute_resource, Executed};
+
+        const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
+        let len = desc.len as usize;
+        if len > MAX_PAYLOAD {
+            log::error!("drain ctx={ctx}: descriptor payload {len} exceeds cap — dropped");
+            return;
+        }
+        let payload_addr = self.ring_base[ctx] + desc.data_offset as u64;
+        let mut payload = vec![0u8; len];
+        if len > 0 && !self.dma.read(payload_addr, &mut payload) {
+            log::error!("drain ctx={ctx}: payload {payload_addr:#x} ({len} B) not mapped");
+            return;
+        }
+        // Dispatch against the resource table first (needs &mut self.resources), then act on the
+        // outcome (the present needs &mut self) — no overlapping borrow.
+        match execute_resource(desc, &payload, &mut self.resources) {
+            Executed::Flush { res_id, rect } => {
+                self.present_resource_flush(res_id, rect, desc.seqno, ctx)
+            }
+            Executed::Rejected(e) => log::warn!("drain ctx={ctx}: resource op rejected: {e:?}"),
+            Executed::ShortPayload => log::warn!("drain ctx={ctx}: short resource payload dropped"),
+            Executed::NotResource => {
+                log::debug!("drain ctx={ctx}: non-resource msg_type {:#x} ignored", desc.msg_type)
+            }
+            ok => log::debug!("drain ctx={ctx}: {ok:?}"),
+        }
+    }
+
+    /// Resource-backed present (`RESOURCE_FLUSH`): the blob bound to a scanout head **is** the
+    /// framebuffer. Resolve its geometry (from the `SET_SCANOUT_BLOB` binding) and its phase-1
+    /// single-segment backing, then reuse the damage-present path (`present_scanout_damaged`) over
+    /// the backing address — so only the damage rect is patched into the persistent per-VM
+    /// `ScanoutBuffer` and streamed. Fail-closed: an unbound resource, non-contiguous/short backing,
+    /// or bad geometry degrades to a skip (the fence still retires in `drain_ctx`).
+    fn present_resource_flush(&mut self, res_id: u32, rect: (u32, u32, u32, u32), seqno: u64, ctx: usize) {
+        use infinigpu_abi::wire::ScanoutPresentDamaged;
+
+        // Copy out the small facts we need so we don't hold a &self.resources borrow across the
+        // &mut self present.
+        let (width, height, pitch, format, backing_addr) = {
+            let Some((_sid, b)) = self.resources.scanout_binding_for(res_id) else {
+                log::warn!("flush ctx={ctx}: res {res_id} not bound to a scanout — skipped");
+                return;
+            };
+            let (width, height, pitch, format) = (b.width, b.height, b.stride, b.format);
+            let Some(r) = self.resources.get(res_id) else { return };
+            // Phase-1 shortcut: a single contiguous backing segment (dma_alloc_coherent). Multi-
+            // segment scatter-gather is a later rung.
+            let backing_addr = match r.backing.as_slice() {
+                [seg] => seg.addr,
+                _ => {
+                    log::warn!("flush ctx={ctx}: res {res_id} backing not single-segment — skipped");
+                    return;
+                }
+            };
+            (width, height, pitch, format, backing_addr)
+        };
+
+        let (dx, dy, dw, dh) = rect;
+        // The blob backing is just another guest framebuffer address — hand it to the existing
+        // damage-present machinery (geometry-guarded, channel-correct, persistent-surface patch).
+        let sp = ScanoutPresentDamaged {
+            width,
+            height,
+            pitch,
+            format,
+            scanout_addr: backing_addr,
+            dx,
+            dy,
+            dw,
+            dh,
+        };
+        self.present_scanout_damaged(&sp, seqno, ctx);
     }
 
     /// 3D command submission (`encoding::VULKAN_VENUSLIKE`) — the Venus-remoting datapath
@@ -1573,5 +1754,154 @@ mod tests {
         // A device reset zeroes the per-attach counter.
         b.reset_state();
         assert_eq!(b.vulkan_submits, 0);
+    }
+
+    /// PR4 accept criterion, end-to-end over memfd-backed guest RAM (no QEMU): program a real
+    /// DMA-resident ring, publish CREATE_BLOB → ATTACH_BACKING → SET_SCANOUT_BLOB → RESOURCE_FLUSH
+    /// through the SPSC producer, ring the doorbell, and assert the drainer retired all N, drained
+    /// the ring (head==tail, seqno_retired==N), registered the resource + scanout, and produced a
+    /// present whose BGRA matches the blob framebuffer. Also checks per-VM isolation + fail-closed.
+    #[test]
+    fn pr4_real_ring_drain_presents_a_blob_resource() {
+        use infinigpu_abi::wire::{
+            format, msg_type, AttachBacking, Descriptor, MemEntry, ResourceCreateBlob, ResourceFlush,
+            SetScanoutBlob,
+        };
+        use std::os::unix::io::FromRawFd;
+        use std::ptr;
+        use zerocopy::IntoBytes;
+
+        const GUEST_BASE: u64 = 0x8000_0000;
+        const SIZE: usize = 0x10000;
+        const IDX_OFF: usize = 0x0;
+        const DESC_OFF: usize = 0x40;
+        const PAY_OFF: usize = 0x400;
+        const BLOB_OFF: usize = 0x2000;
+        const CAP: usize = 8;
+        const CTX: usize = 0;
+        let (w, h) = (4usize, 4usize);
+        let stride = w * 4;
+        let fb_bytes = stride * h;
+
+        // ---- guest RAM (memfd) mapped for our own writes; the device maps it independently ----
+        let fd = unsafe { libc::memfd_create(c"pr4ram".as_ptr(), 0) };
+        assert!(fd >= 0, "memfd_create");
+        assert_eq!(unsafe { libc::ftruncate(fd, SIZE as libc::off_t) }, 0);
+        let ram = unsafe {
+            libc::mmap(ptr::null_mut(), SIZE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
+        } as *mut u8;
+        assert_ne!(ram as *mut libc::c_void, libc::MAP_FAILED, "mmap guest ram");
+
+        // A known BGRA framebuffer in the blob region (A=255 → BGRA identity through the present).
+        let mut blob = vec![0u8; fb_bytes];
+        for i in 0..(w * h) {
+            blob[i * 4] = i as u8 + 1; // B
+            blob[i * 4 + 1] = 0x20 + i as u8; // G
+            blob[i * 4 + 2] = 0x40 + i as u8; // R
+            blob[i * 4 + 3] = 255; // A
+        }
+        unsafe { ptr::copy_nonoverlapping(blob.as_ptr(), ram.add(BLOB_OFF), fb_bytes) };
+
+        // Lay out the four descriptor payloads; `data_offset` is relative to the descriptor array
+        // base (== ring_base). Returns each payload's (data_offset, len).
+        let mut pay = PAY_OFF;
+        let mut put = |bytes: &[u8]| -> (u32, u32) {
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), ram.add(pay), bytes.len()) };
+            let data_offset = (pay - DESC_OFF) as u32;
+            let len = bytes.len() as u32;
+            pay += (bytes.len() + 15) & !15; // 16-align the next payload
+            (data_offset, len)
+        };
+        let create = put(
+            ResourceCreateBlob { res_id: 1, ctx_id: 0, blob_mem: 1, blob_flags: 0, size: fb_bytes as u64 }
+                .as_bytes(),
+        );
+        let mut ab = AttachBacking { res_id: 1, num_entries: 1 }.as_bytes().to_vec();
+        ab.extend_from_slice(
+            MemEntry { addr: GUEST_BASE + BLOB_OFF as u64, length: fb_bytes as u64 }.as_bytes(),
+        );
+        let attach = put(&ab);
+        let scanout = put(
+            SetScanoutBlob {
+                scanout_id: 0,
+                res_id: 1,
+                width: w as u32,
+                height: h as u32,
+                format: format::B8G8R8A8,
+                stride: stride as u32,
+            }
+            .as_bytes(),
+        );
+        let flush = put(
+            ResourceFlush { res_id: 1, x: 0, y: 0, w: w as u32, h: h as u32, _reserved: 0 }.as_bytes(),
+        );
+
+        // ---- build the device; inject the DMA mapping; program the ring via BAR0 registers ----
+        let mut b = InfinigpuBackend::new();
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        b.dma.map(GUEST_BASE, 0, SIZE as u64, file).unwrap();
+
+        let blk = |field: u64| ctrl::CMD_RING_CFG + CTX as u64 * CMD_RING_STRIDE + field;
+        let desc_iova = GUEST_BASE + DESC_OFF as u64;
+        let idx_iova = GUEST_BASE + IDX_OFF as u64;
+        b.bar0_write_u32(blk(ctrl::CMD_RING_BASE_LO), desc_iova as u32);
+        b.bar0_write_u32(blk(ctrl::CMD_RING_BASE_HI), (desc_iova >> 32) as u32);
+        b.bar0_write_u32(blk(ctrl::CMD_RING_SIZE), CAP as u32);
+        b.bar0_write_u32(blk(ctrl::CMD_RING_INDEX_LO), idx_iova as u32);
+        b.bar0_write_u32(blk(ctrl::CMD_RING_INDEX_HI), (idx_iova >> 32) as u32);
+        // Register read-back confirms the decode.
+        assert_eq!(b.bar0_read_u32(blk(ctrl::CMD_RING_INDEX_LO)), idx_iova as u32);
+        assert_eq!(b.bar0_read_u32(blk(ctrl::CMD_RING_SIZE)), CAP as u32);
+
+        // ---- publish the 4 descriptors through the SPSC producer over the shared page ----
+        {
+            let idx_ptr = unsafe { ram.add(IDX_OFF) } as *const u8;
+            let desc_ptr = unsafe { ram.add(DESC_OFF) } as *const u8;
+            let ring = unsafe { drain::ring_over_shared(idx_ptr, desc_ptr, CAP) }.unwrap();
+            let plan = [
+                (msg_type::RESOURCE_CREATE_BLOB, create),
+                (msg_type::RESOURCE_ATTACH_BACKING, attach),
+                (msg_type::SET_SCANOUT_BLOB, scanout),
+                (msg_type::RESOURCE_FLUSH, flush),
+            ];
+            for (i, &(mt, (off, len))) in plan.iter().enumerate() {
+                ring.push(Descriptor {
+                    msg_type: mt,
+                    flags: 0,
+                    len,
+                    data_offset: off,
+                    seqno: (i + 1) as u64,
+                    _reserved: 0,
+                })
+                .unwrap();
+            }
+        }
+
+        // ---- ring the ctx doorbell (the same trapped write QEMU issues) ----
+        b.bar0_write_u32(regs::doorbell::CMD_BASE + CTX as u64 * 4, 1);
+
+        // ---- assertions: full drain, resource state, and a correct present ----
+        assert_eq!(b.ring_retired[CTX], 4, "all 4 descriptors retired (highest seqno)");
+        {
+            let idx_ptr = unsafe { ram.add(IDX_OFF) } as *const u8;
+            let desc_ptr = unsafe { ram.add(DESC_OFF) } as *const u8;
+            let ring = unsafe { drain::ring_over_shared(idx_ptr, desc_ptr, CAP) }.unwrap();
+            assert!(ring.is_empty(), "head advanced to tail — ring fully drained");
+            assert_eq!(ring.retired(), 4, "guest observes seqno_retired == 4");
+        }
+        assert!(b.resources.get(1).is_some(), "blob resource registered");
+        assert_eq!(b.resources.scanout_binding_for(1).unwrap().0, 0, "scanout bound to the resource");
+        let sb = b.last_scanout.as_ref().expect("RESOURCE_FLUSH produced a scanout buffer");
+        assert_eq!((sb.w, sb.h), (w, h), "present geometry matches the scanout binding");
+        assert_eq!(sb.bgra, blob, "presented BGRA matches the blob framebuffer");
+
+        // Per-VM isolation: a *second* backend never sees VM-1's resource.
+        let b2 = InfinigpuBackend::new();
+        assert!(b2.resources.get(1).is_none(), "resources are per-VM (per-backend)");
+
+        // Fail-closed: a flush on an unknown resource is a no-op (no panic, no present change).
+        b.present_resource_flush(999, (0, 0, 1, 1), 5, CTX);
+
+        unsafe { libc::munmap(ram as *mut libc::c_void, SIZE) };
     }
 }

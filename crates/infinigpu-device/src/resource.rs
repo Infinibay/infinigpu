@@ -153,6 +153,17 @@ impl ResourceTable {
         self.scanouts.get(&scanout_id)
     }
 
+    /// The scanout head (if any) bound to `res_id`, with its binding — the reverse of [`scanout`].
+    /// `RESOURCE_FLUSH` uses it to map a flushed resource to its display geometry. Returns the
+    /// lowest-id match if a resource were bound to several heads (single-head today, `MAX_SCANOUTS=1`).
+    pub fn scanout_binding_for(&self, res_id: u32) -> Option<(u32, &ScanoutBinding)> {
+        self.scanouts
+            .iter()
+            .filter(|(_, b)| b.res_id == res_id)
+            .min_by_key(|(&sid, _)| sid)
+            .map(|(&sid, b)| (sid, b))
+    }
+
     pub fn resource_count(&self) -> usize {
         self.resources.len()
     }
