@@ -73,6 +73,9 @@
 #define REG_RETIRED_HI       0x0054
 #define REG_CMD_RING_BASE_LO 0x0100
 #define REG_CMD_RING_BASE_HI 0x0104
+#define REG_CMD_RING_SIZE    0x0108  /* per-ctx capacity (entries, pow2) — PR4 real ring */
+#define REG_CMD_RING_INDEX_LO 0x011C /* per-ctx RingIndices-page IOVA; non-zero => real drainer */
+#define REG_CMD_RING_INDEX_HI 0x0120
 #define REG_DOORBELL_CMD0    0x3004
 
 #define DEV_MAGIC            0x49475055u  /* "IGPU" */
@@ -81,6 +84,12 @@
 /* wire enums (infinigpu-abi wire) */
 #define MSG_SUBMIT_CMD       0x0030u
 #define MSG_CURSOR_UPDATE    0x0042u
+/* PR4 blob-resource messages (real ring-drainer path) */
+#define MSG_RESOURCE_CREATE_BLOB   0x0020u
+#define MSG_RESOURCE_ATTACH_BACKING 0x0021u
+#define MSG_RESOURCE_DESTROY       0x0024u
+#define MSG_SET_SCANOUT_BLOB       0x0040u
+#define MSG_RESOURCE_FLUSH         0x0041u
 #define ENC_DISPLAY_SCANOUT  0x0101u
 #define ENC_DISPLAY_SCANOUT_DAMAGE 0x0102u
 #define WIRE_FMT_XRGB8888    3u  /* = wire::format::B8G8R8X8; XRGB8888 LE = [B,G,R,X] */
@@ -129,6 +138,50 @@ struct igpu_cursor_update {
 	u64 reserved;
 };
 
+/* ---- PR4 real ring-drainer wire structs (mirror infinigpu-abi wire; cross-language interop is
+ * verified by crates/infinigpu-guest-conformance). Only used on the ring_drainer path. ---- */
+
+/* Mirrors wire::RingIndices — one 64-byte cacheline shared with the host consumer. The guest owns
+ * tail/seqno_submit; the host owns head/seqno_retired/status. */
+struct igpu_ring_indices {
+	u32 tail;
+	u32 head;
+	u64 seqno_submit;
+	u64 seqno_retired;
+	u32 status;
+	u32 reserved[9];
+};
+struct igpu_resource_create_blob {
+	u32 res_id, ctx_id, blob_mem, blob_flags;
+	u64 size;
+};
+struct igpu_attach_backing {
+	u32 res_id, num_entries;
+};
+struct igpu_mem_entry {
+	u64 addr, length;
+};
+struct igpu_set_scanout_blob {
+	u32 scanout_id, res_id, width, height, format, stride;
+};
+struct igpu_resource_flush {
+	u32 res_id, x, y, w, h, reserved;
+};
+
+/* Real-ring geometry: a power-of-two descriptor ring with a per-slot payload region, all in one
+ * coherent buffer laid out [descriptors: CAP*32][payloads: CAP*IGPU_RING2_PSTRIDE]. */
+#define IGPU_RING2_CAP     16u   /* descriptor slots (pow2) */
+#define IGPU_RING2_PSTRIDE 64u   /* per-slot payload bytes (largest body is 48B) */
+#define IGPU_FBCACHE       4     /* framebuffer->res_id registrations kept live */
+
+/* PR4 real ring-drainer path is off by default (bring-up gate): the tested-and-shipped default is
+ * the single-descriptor DISPLAY_SCANOUT[_DAMAGE] path. Enable with infinigpu.ring_drainer=1 once a
+ * host advertising the drainer is running, so nothing regresses on today's stack. */
+static bool ring_drainer_param;
+module_param_named(ring_drainer, ring_drainer_param, bool, 0444);
+MODULE_PARM_DESC(ring_drainer,
+		 "Use the PR4 real ring drainer + RESOURCE_* blob present path (default: off)");
+
 struct igpu_device {
 	struct drm_device drm;
 	struct drm_simple_display_pipe pipe;    /* used when !accel_cursor (single primary plane) */
@@ -152,6 +205,22 @@ struct igpu_device {
 	 * DEFINE and to flag a guest-initiated WARP (a jump with no matching pointer motion). */
 	bool cursor_had_fb;
 	int cursor_last_x, cursor_last_y;
+
+	/* PR4 real ring-drainer state (only when `ring_drainer`). The index page + the
+	 * descriptor/payload ring are DMA-coherent, shared with the host consumer. */
+	bool ring_drainer;                     /* module param gate: use the real ring + RESOURCE_* */
+	struct igpu_ring_indices *ring2_idx;   /* shared index page (CMD_RING_INDEX) */
+	dma_addr_t ring2_idx_dma;
+	void *ring2;                           /* [descriptors][payloads] (CMD_RING_BASE) */
+	dma_addr_t ring2_dma;
+	u32 next_res_id;
+	/* Framebuffer -> res_id registrations, so a re-flip of the same FB skips re-registration. */
+	struct {
+		dma_addr_t addr;
+		u32 res_id, w, h, pitch;
+		bool valid;
+	} fbcache[IGPU_FBCACHE];
+	u32 fbcache_next;                      /* round-robin eviction cursor */
 };
 
 #define to_igpu(d) container_of(d, struct igpu_device, drm)
@@ -260,6 +329,117 @@ static u32 igpu_submit_cursor(struct igpu_device *idev, const struct igpu_cursor
 	return retired;
 }
 
+/* ---- PR4 real ring-drainer producer (mirrors the interop-verified C reference in
+ * crates/infinigpu-guest-conformance; here the tail publish is smp_store_release). Only used on
+ * the `ring_drainer` path; the descriptor array + a per-slot payload region are DMA-coherent. ---- */
+
+/* SPSC push one message onto the real ring: stage the payload in this slot's payload region, fill
+ * the descriptor, publish seqno_submit + tail (release), ring the doorbell (the host drains
+ * synchronously in the non-posted write), and return the host-retired seqno. Caller holds
+ * ring_lock. Returns 0 (and drops the message) if the ring is full — caller degrades to full-frame. */
+static u32 igpu_ring2_push(struct igpu_device *idev, u32 msg_type,
+			   const void *payload, u32 payload_len)
+{
+	struct igpu_ring_indices *idx = idev->ring2_idx;
+	u8 *descs = idev->ring2;
+	u8 *payloads = descs + IGPU_RING2_CAP * sizeof(struct igpu_descriptor);
+	u32 tail = idx->tail;                       /* producer owns tail */
+	u32 head = smp_load_acquire(&idx->head);    /* observe host-freed slots */
+	struct igpu_descriptor *d;
+	u32 slot;
+	u64 seq;
+
+	if ((u32)(tail - head) >= IGPU_RING2_CAP)
+		return 0;
+	if (payload_len > IGPU_RING2_PSTRIDE)
+		return 0;
+
+	slot = tail & (IGPU_RING2_CAP - 1);
+	d = (struct igpu_descriptor *)(descs + slot * sizeof(*d));
+	seq = (u64)tail + 1;
+
+	memcpy(payloads + slot * IGPU_RING2_PSTRIDE, payload, payload_len);
+	d->msg_type = msg_type;
+	d->flags = 0;
+	d->len = payload_len;
+	d->data_offset = IGPU_RING2_CAP * sizeof(*d) + slot * IGPU_RING2_PSTRIDE;
+	d->seqno = seq;
+	d->reserved = 0;
+
+	idx->seqno_submit = seq;
+	smp_store_release(&idx->tail, tail + 1);    /* slot visible before tail */
+
+	iowrite32(1, idev->bar0 + REG_DOORBELL_CMD0);
+	return (u32)smp_load_acquire(&idx->seqno_retired);
+}
+
+/* Register `fb`'s backing as a host blob (CREATE_BLOB + ATTACH_BACKING + SET_SCANOUT_BLOB) once,
+ * caching addr->res_id so a re-flip of the same FB skips it. Round-robin evicts (with DESTROY) when
+ * the cache is full. Returns the res_id, or 0 on a full ring. Caller holds ring_lock. */
+static u32 igpu_resource_register(struct igpu_device *idev, dma_addr_t addr,
+				  u32 w, u32 h, u32 pitch)
+{
+	struct igpu_resource_create_blob cb;
+	struct { struct igpu_attach_backing h; struct igpu_mem_entry e; } __packed ab;
+	struct igpu_set_scanout_blob sb;
+	u64 size = (u64)pitch * h;
+	u32 res_id, i;
+
+	for (i = 0; i < IGPU_FBCACHE; i++)
+		if (idev->fbcache[i].valid && idev->fbcache[i].addr == addr &&
+		    idev->fbcache[i].pitch == pitch && idev->fbcache[i].h == h)
+			return idev->fbcache[i].res_id;
+
+	res_id = ++idev->next_res_id;
+
+	cb.res_id = res_id; cb.ctx_id = 0; cb.blob_mem = 1; cb.blob_flags = 0; cb.size = size;
+	if (!igpu_ring2_push(idev, MSG_RESOURCE_CREATE_BLOB, &cb, sizeof(cb)))
+		return 0;
+	ab.h.res_id = res_id; ab.h.num_entries = 1;
+	ab.e.addr = addr; ab.e.length = size;
+	if (!igpu_ring2_push(idev, MSG_RESOURCE_ATTACH_BACKING, &ab, sizeof(ab)))
+		return 0;
+	sb.scanout_id = 0; sb.res_id = res_id; sb.width = w; sb.height = h;
+	sb.format = WIRE_FMT_XRGB8888; sb.stride = pitch;
+	if (!igpu_ring2_push(idev, MSG_SET_SCANOUT_BLOB, &sb, sizeof(sb)))
+		return 0;
+
+	i = idev->fbcache_next;
+	if (idev->fbcache[i].valid) {
+		u32 old = idev->fbcache[i].res_id;
+
+		igpu_ring2_push(idev, MSG_RESOURCE_DESTROY, &old, sizeof(old));
+	}
+	idev->fbcache[i].addr = addr;
+	idev->fbcache[i].res_id = res_id;
+	idev->fbcache[i].w = w;
+	idev->fbcache[i].h = h;
+	idev->fbcache[i].pitch = pitch;
+	idev->fbcache[i].valid = true;
+	idev->fbcache_next = (i + 1) % IGPU_FBCACHE;
+	return res_id;
+}
+
+/* PR4 present: register the FB as a blob (once) and flush only the damage rect via RESOURCE_FLUSH.
+ * Returns false (caller falls back to the legacy full-frame path) if the ring couldn't take it. */
+static bool igpu_flush_resource(struct igpu_device *idev, dma_addr_t addr,
+				struct drm_framebuffer *fb, u32 dx, u32 dy, u32 dw, u32 dh)
+{
+	struct igpu_resource_flush rf;
+	u32 res_id;
+	bool ok = false;
+
+	mutex_lock(&idev->ring_lock);
+	res_id = igpu_resource_register(idev, addr, fb->width, fb->height, fb->pitches[0]);
+	if (res_id) {
+		rf.res_id = res_id; rf.x = dx; rf.y = dy; rf.w = dw; rf.h = dh; rf.reserved = 0;
+		igpu_ring2_push(idev, MSG_RESOURCE_FLUSH, &rf, sizeof(rf));
+		ok = true;
+	}
+	mutex_unlock(&idev->ring_lock);
+	return ok;
+}
+
 static void igpu_flush(struct igpu_device *idev, struct drm_plane_state *state)
 {
 	struct drm_framebuffer *fb = state->fb;
@@ -268,6 +448,12 @@ static void igpu_flush(struct igpu_device *idev, struct drm_plane_state *state)
 	if (!fb)
 		return;
 	addr = drm_fb_dma_get_gem_addr(fb, state, 0);
+	if (idev->ring_drainer) {
+		/* Best-effort; a full ring drops this frame (the next flip retries). Never fall back
+		 * to the legacy path here — it reprograms CMD_RING_BASE away from the real ring. */
+		igpu_flush_resource(idev, addr, fb, 0, 0, fb->width, fb->height);
+		return;
+	}
 	igpu_submit_scanout(idev, addr, fb->width, fb->height, fb->pitches[0],
 			    WIRE_FMT_XRGB8888);
 }
@@ -284,11 +470,18 @@ static void igpu_flush_damaged(struct igpu_device *idev,
 	struct drm_rect damage;
 	dma_addr_t addr;
 
+	u32 dx, dy, dw, dh;
+
 	if (!fb)
 		return;
 	addr = drm_fb_dma_get_gem_addr(fb, state, 0);
 
 	if (!drm_atomic_helper_damage_merged(old_state, state, &damage)) {
+		/* Full-frame: framebuffer swap / scaled plane / first flip after modeset. */
+		if (idev->ring_drainer) {
+			igpu_flush_resource(idev, addr, fb, 0, 0, fb->width, fb->height);
+			return;
+		}
 		igpu_submit_scanout(idev, addr, fb->width, fb->height,
 				    fb->pitches[0], WIRE_FMT_XRGB8888);
 		return;
@@ -306,10 +499,19 @@ static void igpu_flush_damaged(struct igpu_device *idev,
 	if (damage.x2 <= damage.x1 || damage.y2 <= damage.y1)
 		return; /* zero-area after clamp: nothing changed */
 
+	dx = damage.x1;
+	dy = damage.y1;
+	dw = damage.x2 - damage.x1;
+	dh = damage.y2 - damage.y1;
+
+	if (idev->ring_drainer) {
+		igpu_flush_resource(idev, addr, fb, dx, dy, dw, dh);
+		return;
+	}
+
 	igpu_submit_scanout_damaged(idev, addr, fb->width, fb->height,
 				    fb->pitches[0], WIRE_FMT_XRGB8888,
-				    damage.x1, damage.y1,
-				    damage.x2 - damage.x1, damage.y2 - damage.y1);
+				    dx, dy, dw, dh);
 }
 
 /* ---- simple display pipe ---- */
@@ -646,6 +848,16 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct igpu_cursor_update) != 48);
 	BUILD_BUG_ON(offsetof(struct igpu_cursor_update, pos_x) != 8);
 	BUILD_BUG_ON(offsetof(struct igpu_cursor_update, shape_ref) != 32);
+	/* PR4 real-ring wire structs (mirror infinigpu-abi; interop-verified by the guest-conformance
+	 * crate). Pin the shared layouts here too. */
+	BUILD_BUG_ON(sizeof(struct igpu_ring_indices) != 64);
+	BUILD_BUG_ON(offsetof(struct igpu_ring_indices, seqno_retired) != 16);
+	BUILD_BUG_ON(sizeof(struct igpu_resource_create_blob) != 24);
+	BUILD_BUG_ON(sizeof(struct igpu_attach_backing) != 8);
+	BUILD_BUG_ON(sizeof(struct igpu_mem_entry) != 16);
+	BUILD_BUG_ON(sizeof(struct igpu_set_scanout_blob) != 24);
+	BUILD_BUG_ON(sizeof(struct igpu_resource_flush) != 24);
+	BUILD_BUG_ON((IGPU_RING2_CAP & (IGPU_RING2_CAP - 1)) != 0); /* power of two */
 
 	ret = pcim_enable_device(pdev);
 	if (ret)
@@ -687,6 +899,33 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	idev->ring = dmam_alloc_coherent(&pdev->dev, PAGE_SIZE, &idev->ring_dma, GFP_KERNEL);
 	if (!idev->ring)
 		return -ENOMEM;
+
+	/* PR4 real ring drainer (opt-in): a shared RingIndices page + a descriptor/payload ring.
+	 * Programming a non-zero CMD_RING_INDEX switches the host to the bounded two-phase drainer;
+	 * the scanout path then registers each FB as a blob and flips via RESOURCE_FLUSH. */
+	idev->ring_drainer = ring_drainer_param;
+	if (idev->ring_drainer) {
+		size_t ring2_bytes = IGPU_RING2_CAP * sizeof(struct igpu_descriptor) +
+				     IGPU_RING2_CAP * IGPU_RING2_PSTRIDE;
+
+		idev->ring2_idx = dmam_alloc_coherent(&pdev->dev, PAGE_SIZE,
+						      &idev->ring2_idx_dma, GFP_KERNEL);
+		idev->ring2 = dmam_alloc_coherent(&pdev->dev, ring2_bytes,
+						  &idev->ring2_dma, GFP_KERNEL);
+		if (!idev->ring2_idx || !idev->ring2)
+			return -ENOMEM;
+		memset(idev->ring2_idx, 0, sizeof(*idev->ring2_idx));
+		idev->next_res_id = 0;
+		idev->fbcache_next = 0;
+
+		iowrite32(lower_32_bits(idev->ring2_dma), bar0 + REG_CMD_RING_BASE_LO);
+		iowrite32(upper_32_bits(idev->ring2_dma), bar0 + REG_CMD_RING_BASE_HI);
+		iowrite32(IGPU_RING2_CAP, bar0 + REG_CMD_RING_SIZE);
+		iowrite32(lower_32_bits(idev->ring2_idx_dma), bar0 + REG_CMD_RING_INDEX_LO);
+		iowrite32(upper_32_bits(idev->ring2_idx_dma), bar0 + REG_CMD_RING_INDEX_HI);
+		dev_info(&pdev->dev, "infinigpu: PR4 ring drainer enabled (cap=%u)\n",
+			 IGPU_RING2_CAP);
+	}
 
 	iowrite32(GLOBAL_CTRL_ENABLE, bar0 + REG_GLOBAL_CTRL);
 
@@ -737,8 +976,12 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		return ret;
 
-	/* Prove the KMS ring path deterministically before fbcon starts flushing. */
-	igpu_kms_selftest(idev);
+	/* Prove the KMS ring path deterministically before fbcon starts flushing. Skipped on the
+	 * ring_drainer path: the selftest uses the legacy single-descriptor submit, which reprograms
+	 * CMD_RING_BASE away from the real ring (the ring2 wire path is covered off-hardware by the
+	 * infinigpu-guest-conformance interop test instead). */
+	if (!idev->ring_drainer)
+		igpu_kms_selftest(idev);
 
 	/* Bring up fbdev emulation → fbcon renders the console on our framebuffer. */
 	drm_client_setup(drm, NULL);

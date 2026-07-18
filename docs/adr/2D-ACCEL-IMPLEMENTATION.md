@@ -124,13 +124,23 @@ the pivot that makes everything after it reusable for 3D.
 > back the retired seqno — byte-level guest↔device interop, no QEMU. Also checks the shared full-ring
 > backpressure condition. So the transcription-risk half of the guest driver is verified.
 >
-> **Remaining (genuinely hardware/guest-gated):** wiring that C reference into `infinigpu.c` proper —
-> the kernel-runtime parts (`dma_alloc_coherent` the ring/index page, program `CMD_RING_INDEX/BASE/`
-> `SIZE`, the DRM framebuffer-registration lifecycle → `res_id`, flip via `RESOURCE_FLUSH`, poll the
-> retired seqno) — which needs a rebuilt `.ko` under QEMU to validate at runtime; the
-> `build_regions(index_fd)` **sparse-mmap BAR2 transport** (a zero-copy optimization over today's
-> DMA-resident ring — only needed/exercisable under QEMU); and multi-segment scatter-gather backing
-> (phase-1 takes the single-segment shortcut). The PR3 CPU-patch path stays the live fallback.
+> **And the guest `.ko` PR4 support is now written + compile-verified** (kernel 6.14 headers), behind
+> a default-off module param `infinigpu.ring_drainer=1` so today's tested single-descriptor path is
+> unchanged. `infinigpu.c` gained: the shared `RingIndices` page + a descriptor/payload ring
+> (`dmam_alloc_coherent`), the in-kernel SPSC `igpu_ring2_push` (mirrors the interop-verified C
+> reference; tail publish via `smp_store_release`), `igpu_resource_register` (CREATE_BLOB +
+> ATTACH_BACKING + SET_SCANOUT_BLOB with a 4-entry FB→`res_id` cache + round-robin DESTROY),
+> `igpu_flush_resource` (RESOURCE_FLUSH of the damage rect), probe-time `CMD_RING_INDEX/BASE/SIZE`
+> programming, and `BUILD_BUG_ON` layout pins. The `igpu_flush`/`igpu_flush_damaged` paths route
+> through it when the param is set (full-ring drops the frame rather than corrupting the ring base;
+> the legacy selftest is skipped on this path).
+>
+> **Remaining (genuinely runtime/hardware-gated):** **runtime validation of the guest `.ko` under
+> QEMU** (does the guest↔device actually exchange frames over the real ring on a running system —
+> the FB lifecycle, DMA coherency, retire timing); the `build_regions(index_fd)` **sparse-mmap BAR2
+> transport** (a zero-copy optimization over the DMA-resident ring — only needed/exercisable under
+> QEMU); and multi-segment scatter-gather backing (phase-1 takes the single-segment shortcut). The
+> PR3 CPU-patch path stays the live fallback.
 
 - `infinigpu-ring` becomes a device dep; `#[repr(C)]` on `Indices` + `Indices::from_ptr` so the
   loom-verified SPSC pop/retire/len runs over the shared page. New `index.rs`
