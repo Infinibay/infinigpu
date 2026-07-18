@@ -361,3 +361,24 @@ struct CursorUpdate {
    */
   uint64_t _reserved;
 };
+
+/**
+ * `SUBMIT_CMD` payload for [`encoding::VULKAN_VENUSLIKE`] — the Phase-0 own-remoting 3D
+ * subset (`docs/adr/3D-ACCEL-IMPLEMENTATION.md`, Step 4/5). A guest names one hand-rolled
+ * Vulkan workload ([`vk_op`]); the host **replays it against real Vulkan (ash) on the physical
+ * GPU** and DMA-writes the `R8G8B8A8` result to `scanout_addr` for the guest's page-flip —
+ * the same present shape as [`ClearPresent`], but the pixels come from GPU pipeline execution,
+ * not a fixed clear. This is our own decoder — no Mesa venus / virglrenderer dependency, so it
+ * runs on the stock host driver. `bg` is the clear colour (or the triangle's background).
+ */
+struct VulkanWorkload {
+  /**
+   * [`vk_op`].
+   */
+  uint32_t op;
+  uint32_t width;
+  uint32_t height;
+  uint32_t _pad;
+  float bg[4];
+  uint64_t scanout_addr;
+};

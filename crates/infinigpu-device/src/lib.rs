@@ -82,6 +82,32 @@ impl SharedGpu {
         }
     }
 
+    /// Lazily open the GPU, then replay a **shader-executed** triangle workload (a real graphics
+    /// pipeline + SM execution on the physical GPU — the Phase-0 3D remoting proof, `vk_op::TRIANGLE`).
+    /// `None` on GPU-open/render failure (logged). Call only from inside a broker `run()` closure.
+    pub fn render_triangle(&self, width: u32, height: u32, bg: [f32; 4]) -> Option<Frame> {
+        let mut g = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            match HostGpu::open() {
+                Ok(x) => {
+                    info!("replay GPU: {} ({:?})", x.device_name(), x.driver_id());
+                    *g = Some(x);
+                }
+                Err(e) => {
+                    log::error!("cannot open replay GPU: {e}");
+                    return None;
+                }
+            }
+        }
+        match g.as_ref().unwrap().render_triangle(width, height, bg) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                log::error!("triangle render failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Lazily open the GPU and return its HAL capabilities (ADR-0008) — vendor, driver,
     /// render/timestamp/external-memory/priority flags — or `None` if no GPU.
     pub fn caps(&self) -> Option<infinigpu_hal::GpuCaps> {
@@ -646,7 +672,7 @@ impl InfinigpuBackend {
     fn process_ring(&mut self, ctx: usize) {
         use infinigpu_abi::wire::{
             encoding, msg_type, ClearPresent, CursorUpdate, Descriptor, ScanoutPresent,
-            ScanoutPresentDamaged, SubmitCmd,
+            ScanoutPresentDamaged, SubmitCmd, VulkanWorkload,
         };
         use zerocopy::FromBytes;
 
@@ -736,7 +762,17 @@ impl InfinigpuBackend {
                 self.present_scanout_damaged(&sp, sc.seqno, ctx);
             }
             encoding::VULKAN_VENUSLIKE => {
-                self.submit_vulkan(&sc, ctx);
+                // Read the workload header from guest RAM (bounded to what we understand; a fuller
+                // ICD's trailing vkCmd* stream past the header is ignored in Phase-0).
+                let mut pb = [0u8; core::mem::size_of::<VulkanWorkload>()];
+                let n = if sc.payload_len == 0 {
+                    pb.len()
+                } else {
+                    (sc.payload_len as usize).min(pb.len())
+                };
+                if self.dma.read(payload_addr, &mut pb[..n]) {
+                    self.submit_vulkan(&sc, &pb, ctx);
+                }
             }
             other => log::warn!("unsupported encoding {:#x}", other),
         }
@@ -887,7 +923,7 @@ impl InfinigpuBackend {
                     self.present_scanout_damaged(&sp, sc.seqno, ctx);
                 }
             }
-            encoding::VULKAN_VENUSLIKE => self.submit_vulkan(sc, ctx),
+            encoding::VULKAN_VENUSLIKE => self.submit_vulkan(sc, enc_payload, ctx),
             other => log::warn!("drain ctx={ctx}: unsupported submit encoding {:#x}", other),
         }
     }
@@ -939,18 +975,24 @@ impl InfinigpuBackend {
         self.present_scanout_damaged(&sp, seqno, ctx);
     }
 
-    /// 3D command submission (`encoding::VULKAN_VENUSLIKE`) — the Venus-remoting datapath
-    /// (`docs/adr/3D-ACCEL-IMPLEMENTATION.md`, Phase 1). The host-side command decoder
-    /// (`crates/infinigpu-replay/src/venus/`) is **gated on the Phase-0 go/no-go spike**
-    /// (`docs/spikes/venus-nvidia-a5000.md`); until that records a GO, this is the wiring point:
-    /// it admits fail-closed, bound-checks the opaque payload against the same 64 MiB geometry cap
-    /// the present/resource paths use, and **retires the fence** so a guest render node can drive
-    /// the ring end-to-end (its `out_fence` resolves) with a no-op executor — never a ring stall,
-    /// never the generic "unsupported encoding" warn. When the decoder lands it replaces the no-op
-    /// body here (resolve `payload_addr`/`payload_len` through `DmaTable`, replay onto `shared_gpu`).
-    fn submit_vulkan(&mut self, sc: &infinigpu_abi::wire::SubmitCmd, ctx: usize) {
+    /// 3D command submission (`encoding::VULKAN_VENUSLIKE`) — the own-remoting datapath
+    /// (`docs/adr/3D-ACCEL-IMPLEMENTATION.md`, Phase-0 Step 4/5). Decode the [`VulkanWorkload`]
+    /// header the guest's thin ICD wrote (`vk_op` names one hand-rolled workload; a fuller ICD
+    /// appends a `vkCmd*` stream past the header), **replay it against real Vulkan on the physical
+    /// GPU** via [`SharedGpu`] under the broker's fair-share run-lock, and DMA-write the resulting
+    /// `R8G8B8A8` pixels to the guest scanout — the same present shape as `render_clear_present`,
+    /// but the pixels come from GPU pipeline/SM execution. This is our own decoder against `ash`;
+    /// it needs **no Mesa venus / virglrenderer**, so it runs on the stock host driver (no Phase-0
+    /// driver-upgrade gate). Fail-closed throughout: bad admission/geometry/GPU error is logged and
+    /// skipped, but the fence **always retires** so the guest's `out_fence` resolves and the ring
+    /// never wedges.
+    fn submit_vulkan(&mut self, sc: &infinigpu_abi::wire::SubmitCmd, payload: &[u8], ctx: usize) {
+        use infinigpu_abi::wire::{vk_op, VulkanWorkload};
+        use zerocopy::FromBytes;
+
         // Admission gate (fail-closed): a VM the broker didn't admit cannot submit 3D work.
         if !self.ensure_admitted() {
+            self.ring_retired[ctx] = sc.seqno;
             return;
         }
         // Fail-closed payload bound (mirrors resource::MAX_BLOB_BYTES). A hostile/oversized
@@ -962,20 +1004,61 @@ impl InfinigpuBackend {
                 sc.payload_len,
                 MAX_CMD_BYTES
             );
-        } else {
-            self.vulkan_submits += 1;
-            // The real work (Venus decode + replay) is Phase-0-gated; log sparsely so a bring-up
-            // guest can confirm the datapath without flooding.
-            if self.vulkan_submits.is_multiple_of(120) || self.vulkan_submits == 1 {
-                info!(
-                    "3D: {} Venus submit(s) reached the device ({} B latest); decoder pending the \
-                     Phase-0 GO (docs/spikes/venus-nvidia-a5000.md)",
-                    self.vulkan_submits, sc.payload_len
-                );
-            }
+            self.ring_retired[ctx] = sc.seqno;
+            return;
         }
-        // Retire the fence (no-op executor): the guest's `out_fence`/retired register resolves so
-        // its submit thread makes progress. Nothing is rendered until the decoder lands.
+        // Decode the fixed workload header (Phase-0 replays the named workload; a fuller ICD's
+        // trailing vkCmd* stream sits past it and is ignored here). Malformed → drop, still retire.
+        let Ok((wl, _)) = VulkanWorkload::read_from_prefix(payload) else {
+            log::warn!("vulkan submit ctx={ctx}: short payload ({} B) — dropped", payload.len());
+            self.ring_retired[ctx] = sc.seqno;
+            return;
+        };
+        // Validate guest-controlled geometry BEFORE the GPU sees it (fail-closed; same guard as
+        // render_clear_present — bound each dim and reject an overflowing width*height*4).
+        let bytes = (wl.width as u64)
+            .checked_mul(wl.height as u64)
+            .and_then(|px| px.checked_mul(4));
+        if wl.width == 0
+            || wl.height == 0
+            || wl.width > 16384
+            || wl.height > 16384
+            || bytes.is_none_or(|b| b > MAX_CMD_BYTES as u64)
+        {
+            log::error!("vulkan submit ctx={ctx}: bad geometry {}x{}", wl.width, wl.height);
+            self.ring_retired[ctx] = sc.seqno;
+            return;
+        }
+        // Count the validated 3D submit here (GPU-independent: it reflects the work that reached
+        // the executor, so the datapath is observable even on a host whose GPU render then fails).
+        let (w, h, bg, op) = (wl.width, wl.height, wl.bg, wl.op);
+        self.vulkan_submits += 1;
+        if self.vulkan_submits.is_multiple_of(120) || self.vulkan_submits == 1 {
+            info!(
+                "3D: vm={} replaying Vulkan workload op={op} {w}x{h} on the GPU → scanout {:#x} ({} total)",
+                self.vm_config.vm_id, wl.scanout_addr, self.vulkan_submits
+            );
+        }
+        // Pre-warm the shared GPU OUTSIDE the broker's timed region (the one-time Vulkan init is
+        // never billed to this tenant), then replay the named workload under the fair-share run-lock.
+        let _ = self.shared_gpu.device_name();
+        let gpu = Arc::clone(&self.shared_gpu);
+        let frame = match self.ticket.as_ref().unwrap().run(move || match op {
+            vk_op::TRIANGLE => gpu.render_triangle(w, h, bg),
+            _ => gpu.render_clear(w, h, bg), // vk_op::CLEAR + forward-compat default
+        }) {
+            Ok(Some(f)) => f,
+            _ => {
+                // GPU-open/render failure (already logged) — retire so the ring never wedges.
+                self.ring_retired[ctx] = sc.seqno;
+                return;
+            }
+        };
+        // DMA-write the GPU-produced R8G8B8A8 result to the guest scanout (like
+        // render_clear_present) so the guest's page-flip shows it. scanout_addr == 0 → render-only.
+        if wl.scanout_addr != 0 && !self.dma.write(wl.scanout_addr, &frame.rgba) {
+            log::error!("vulkan submit ctx={ctx}: scanout {:#x} not fully mapped", wl.scanout_addr);
+        }
         self.ring_retired[ctx] = sc.seqno;
     }
 
@@ -1780,8 +1863,22 @@ mod tests {
 
     #[test]
     fn vulkan_submit_retires_fence_and_is_bounded() {
-        use infinigpu_abi::wire::{encoding, SubmitCmd};
+        use infinigpu_abi::wire::{encoding, vk_op, SubmitCmd, VulkanWorkload};
+        use zerocopy::IntoBytes;
         let mut b = InfinigpuBackend::new();
+        // A well-formed workload header: CLEAR, small, scanout_addr=0 → render-only (no writeback).
+        // The counter advances on any VALIDATED submit (before the GPU render), so this asserts the
+        // datapath/fail-closed logic without needing a GPU; the actual render + DMA-writeback is
+        // exercised by the #[ignore]'d E2E test `vulkan_workload_renders_a_triangle_to_scanout`.
+        let wl = VulkanWorkload {
+            op: vk_op::CLEAR,
+            width: 16,
+            height: 16,
+            _pad: 0,
+            bg: [0.0; 4],
+            scanout_addr: 0,
+        };
+        let payload = wl.as_bytes().to_vec();
         let mk = |seqno: u64, payload_len: u32| SubmitCmd {
             ctx_id: 0,
             encoding: encoding::VULKAN_VENUSLIKE,
@@ -1792,15 +1889,19 @@ mod tests {
             out_fence: seqno,
         };
         // A well-formed 3D submit: the fence retires (guest's submit thread progresses) and the
-        // datapath counter advances — proof a Venus stream reached the device.
-        b.submit_vulkan(&mk(7, 4096), 1);
+        // datapath counter advances — proof a Vulkan workload reached the executor.
+        b.submit_vulkan(&mk(7, payload.len() as u32), &payload, 1);
         assert_eq!(b.ring_retired[1], 7, "out_fence must retire so the guest progresses");
         assert_eq!(b.vulkan_submits, 1);
-        // An oversized command stream is dropped fail-closed (not counted as executed) but must
-        // NOT stall the ring — the fence still retires to the new seqno.
-        b.submit_vulkan(&mk(9, 64 * 1024 * 1024 + 1), 1);
+        // An oversized command stream is dropped fail-closed (not counted) but must NOT stall the
+        // ring — the fence still retires to the new seqno.
+        b.submit_vulkan(&mk(9, 64 * 1024 * 1024 + 1), &payload, 1);
         assert_eq!(b.vulkan_submits, 1, "oversized submit is not counted as executed");
         assert_eq!(b.ring_retired[1], 9, "even a dropped submit retires its fence (no ring stall)");
+        // A too-short payload (can't even decode the header) is dropped fail-closed, still retires.
+        b.submit_vulkan(&mk(11, 8), &[0u8; 8], 1);
+        assert_eq!(b.vulkan_submits, 1, "short payload is not counted");
+        assert_eq!(b.ring_retired[1], 11, "short submit still retires its fence");
         // A device reset zeroes the per-attach counter.
         b.reset_state();
         assert_eq!(b.vulkan_submits, 0);
@@ -1960,7 +2061,7 @@ mod tests {
     /// is the datapath a guest render node (3D Phase 1) will drive.
     #[test]
     fn vulkan_submit_flows_through_the_ring_drainer() {
-        use infinigpu_abi::wire::{encoding, Descriptor, SubmitCmd};
+        use infinigpu_abi::wire::{encoding, vk_op, Descriptor, SubmitCmd, VulkanWorkload};
         use zerocopy::IntoBytes;
 
         const GUEST_BASE: u64 = 0x9000_0000;
@@ -1979,18 +2080,30 @@ mod tests {
         } as *mut u8;
         assert_ne!(ram as *mut libc::c_void, libc::MAP_FAILED);
 
-        // A VULKAN_VENUSLIKE submit (no encoding payload — the no-op executor uses only the header).
+        // A VULKAN_VENUSLIKE submit: a SubmitCmd header followed by a VulkanWorkload body (CLEAR,
+        // scanout_addr=0 → render-only, no writeback into this small test region).
+        let wl = VulkanWorkload {
+            op: vk_op::CLEAR,
+            width: 16,
+            height: 16,
+            _pad: 0,
+            bg: [0.0; 4],
+            scanout_addr: 0,
+        };
         let sc = SubmitCmd {
             ctx_id: 0,
             encoding: encoding::VULKAN_VENUSLIKE,
-            payload_len: 0,
+            payload_len: core::mem::size_of::<VulkanWorkload>() as u32,
             flags: 0,
             seqno: 1,
             in_fence: 0,
             out_fence: 1,
         };
+        let sc_len = sc.as_bytes().len();
+        let wl_len = wl.as_bytes().len();
         unsafe {
-            std::ptr::copy_nonoverlapping(sc.as_bytes().as_ptr(), ram.add(PAY_OFF), sc.as_bytes().len())
+            std::ptr::copy_nonoverlapping(sc.as_bytes().as_ptr(), ram.add(PAY_OFF), sc_len);
+            std::ptr::copy_nonoverlapping(wl.as_bytes().as_ptr(), ram.add(PAY_OFF + sc_len), wl_len);
         };
 
         let mut b = InfinigpuBackend::new();
@@ -2008,7 +2121,7 @@ mod tests {
             ring.push(Descriptor {
                 msg_type: infinigpu_abi::wire::msg_type::SUBMIT_CMD,
                 flags: 0,
-                len: sc.as_bytes().len() as u32,
+                len: (sc_len + wl_len) as u32,
                 data_offset: (PAY_OFF - DESC_OFF) as u32,
                 seqno: 1,
                 _reserved: 0,
@@ -2022,5 +2135,79 @@ mod tests {
         assert_eq!(b.ring_retired[CTX], 1, "the 3D fence retired");
 
         unsafe { libc::munmap(ram as *mut libc::c_void, SIZE) };
+    }
+
+    /// 3D own-remoting, end-to-end on real silicon: a `VULKAN_VENUSLIKE` submit naming a
+    /// `vk_op::TRIANGLE` workload must **execute a real graphics pipeline on the physical GPU** and
+    /// DMA-write the rendered `R8G8B8A8` pixels back to the guest scanout — the Phase-0 Step 4/5
+    /// definition-of-done for a minimal Vulkan subset, with our own decoder (no Mesa venus). GPU-
+    /// gated (#[ignore]); run on real silicon: `cargo test -p infinigpu-device --lib -- --ignored
+    /// --test-threads=1`.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn vulkan_workload_renders_a_triangle_to_scanout() {
+        use infinigpu_abi::wire::{encoding, vk_op, SubmitCmd, VulkanWorkload};
+        use std::os::unix::io::FromRawFd;
+        use zerocopy::IntoBytes;
+
+        const GUEST_BASE: u64 = 0xA000_0000;
+        const SCAN_OFF: usize = 0x1000;
+        let (w, h): (u32, u32) = (64, 64);
+        let fb_bytes = (w * h * 4) as usize;
+        let size = SCAN_OFF + fb_bytes + 0x1000;
+
+        let fd = unsafe { libc::memfd_create(c"vk3dtri".as_ptr(), 0) };
+        assert!(fd >= 0);
+        assert_eq!(unsafe { libc::ftruncate(fd, size as libc::off_t) }, 0);
+        let ram = unsafe {
+            libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
+        } as *mut u8;
+        assert_ne!(ram as *mut libc::c_void, libc::MAP_FAILED);
+
+        let scanout_addr = GUEST_BASE + SCAN_OFF as u64;
+        let wl = VulkanWorkload {
+            op: vk_op::TRIANGLE,
+            width: w,
+            height: h,
+            _pad: 0,
+            bg: [0.02, 0.02, 0.05, 1.0],
+            scanout_addr,
+        };
+        let payload = wl.as_bytes().to_vec();
+        let sc = SubmitCmd {
+            ctx_id: 0,
+            encoding: encoding::VULKAN_VENUSLIKE,
+            payload_len: payload.len() as u32,
+            flags: 0,
+            seqno: 5,
+            in_fence: 0,
+            out_fence: 5,
+        };
+
+        let mut b = InfinigpuBackend::new();
+        let file = unsafe { <std::fs::File as FromRawFd>::from_raw_fd(fd) };
+        b.dma.map(GUEST_BASE, 0, size as u64, file).unwrap();
+
+        if b.shared_gpu.device_name().is_none() {
+            eprintln!("skipping: no GPU");
+            unsafe { libc::munmap(ram as *mut libc::c_void, size) };
+            return;
+        }
+
+        b.submit_vulkan(&sc, &payload, 0);
+        assert_eq!(b.ring_retired[0], 5, "the 3D fence retired");
+        assert_eq!(b.vulkan_submits, 1);
+
+        // Read the scanout back out of guest RAM: a shader-executed triangle over the dark bg leaves
+        // clearly-lit pixels (the render is proven by infinigpu-replay; here we prove it reached the
+        // guest framebuffer over the device's DMA path).
+        let px = unsafe { std::slice::from_raw_parts(ram.add(SCAN_OFF), fb_bytes) };
+        let lit = px
+            .chunks_exact(4)
+            .filter(|p| p[0] as u16 + p[1] as u16 + p[2] as u16 > 96)
+            .count();
+        assert!(lit > 0, "the GPU-rendered triangle wrote lit pixels to the guest scanout ({lit})");
+
+        unsafe { libc::munmap(ram as *mut libc::c_void, size) };
     }
 }

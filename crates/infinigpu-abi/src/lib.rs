@@ -65,6 +65,10 @@ mod layout_asserts {
     const _: () = assert!(size_of::<ResourceFlush>() == 24);
     const _: () = assert!(size_of::<ClearPresent>() == 32);
     const _: () = assert!(offset_of!(ClearPresent, scanout_addr) == 24);
+    // VulkanWorkload (VULKAN_VENUSLIKE payload): op/w/h/_pad (16) + bg[4] (16) + scanout_addr (8);
+    // scanout_addr must stay 8-aligned so the u64 reads directly out of the payload.
+    const _: () = assert!(size_of::<VulkanWorkload>() == 40);
+    const _: () = assert!(offset_of!(VulkanWorkload, scanout_addr) == 32);
     const _: () = assert!(size_of::<ScanoutPresent>() == 24);
     const _: () = assert!(offset_of!(ScanoutPresent, scanout_addr) == 16);
     // ScanoutPresentDamaged is a ScanoutPresent superset (same prefix + scanout_addr@16)
@@ -103,7 +107,7 @@ mod tests {
             abi_version(),
             (u32::from(ABI_MAJOR) << 16) | u32::from(ABI_MINOR)
         );
-        assert_eq!(abi_version(), 0x0000_0004);
+        assert_eq!(abi_version(), 0x0000_0005);
     }
 
     #[test]

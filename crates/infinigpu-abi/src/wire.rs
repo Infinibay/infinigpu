@@ -336,6 +336,35 @@ pub struct ClearPresent {
     pub scanout_addr: u64,
 }
 
+/// [`VulkanWorkload::op`] — the hand-rolled Vulkan workload the guest's thin ICD names for
+/// the host to replay (Phase-0 own-remoting subset; a fuller ICD serializes a vkCmd* stream
+/// into a trailing opaque region — `SubmitCmd::payload_len` past this fixed header).
+pub mod vk_op {
+    /// Clear an image to `bg` on the host GPU (a real `vkCmdClear`/render-pass LOAD_CLEAR).
+    pub const CLEAR: u32 = 0;
+    /// Draw a shader-executed triangle over `bg` — real SM/pipeline execution on the host GPU.
+    pub const TRIANGLE: u32 = 1;
+}
+
+/// `SUBMIT_CMD` payload for [`encoding::VULKAN_VENUSLIKE`] — the Phase-0 own-remoting 3D
+/// subset (`docs/adr/3D-ACCEL-IMPLEMENTATION.md`, Step 4/5). A guest names one hand-rolled
+/// Vulkan workload ([`vk_op`]); the host **replays it against real Vulkan (ash) on the physical
+/// GPU** and DMA-writes the `R8G8B8A8` result to `scanout_addr` for the guest's page-flip —
+/// the same present shape as [`ClearPresent`], but the pixels come from GPU pipeline execution,
+/// not a fixed clear. This is our own decoder — no Mesa venus / virglrenderer dependency, so it
+/// runs on the stock host driver. `bg` is the clear colour (or the triangle's background).
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct VulkanWorkload {
+    /// [`vk_op`].
+    pub op: u32,
+    pub width: u32,
+    pub height: u32,
+    pub _pad: u32,
+    pub bg: [f32; 4],
+    pub scanout_addr: u64,
+}
+
 /// `DISPLAY_SCANOUT` payload (see [`encoding::DISPLAY_SCANOUT`]): the guest's real
 /// DRM/KMS driver hands the host a contiguous framebuffer to present. `scanout_addr`
 /// is the guest-physical base of the framebuffer (a `dma_addr_t` from

@@ -46,4 +46,9 @@ _Static_assert(sizeof(struct AttachBacking) == 8, "AttachBacking size");
 _Static_assert(sizeof(struct MemEntry) == 16, "MemEntry size");
 _Static_assert(offsetof(struct MemEntry, length) == 8, "MemEntry.length offset");
 
+/* VulkanWorkload — VULKAN_VENUSLIKE submit payload, Phase-0 own-remoting 3D (ABI 0.5). */
+_Static_assert(sizeof(struct VulkanWorkload) == 40, "VulkanWorkload size");
+_Static_assert(offsetof(struct VulkanWorkload, bg) == 16, "VulkanWorkload.bg offset");
+_Static_assert(offsetof(struct VulkanWorkload, scanout_addr) == 32, "VulkanWorkload.scanout_addr offset");
+
 int main(void) { return 0; }

@@ -32,8 +32,10 @@ pub const ABI_MAJOR: u16 = 0;
 /// `ScanoutPresentDamaged`, `DISPLAY_ACCEL`/`CAP_DISPLAY_2D`). v3 added the cursor-plane wire
 /// (`CursorUpdate`, `cursor_flags`, `caps::CURSOR_PLANE`, reserving `msg_type::MEDIA_REGION`). v4
 /// added the blob-backing wire (`AttachBacking`, `MemEntry` — the `RESOURCE_ATTACH_BACKING` payload
-/// the PR4 ring drainer records into the per-VM `ResourceTable`).
-pub const ABI_MINOR: u16 = 4;
+/// the PR4 ring drainer records into the per-VM `ResourceTable`). v5 added the Phase-0 own-remoting
+/// 3D payload (`VulkanWorkload`, `vk_op` — the `VULKAN_VENUSLIKE` submit body the host replays on the
+/// real GPU via ash, no Mesa venus dependency).
+pub const ABI_MINOR: u16 = 5;
 
 /// Packed `ABI_VERSION` register value (`major << 16 | minor`).
 pub const fn abi_version() -> u32 {

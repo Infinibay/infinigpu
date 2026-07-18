@@ -16,7 +16,7 @@ include = [
   "Descriptor", "MsgHeader", "RingGeometry",
   "Negotiate", "CtxCreate", "ResourceCreateBlob", "AttachBacking", "MemEntry", "MapBlob",
   "SubmitCmd", "Fence", "SetScanoutBlob", "ResourceFlush", "ClearPresent",
-  "ScanoutPresent", "ScanoutPresentDamaged", "CursorUpdate",
+  "ScanoutPresent", "ScanoutPresentDamaged", "CursorUpdate", "VulkanWorkload",
 ]
 
 [parse]
