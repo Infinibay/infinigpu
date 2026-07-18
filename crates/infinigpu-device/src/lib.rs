@@ -1730,7 +1730,23 @@ pub fn build_irqs() -> Vec<IrqInfo> {
 /// single-VM: its own broker + GPU context.
 pub fn serve(socket_path: &Path) -> Result<(), vfio_user::Error> {
     let server = Server::new(socket_path, true, build_irqs(), build_regions())?;
-    let mut backend = InfinigpuBackend::new();
+    let shared_gpu = SharedGpu::new();
+    // Pre-warm the GPU concurrently with the guest's PCI probe. The first ring submission would
+    // otherwise pay the one-time HostGpu::open() (Vulkan init) synchronously on the vfio-user
+    // callback thread, parking QEMU past the guest's submit timeout. Opening it on a side thread
+    // now means it is usually ready before the first doorbell arrives. (The proper fix — running
+    // the whole GPU drain on a worker thread so the callback never blocks — is a follow-up.)
+    {
+        let gpu = Arc::clone(&shared_gpu);
+        std::thread::spawn(move || {
+            if let Some(name) = gpu.device_name() {
+                info!("GPU pre-warmed on a side thread: {name}");
+            }
+        });
+    }
+    let broker = GpuBroker::with_real_clock(broker_config_from_nvml());
+    let mut backend =
+        InfinigpuBackend::with_broker(broker, shared_gpu, VmConfig::new("vm", 1, 4096));
     server.run(&mut backend)
 }
 

@@ -64,6 +64,9 @@ qemu_common=(
   -device "{\"driver\":\"vfio-user-pci\",\"socket\":{\"type\":\"unix\",\"path\":\"$SOCK\"}}"
 )
 [ -e /dev/kvm ] && qemu_common+=(-enable-kvm -cpu host)
+# Opt-in vfio-user protocol trace (QEMU_TRACE=1) — logs every message QEMU sends/receives so a
+# reply-framing desync can be pinned to the exact culprit. Off by default.
+[ -n "${QEMU_TRACE:-}" ] && qemu_common+=(-trace "enable=vfio_user*" -D "$WORK/qtrace.log")
 
 if [ "$MODE" = smoke ]; then
   echo ">> smoke: realizing the device in QEMU (no guest OS; 8s)"
@@ -194,7 +197,7 @@ fi
 if [ -x "$IR/submit3d" ]; then
   echo "---- 3D render node ----"
   guest_ok=$(grep -c "SUBMIT3D: PASS" "$WORK/guest.log" || true)
-  host_ok=$(grep -c "replayed Vulkan workload" "$SRV_LOG" || true)
+  host_ok=$(grep -c "replaying Vulkan workload" "$SRV_LOG" || true)
   grep -E "SUBMIT3D:" "$WORK/guest.log" | head -1 || true
   grep -E "replayed Vulkan workload" "$SRV_LOG" | head -1 || true
   if [ "${guest_ok:-0}" -ge 1 ] && [ "${host_ok:-0}" -ge 1 ]; then
