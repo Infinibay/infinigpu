@@ -114,11 +114,23 @@ the pivot that makes everything after it reusable for 3D.
 > resource/scanout registered + the presented BGRA matches the blob + per-VM isolation + fail-closed
 > on an unknown resource.
 >
-> **Remaining (genuinely hardware/guest-gated):** the `build_regions(index_fd)` **sparse-mmap BAR2
-> transport** (a zero-copy optimization over today's DMA-resident ring — only exercisable/needed
-> under QEMU), multi-segment scatter-gather backing (phase-1 takes the single-segment shortcut), and
-> the **guest KMD** actually programming the ring + registering each dumb FB + flipping via
-> `RESOURCE_FLUSH` (needs a rebuilt `.ko` + QEMU). The PR3 CPU-patch path stays the live fallback.
+> **Guest half — protocol now verified off-hardware (cross-language).** The `.ko`'s PR4 wire
+> protocol (the SPSC ring *producer* + the `RESOURCE_CREATE_BLOB/ATTACH_BACKING/SET_SCANOUT_BLOB/`
+> `RESOURCE_FLUSH` payload construction) is implemented as a freestanding C reference
+> (`crates/infinigpu-guest-conformance/csrc/guest_ring_ref.c` — the exact logic the `.ko` mirrors,
+> `_Static_assert`-pinned) and driven through the **tested Rust device consumer** (`drain` +
+> `dispatch`) by `tests/interop.rs`: the guest builds a real ring + `RESOURCE_*` stream, the device
+> drains it, and every message decodes to the intended `ResourceTable` effect with the guest reading
+> back the retired seqno — byte-level guest↔device interop, no QEMU. Also checks the shared full-ring
+> backpressure condition. So the transcription-risk half of the guest driver is verified.
+>
+> **Remaining (genuinely hardware/guest-gated):** wiring that C reference into `infinigpu.c` proper —
+> the kernel-runtime parts (`dma_alloc_coherent` the ring/index page, program `CMD_RING_INDEX/BASE/`
+> `SIZE`, the DRM framebuffer-registration lifecycle → `res_id`, flip via `RESOURCE_FLUSH`, poll the
+> retired seqno) — which needs a rebuilt `.ko` under QEMU to validate at runtime; the
+> `build_regions(index_fd)` **sparse-mmap BAR2 transport** (a zero-copy optimization over today's
+> DMA-resident ring — only needed/exercisable under QEMU); and multi-segment scatter-gather backing
+> (phase-1 takes the single-segment shortcut). The PR3 CPU-patch path stays the live fallback.
 
 - `infinigpu-ring` becomes a device dep; `#[repr(C)]` on `Indices` + `Indices::from_ptr` so the
   loom-verified SPSC pop/retire/len runs over the shared page. New `index.rs`

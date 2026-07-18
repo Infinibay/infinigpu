@@ -711,6 +711,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "infinigpu-guest-conformance"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "infinigpu-device",
+]
+
+[[package]]
 name = "infinigpu-hal"
 version = "0.0.0"
 

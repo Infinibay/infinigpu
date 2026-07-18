@@ -1,0 +1,19 @@
+[package]
+name = "infinigpu-guest-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Cross-language conformance: the guest .ko's PR4 ring-producer + RESOURCE_* payload C reference, driven through the tested Rust device consumer to prove guest↔device interop off-hardware."
+
+# The lib only holds the FFI declarations for the C reference; the value is in tests/interop.rs.
+[lib]
+doctest = false
+
+[dependencies]
+infinigpu-device = { path = "../infinigpu-device" }
+
+[build-dependencies]
+cc = "1"

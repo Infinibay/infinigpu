@@ -10,6 +10,7 @@ members = [
     "crates/infinigpu-device",
     "crates/infinigpu-viewer",
     "crates/infinigpu-nvml",
+    "crates/infinigpu-guest-conformance",
 ]
 
 # Crates added as their Phase-0 step comes online:
