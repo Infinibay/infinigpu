@@ -48,6 +48,69 @@ impl FrameSlot {
     }
 }
 
+/// A client-side cursor sprite (BGRA, guest-pixel scale) plus its hotspot. Uploaded once per
+/// shape change from an `XIPL` `DEFINE`; the viewer blends it at the **local** pointer position.
+pub struct CursorShape {
+    /// Tightly-packed BGRA, `w*h*4`.
+    pub bgra: Vec<u8>,
+    pub w: u16,
+    pub h: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    /// Whether the sprite's alpha is premultiplied (DRM default) — decides the blend equation.
+    pub premultiplied: bool,
+}
+
+#[derive(Default)]
+struct CursorInner {
+    shape: Option<Arc<CursorShape>>,
+    /// Bumped whenever `shape` changes, so the render loop re-uploads only on a new shape.
+    version: u64,
+    /// Whether the cursor should currently be drawn (a guest `VISIBLE=0` hides it).
+    visible: bool,
+    /// True once any cursor sideband arrived — the signal that the guest cursor plane is active
+    /// and the viewer should switch to the client-drawn cursor (and hide the OS cursor).
+    active: bool,
+}
+
+/// Latest-cursor-wins hand-off from the network thread to the render loop, parallel to
+/// [`FrameSlot`]. The render loop reads a cheap snapshot each draw and re-uploads the sprite only
+/// when the version changes.
+#[derive(Default)]
+pub struct CursorSlot {
+    inner: Mutex<CursorInner>,
+}
+
+impl CursorSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(CursorSlot::default())
+    }
+    /// Install a new cursor shape (from a `DEFINE`), marking the plane active + visible.
+    pub fn define(&self, shape: CursorShape, visible: bool) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.shape = Some(Arc::new(shape));
+        g.version = g.version.wrapping_add(1);
+        g.visible = visible;
+        g.active = true;
+    }
+    /// Update only visibility (from a `MOVE` / hide), marking the plane active.
+    pub fn set_visible(&self, visible: bool) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.visible = visible;
+        g.active = true;
+    }
+    /// `(active, visible, current shape, version)` — a cheap per-draw read (Arc clone only).
+    pub fn snapshot(&self) -> (bool, bool, Option<Arc<CursorShape>>, u64) {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        (g.active, g.visible, g.shape.clone(), g.version)
+    }
+    /// Whether a shape has ever arrived — the viewer hides the OS cursor only then (never a
+    /// "no cursor at all" window before the first `DEFINE`).
+    pub fn has_shape(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).shape.is_some()
+    }
+}
+
 /// Connect to `url` (e.g. `ws://127.0.0.1:8090`) and drive decoding, invoking `on_frame`
 /// for every decoded frame. Blocks until the socket closes, `on_frame` returns `false`,
 /// or an error occurs. Runs on the caller's thread (spawn it for a windowed client).
@@ -61,6 +124,7 @@ impl FrameSlot {
 pub fn run_stream(
     url: &str,
     input_rx: Option<Receiver<String>>,
+    cursor: Option<Arc<CursorSlot>>,
     mut on_frame: impl FnMut(DecodedFrame) -> bool,
 ) -> Result<(), Box<dyn Error>> {
     let (mut ws, _resp) = tungstenite::connect(url)?;
@@ -142,14 +206,36 @@ pub fn run_stream(
         if data.len() >= 4
             && u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == proto::plane::MAGIC
         {
-            if let Some(ph) = PlaneHeader::parse(&data) {
-                log::debug!(
-                    "recv plane sideband: op={} kind={} id={} ({} body bytes) [overlay handled in PR-C4]",
-                    ph.op,
-                    ph.plane_kind,
-                    ph.plane_id,
-                    data.len().saturating_sub(proto::plane::HEADER_LEN)
-                );
+            if let (Some(ph), Some(cslot)) = (PlaneHeader::parse(&data), cursor.as_ref()) {
+                if ph.plane_kind == proto::plane::kind::CURSOR {
+                    let vis = ph.flags & proto::plane::flags::VISIBLE != 0;
+                    match ph.op {
+                        o if o == proto::plane::op::DEFINE => {
+                            let body = &data[proto::plane::HEADER_LEN..];
+                            let need = (ph.width as usize) * (ph.height as usize) * 4;
+                            // Trust the header only as far as the body actually reaches (M5).
+                            if ph.width > 0 && ph.height > 0 && body.len() >= need {
+                                cslot.define(
+                                    CursorShape {
+                                        bgra: body[..need].to_vec(),
+                                        w: ph.width,
+                                        h: ph.height,
+                                        hot_x: ph.hot_x,
+                                        hot_y: ph.hot_y,
+                                        premultiplied: ph.flags & proto::plane::flags::PREMULTIPLIED != 0,
+                                    },
+                                    vis,
+                                );
+                            }
+                        }
+                        o if o == proto::plane::op::MOVE || o == proto::plane::op::DESTROY => {
+                            // The driving viewer draws the cursor at its own local pointer, so a
+                            // MOVE only carries visibility here; DESTROY hides it.
+                            cslot.set_visible(vis && ph.op == proto::plane::op::MOVE);
+                        }
+                        _ => {}
+                    }
+                }
             }
             continue;
         }

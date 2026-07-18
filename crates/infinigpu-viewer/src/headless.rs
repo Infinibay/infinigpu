@@ -2,7 +2,8 @@
 //! as a PPM — no window. This is the CI/dev path (works on a box with no display) and
 //! proves the whole net → protocol → decode pipeline against a running server.
 
-use crate::stream::{run_stream, DecodedFrame};
+use crate::stream::{run_stream, CursorSlot, DecodedFrame};
+use std::sync::Arc;
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
@@ -12,7 +13,7 @@ pub fn run(url: &str, frames: usize, out: Option<&str>) -> Result<(), Box<dyn Er
     let mut keyframes = 0usize;
     let mut last: Option<DecodedFrame> = None;
 
-    run_stream(url, None::<std::sync::mpsc::Receiver<String>>, |f| {
+    run_stream(url, None::<std::sync::mpsc::Receiver<String>>, None::<Arc<CursorSlot>>, |f| {
         got += 1;
         if f.keyframe {
             keyframes += 1;

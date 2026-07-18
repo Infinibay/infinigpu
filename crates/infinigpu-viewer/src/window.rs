@@ -5,12 +5,18 @@
 //! network+decode work runs on a background thread and hands the newest frame over via a
 //! latest-wins [`FrameSlot`]; the render loop presents whatever is current.
 //!
+//! **Client-side cursor** (see `docs/adr/CLIENT-PLANE-COMPOSITOR.md`): when the guest cursor plane
+//! is active, its shape arrives out-of-band via a [`CursorSlot`] and is alpha-blended onto a clean
+//! copy of the frame at the **local** pointer position each draw — so the cursor moves at local
+//! input latency (zero network round-trip), and the OS cursor is hidden. Still no graphics
+//! pipeline: the blend is a CPU pass into the same staging buffer the blit already consumes.
+//!
 //! This module is compile-validated on a headless box; it needs a Wayland/Win32 display
 //! to run. Colour path: openh264 emits RGBA; we upload as BGRA (`B8G8R8A8_UNORM`, the
 //! near-universal swapchain format) by swapping R/B, so blit is a same-format scale.
 
 use crate::input;
-use crate::stream::{run_stream, DecodedFrame, FrameSlot};
+use crate::stream::{run_stream, CursorShape, CursorSlot, DecodedFrame, FrameSlot};
 use ash::vk;
 use std::collections::HashSet;
 use std::error::Error;
@@ -36,6 +42,8 @@ pub fn run(url: &str) -> R<()> {
         window: None,
         vk: None,
         slot: FrameSlot::new(),
+        cursor_slot: CursorSlot::new(),
+        os_cursor_hidden: false,
         net_started: false,
         input_tx,
         input_rx: Some(input_rx),
@@ -51,6 +59,10 @@ struct App {
     window: Option<Arc<Window>>,
     vk: Option<VkViewer>,
     slot: Arc<FrameSlot>,
+    /// Client-side cursor hand-off (shape + visibility) from the stream thread.
+    cursor_slot: Arc<CursorSlot>,
+    /// Whether we've hidden the OS cursor (done once the guest cursor plane is driving ours).
+    os_cursor_hidden: bool,
     net_started: bool,
     /// Sends encoded input messages to the stream thread (which forwards them to the server).
     input_tx: Sender<String>,
@@ -100,7 +112,7 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        match VkViewer::new(&window) {
+        match VkViewer::new(&window, Arc::clone(&self.cursor_slot)) {
             Ok(vk) => self.vk = Some(vk),
             Err(e) => {
                 log::error!("Vulkan init failed: {e}");
@@ -113,10 +125,11 @@ impl ApplicationHandler for App {
             self.net_started = true;
             let url = self.url.clone();
             let slot = Arc::clone(&self.slot);
+            let cursor_slot = Arc::clone(&self.cursor_slot);
             let proxy = window.clone();
             let input_rx = self.input_rx.take();
             std::thread::spawn(move || {
-                let r = run_stream(&url, input_rx, |f| {
+                let r = run_stream(&url, input_rx, Some(cursor_slot), |f| {
                     slot.put(f);
                     proxy.request_redraw(); // wake the render loop
                     true
@@ -139,6 +152,15 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 if let (Some(vk), Some(win)) = (self.vk.as_mut(), self.window.as_ref()) {
+                    // Switch to the client-drawn cursor once the guest cursor plane is driving it
+                    // (a shape has arrived): hide the OS cursor. Until then, keep the OS cursor so
+                    // there is never a "no cursor at all" window (D8) and no double cursor in
+                    // server mode (the guest still bakes its cursor into the video).
+                    let want_hidden = self.cursor_slot.has_shape();
+                    if want_hidden != self.os_cursor_hidden {
+                        win.set_cursor_visible(!want_hidden);
+                        self.os_cursor_hidden = want_hidden;
+                    }
                     let frame = self.slot.take();
                     if let Err(e) = vk.draw(frame) {
                         log::error!("draw failed: {e}");
@@ -157,8 +179,20 @@ impl ApplicationHandler for App {
                     if size.width > 0 && size.height > 0 {
                         let x = position.x / size.width as f64;
                         let y = position.y / size.height as f64;
+                        // Draw the client cursor at the LOCAL pointer immediately (zero lag) — the
+                        // same window-normalized coords we send the guest, so they stay aligned.
+                        if let Some(vk) = self.vk.as_mut() {
+                            vk.set_local_cursor(Some((x as f32, y as f32)));
+                        }
                         self.send_input(Some(input::mouse_move(x, y)));
                     }
+                }
+            }
+            // Pointer left the window / lost focus: park the client cursor so it isn't drawn at a
+            // stale position (and, on focus loss, release held keys/buttons — see release_all).
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(vk) = self.vk.as_mut() {
+                    vk.set_local_cursor(None);
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -194,7 +228,12 @@ impl ApplicationHandler for App {
             // Focus left the window (Alt-Tab out, click-away). winit will deliver no further
             // releases until focus returns, so release everything now — otherwise a held
             // modifier (Ctrl/Shift/Alt) or mouse button sticks in the guest.
-            WindowEvent::Focused(false) => self.release_all(),
+            WindowEvent::Focused(false) => {
+                self.release_all();
+                if let Some(vk) = self.vk.as_mut() {
+                    vk.set_local_cursor(None);
+                }
+            }
             _ => {}
         }
     }
@@ -231,6 +270,25 @@ struct VkViewer {
     frame: Option<FrameImage>,
     want_extent: vk::Extent2D,
     dirty: bool,
+
+    // ---- client-side cursor overlay (composited into the frame on the CPU) ----
+    /// Cursor shape/visibility hand-off from the stream thread.
+    cursor_slot: Arc<CursorSlot>,
+    /// Persistent **clean** (cursor-free) copy of the last decoded frame, BGRA `clean_w*clean_h*4`.
+    /// The cursor is blended onto a fresh copy of this into the staging buffer each recomposite, so
+    /// the previous cursor position is always erased.
+    clean_frame: Vec<u8>,
+    clean_w: u32,
+    clean_h: u32,
+    /// Local pointer position, window-normalized (0..1). `None` when the pointer left the window.
+    local_cursor: Option<(f32, f32)>,
+    /// Cached sprite + the slot version it came from (re-clone only when the shape changes).
+    cached_shape: Option<Arc<CursorShape>>,
+    cached_version: u64,
+    cursor_visible: bool,
+    /// Change key of the last recomposite `(cursor top-left px, version, visible)` — skip the
+    /// per-draw copy+blend+upload when nothing changed (idle cost stays ~0).
+    last_cursor_key: Option<(i32, i32, u64, bool)>,
 }
 
 struct FrameImage {
@@ -246,7 +304,7 @@ struct FrameImage {
 }
 
 impl VkViewer {
-    fn new(window: &Window) -> R<Self> {
+    fn new(window: &Window, cursor_slot: Arc<CursorSlot>) -> R<Self> {
         use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
         let entry = unsafe { ash::Entry::load()? };
 
@@ -363,6 +421,15 @@ impl VkViewer {
             frame: None,
             want_extent: vk::Extent2D { width: size.width.max(1), height: size.height.max(1) },
             dirty: true,
+            cursor_slot,
+            clean_frame: Vec::new(),
+            clean_w: 0,
+            clean_h: 0,
+            local_cursor: None,
+            cached_shape: None,
+            cached_version: 0,
+            cursor_visible: false,
+            last_cursor_key: None,
         };
         me.recreate_swapchain()?;
         Ok(me)
@@ -371,6 +438,71 @@ impl VkViewer {
     fn mark_dirty(&mut self, w: u32, h: u32) {
         self.want_extent = vk::Extent2D { width: w.max(1), height: h.max(1) };
         self.dirty = true;
+    }
+
+    /// Update the local (window-normalized) pointer position — the zero-lag source for the
+    /// client-drawn cursor. `None` parks it (pointer left the window / focus lost).
+    fn set_local_cursor(&mut self, pos: Option<(f32, f32)>) {
+        self.local_cursor = pos;
+    }
+
+    /// Change key for the current cursor draw: `(top-left px, shape version, drawn?)`. When it is
+    /// unchanged between draws, the copy+blend+upload is skipped, so a static screen costs ~0.
+    fn cursor_key(&self) -> (i32, i32, u64, bool) {
+        let (px, py) = match (self.local_cursor, self.cached_shape.as_ref()) {
+            (Some((nx, ny)), Some(sh)) => (
+                (nx * self.clean_w as f32) as i32 - sh.hot_x as i32,
+                (ny * self.clean_h as f32) as i32 - sh.hot_y as i32,
+            ),
+            _ => (i32::MIN, i32::MIN),
+        };
+        let drawn = self.cursor_visible && self.local_cursor.is_some() && self.cached_shape.is_some();
+        (px, py, self.cached_version, drawn)
+    }
+
+    /// Copy the clean (cursor-free) frame into the host-visible staging buffer and alpha-blend the
+    /// cursor sprite at the local pointer position on top. Marks the frame for upload. The whole
+    /// cursor lift is this CPU blend + the existing blit — no graphics pipeline/shaders. Because the
+    /// decoded frame IS the guest framebuffer, the sprite (guest-pixel scale) needs no rescaling;
+    /// the stretch-to-fill blit then scales cursor and video together, so they stay aligned.
+    fn composite_into_staging(&mut self) {
+        let (fw, fh) = (self.clean_w as usize, self.clean_h as usize);
+        let need = fw * fh * 4;
+        if need == 0 || self.clean_frame.len() < need {
+            return;
+        }
+        let Some(fi) = self.frame.as_mut() else {
+            return;
+        };
+        if fi.width as usize != fw || fi.height as usize != fh {
+            return; // frame image not yet resized to match (transient) — skip this draw
+        }
+        let staging_ptr = fi.staging_ptr;
+        fi.pending_upload = true;
+        // `fi`'s borrow of self.frame ends here; the raw slice below aliases device memory, not self.
+        let dst = unsafe { std::slice::from_raw_parts_mut(staging_ptr, need) };
+        dst.copy_from_slice(&self.clean_frame[..need]);
+
+        // Blend the cursor only when we're drawing it (visible + a shape + the pointer is inside).
+        let (Some((nx, ny)), Some(shape)) = (self.local_cursor, self.cached_shape.as_ref()) else {
+            return;
+        };
+        if !self.cursor_visible {
+            return;
+        }
+        let px0 = (nx * fw as f32) as i32 - shape.hot_x as i32;
+        let py0 = (ny * fh as f32) as i32 - shape.hot_y as i32;
+        blend_sprite(
+            dst,
+            fw,
+            fh,
+            &shape.bgra,
+            shape.w as usize,
+            shape.h as usize,
+            px0,
+            py0,
+            shape.premultiplied,
+        );
     }
 
     fn find_mem(&self, bits: u32, flags: vk::MemoryPropertyFlags) -> R<u32> {
@@ -562,20 +694,41 @@ impl VkViewer {
             return Ok(());
         }
 
-        // Upload the decoded frame into the (host-visible) staging buffer as BGRA.
+        // Ingest a new decoded frame into the persistent CLEAN (cursor-free) buffer, so the
+        // cursor can be re-blended at the moving local pointer each draw without smearing.
+        let mut need_composite = false;
         if let Some(f) = new_frame {
             self.ensure_frame_image(f.width, f.height)?;
-            let fi = self.frame.as_mut().unwrap();
             let px = (f.width * f.height) as usize;
+            self.clean_frame.resize(px * 4, 0);
             // openh264 RGBA -> BGRA (swap R/B); alpha forced opaque.
-            let dst = unsafe { std::slice::from_raw_parts_mut(fi.staging_ptr, px * 4) };
-            for (s, d) in f.rgba.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+            for (s, d) in f.rgba.chunks_exact(4).zip(self.clean_frame.chunks_exact_mut(4)) {
                 d[0] = s[2];
                 d[1] = s[1];
                 d[2] = s[0];
                 d[3] = 255;
             }
-            fi.pending_upload = true;
+            self.clean_w = f.width;
+            self.clean_h = f.height;
+            need_composite = true;
+        }
+
+        // Pull the latest cursor state; re-clone the sprite Arc only when its version changes.
+        let (_active, visible, shape, version) = self.cursor_slot.snapshot();
+        self.cursor_visible = visible;
+        if version != self.cached_version {
+            self.cached_shape = shape;
+            self.cached_version = version;
+            need_composite = true;
+        }
+        // A cursor move / hide / show with no new video frame still needs exactly one recomposite.
+        let key = self.cursor_key();
+        if self.last_cursor_key != Some(key) {
+            self.last_cursor_key = Some(key);
+            need_composite = true;
+        }
+        if need_composite {
+            self.composite_into_staging();
         }
 
         unsafe {
@@ -818,5 +971,94 @@ fn image_barrier(
             &[],
             &[barrier],
         );
+    }
+}
+
+/// Alpha-blend a BGRA `sprite` (`cw`×`ch`) into a BGRA `dst` frame (`fw`×`fh`) with the sprite's
+/// top-left at `(px0,py0)`, clipping to the frame. `premul` selects premultiplied (`out = src +
+/// dst*(1-a)`) vs straight (`out = src*a + dst*(1-a)`) alpha. Pure + bounds-safe: any off-screen or
+/// partially-clipped placement is skipped per-pixel, never an out-of-range index.
+#[allow(clippy::too_many_arguments)]
+fn blend_sprite(
+    dst: &mut [u8],
+    fw: usize,
+    fh: usize,
+    sprite: &[u8],
+    cw: usize,
+    ch: usize,
+    px0: i32,
+    py0: i32,
+    premul: bool,
+) {
+    if sprite.len() < cw * ch * 4 {
+        return;
+    }
+    for sy in 0..ch as i32 {
+        let dy = py0 + sy;
+        if dy < 0 || dy >= fh as i32 {
+            continue;
+        }
+        for sx in 0..cw as i32 {
+            let dx = px0 + sx;
+            if dx < 0 || dx >= fw as i32 {
+                continue;
+            }
+            let si = (sy as usize * cw + sx as usize) * 4;
+            let s = &sprite[si..si + 4];
+            let sa = s[3] as u32;
+            if sa == 0 {
+                continue; // fully transparent — leave the video pixel untouched
+            }
+            let di = (dy as usize * fw + dx as usize) * 4;
+            for c in 0..3 {
+                let sc = s[c] as u32;
+                let dc = dst[di + c] as u32;
+                dst[di + c] = if premul {
+                    (sc + dc * (255 - sa) / 255).min(255) as u8
+                } else {
+                    ((sc * sa + dc * (255 - sa)) / 255) as u8
+                };
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::blend_sprite;
+
+    #[test]
+    fn blend_sprite_composites_and_clips_safely() {
+        // 4x4 opaque-black BGRA frame.
+        let mut frame = vec![0u8; 4 * 4 * 4];
+        // 2x2 sprite: top-left opaque white, top-right fully transparent, bottom row 50% white.
+        let mut sprite = vec![0u8; 2 * 2 * 4];
+        sprite[0..4].copy_from_slice(&[255, 255, 255, 255]); // (0,0) opaque white
+        sprite[4..8].copy_from_slice(&[255, 255, 255, 0]); //   (1,0) transparent
+        // (0,1) and (1,1): premultiplied 50% white → color already *0.5 = 128, alpha 128.
+        sprite[8..12].copy_from_slice(&[128, 128, 128, 128]);
+        sprite[12..16].copy_from_slice(&[128, 128, 128, 128]);
+
+        blend_sprite(&mut frame, 4, 4, &sprite, 2, 2, 1, 1, true);
+
+        let px = |x: usize, y: usize| {
+            let i = (y * 4 + x) * 4;
+            [frame[i], frame[i + 1], frame[i + 2], frame[i + 3]]
+        };
+        assert_eq!(px(1, 1), [255, 255, 255, 0], "opaque white pasted at (1,1)");
+        assert_eq!(px(2, 1), [0, 0, 0, 0], "transparent sprite pixel left the frame black");
+        // Premultiplied 50% white over black: out = 128 + 0*(255-128)/255 = 128.
+        assert_eq!(px(1, 2), [128, 128, 128, 0], "premultiplied blend");
+        // Pixels outside the 2x2 placement are untouched.
+        assert_eq!(px(0, 0), [0, 0, 0, 0]);
+
+        // A placement partly off the right/bottom edge must not panic or corrupt out-of-range.
+        blend_sprite(&mut frame, 4, 4, &sprite, 2, 2, 3, 3, true);
+        // A wholly off-screen placement is a no-op.
+        let before = frame.clone();
+        blend_sprite(&mut frame, 4, 4, &sprite, 2, 2, -10, -10, true);
+        assert_eq!(frame, before);
+        // A truncated sprite buffer is rejected (no OOB).
+        blend_sprite(&mut frame, 4, 4, &[0u8; 3], 2, 2, 0, 0, true);
     }
 }
