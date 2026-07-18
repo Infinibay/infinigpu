@@ -269,6 +269,11 @@ pub struct InfinigpuBackend {
     /// a guest render node can prove the 3D datapath reaches the device (fence retires) without the
     /// generic "unsupported encoding" warn. Reset on device reset.
     vulkan_submits: u64,
+    /// The framebuffer dims the broker VRAM reservation was last trued-up for (PR8). Admission
+    /// reserves a baseline at attach (before the guest picks a mode); the first present at each new
+    /// size revises the reservation to cover the real per-VM scanout footprint. `None` until the
+    /// first present; reset on device reset.
+    scanout_vram_dims: Option<(u32, u32)>,
 }
 
 impl Default for InfinigpuBackend {
@@ -285,6 +290,13 @@ impl Default for InfinigpuBackend {
 /// once the replay runs as a separate process.
 pub fn broker_config_from_nvml() -> BrokerConfig {
     let mut cfg = BrokerConfig::default();
+    // PR8: a host on an older driver/SKU whose NVENC block caps concurrent sessions sets this so
+    // an over-cap streaming VM is denied-with-reason instead of getting a silent black stream.
+    // Unset (default `None`) = unlimited, matching drivers ≥550.
+    if let Some(n) = std::env::var("INFINIGPU_MAX_ENC_SESSIONS").ok().and_then(|s| s.parse().ok()) {
+        cfg.max_enc_sessions = Some(n);
+        info!("broker: NVENC session cap set to {n} (env INFINIGPU_MAX_ENC_SESSIONS)");
+    }
     match infinigpu_nvml::NvmlProbe::open().and_then(|p| p.snapshot(0)) {
         Ok(s) => {
             cfg.total_vram_mb = s.total_mb;
@@ -365,6 +377,7 @@ impl InfinigpuBackend {
             cursor_needs_resolicit: false,
             cursor_plane_enabled: std::env::var_os("INFINIGPU_CURSOR_PLANE").is_some(),
             vulkan_submits: 0,
+            scanout_vram_dims: None,
         }
     }
 
@@ -378,7 +391,15 @@ impl InfinigpuBackend {
         if self.admission_denied {
             return false;
         }
-        match self.broker.admit(self.vm_config.clone(), VRAM_ESTIMATE_MB) {
+        // PR8: a streaming VM (infiniPixel encoder bound) also claims a scarce NVENC session, so a
+        // host at its encode-session cap denies the (n+1)-th VM with a reason instead of a black
+        // stream. A control-plane-only backend (no pixel port) reserves VRAM only.
+        let req = if self.pixel.is_some() {
+            infinigpu_sched::AdmitRequest::streaming(VRAM_ESTIMATE_MB)
+        } else {
+            infinigpu_sched::AdmitRequest::vram(VRAM_ESTIMATE_MB)
+        };
+        match self.broker.admit(self.vm_config.clone(), req) {
             Ok(t) => {
                 self.ticket = Some(t);
                 true
@@ -391,6 +412,28 @@ impl InfinigpuBackend {
                 self.global_status |= regs::global_status::FATAL;
                 self.admission_denied = true;
                 false
+            }
+        }
+    }
+
+    /// PR8: true up this VM's broker VRAM reservation to the real per-VM scanout footprint once the
+    /// guest negotiates its framebuffer size. Admission reserved only a baseline (`VRAM_ESTIMATE_MB`)
+    /// at attach — before any mode was set; a per-VM host `ScanoutTarget` adds ~3× `w*h*4`. Runs at
+    /// most once per distinct size (cheap no-op every other present). **Degrade, never black:** if
+    /// the grow is refused (host near capacity) we keep the baseline reservation and keep streaming.
+    fn account_scanout_vram(&mut self, w: u32, h: u32) {
+        if self.scanout_vram_dims == Some((w, h)) {
+            return;
+        }
+        self.scanout_vram_dims = Some((w, h));
+        let want = VRAM_ESTIMATE_MB + infinigpu_sched::scanout_vram_estimate_mb(w, h, 3);
+        if let Some(t) = &self.ticket {
+            match t.adjust_vram(want) {
+                Ok(mb) => log::debug!("PR8: VRAM reservation trued up to {mb} MB for {w}x{h}"),
+                Err(e) => log::warn!(
+                    "PR8: VRAM true-up to {want} MB for {w}x{h} refused ({e}); keeping baseline \
+                     {VRAM_ESTIMATE_MB} MB (degrade, not black)"
+                ),
             }
         }
     }
@@ -420,6 +463,8 @@ impl InfinigpuBackend {
         self.cursor_needs_resolicit = true;
         // 3D submit counter is per-attach observability; a fresh generation starts from zero.
         self.vulkan_submits = 0;
+        // The VRAM true-up re-runs on the next present after a reset (fresh mode negotiation).
+        self.scanout_vram_dims = None;
         if let Some(p) = &self.pixel {
             p.reset_planes();
         }
@@ -731,6 +776,8 @@ impl InfinigpuBackend {
                 return;
             }
         };
+        // PR8: true up the broker VRAM reservation to this scanout's real footprint (once per size).
+        self.account_scanout_vram(sp.width, sp.height);
         let mut buf = vec![0u8; total];
         if !self.dma.read(sp.scanout_addr, &mut buf) {
             log::error!(
@@ -851,6 +898,8 @@ impl InfinigpuBackend {
                 return;
             }
         };
+        // PR8: true up the broker VRAM reservation to this scanout's real footprint (once per size).
+        self.account_scanout_vram(sp.width, sp.height);
 
         // Clamp the guest damage rect into [0,w]×[0,h] (see `clamp_damage`): a hostile
         // origin or width can never index outside the frame.

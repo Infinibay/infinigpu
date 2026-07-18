@@ -165,6 +165,13 @@ pub struct BrokerConfig {
     /// A single render exceeding this per-VM GPU-time trips the watchdog (real design
     /// kills the replay process; here it is flagged and counted).
     pub watchdog_us: Micros,
+    /// Concurrent hardware-encode (NVENC) sessions the host allows — the scarce ADR-0007
+    /// admission resource (a GA102 has a single NVENC block; some driver/SKU combos cap the
+    /// concurrent session count). `None` = unlimited (modern drivers lifted the consumer cap):
+    /// admission never denies on encoder grounds. `Some(n)` makes an `(n+1)`-th streaming VM a
+    /// **fail-closed `NoEncoderSession` denial** instead of a silent black stream (the failure
+    /// mode PR8 exists to surface). Set host-wide via env `INFINIGPU_MAX_ENC_SESSIONS`.
+    pub max_enc_sessions: Option<u32>,
 }
 
 impl Default for BrokerConfig {
@@ -179,7 +186,54 @@ impl Default for BrokerConfig {
             bucket_burst_us: 50_000,
             min_refill_us_per_s: 20_000,
             watchdog_us: 2_000_000, // 2 s single-submission budget
+            // Unlimited by default (matches drivers ≥550, which removed the consumer NVENC
+            // session cap). A host on an older driver/SKU sets this to surface the limit.
+            max_enc_sessions: None,
         }
+    }
+}
+
+/// Bytes a single BGRA (`B8G8R8A8`) scanout surface of `width`×`height` occupies, times a
+/// working-set `factor` — the PR8 VRAM-accounting input. A per-VM host `ScanoutTarget` keeps a
+/// staging buffer **and** a persistent out image (so undamaged pixels survive), plus transient
+/// blit scratch, so the live footprint is ~2–3× the raw frame; pass `factor=3` for the honest
+/// upper bound. Overflow-safe (a hostile geometry saturates rather than wrapping) and rounded up
+/// to whole MB so a sub-MB surface still counts as 1.
+pub fn scanout_vram_estimate_mb(width: u32, height: u32, factor: u32) -> u64 {
+    const MB: u64 = 1024 * 1024;
+    let raw = (width as u64)
+        .saturating_mul(height as u64)
+        .saturating_mul(4)
+        .saturating_mul(factor.max(1) as u64);
+    raw.div_ceil(MB)
+}
+
+/// An admission request (PR8): how much VRAM the VM reserves, and whether it needs a scarce
+/// hardware-encode session. Existing call sites pass a bare `vram_mb` (via `From<u64>`, which
+/// sets `needs_encoder: false`); a streaming GPU VM builds one with `needs_encoder: true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmitRequest {
+    pub vram_mb: u64,
+    /// True if this VM will hold an NVENC session (its infiniPixel stream). Counted against
+    /// `BrokerConfig::max_enc_sessions`.
+    pub needs_encoder: bool,
+}
+
+impl AdmitRequest {
+    /// A VRAM-only request (no encoder session) — the pre-PR8 behavior.
+    pub fn vram(vram_mb: u64) -> Self {
+        Self { vram_mb, needs_encoder: false }
+    }
+    /// A streaming GPU VM: reserves VRAM **and** one hardware-encode session.
+    pub fn streaming(vram_mb: u64) -> Self {
+        Self { vram_mb, needs_encoder: true }
+    }
+}
+
+impl From<u64> for AdmitRequest {
+    /// Bare `vram_mb` → a VRAM-only request. Keeps every pre-PR8 `admit(cfg, mb)` call compiling.
+    fn from(vram_mb: u64) -> Self {
+        Self::vram(vram_mb)
     }
 }
 
@@ -194,6 +248,9 @@ pub enum AdmitError {
     ExceedsVmCap { requested_mb: u64, cap_mb: u64 },
     /// This vm_id is already admitted.
     AlreadyAdmitted,
+    /// All hardware-encode (NVENC) sessions are in use (`cap` concurrent). PR8: surfaced as a
+    /// fail-closed denial instead of a silent black stream.
+    NoEncoderSession { cap: u32 },
 }
 
 impl std::fmt::Display for AdmitError {
@@ -213,6 +270,9 @@ impl std::fmt::Display for AdmitError {
                 write!(f, "requested {requested_mb} MB exceeds VM cap {cap_mb} MB")
             }
             AdmitError::AlreadyAdmitted => write!(f, "VM already admitted"),
+            AdmitError::NoEncoderSession { cap } => {
+                write!(f, "no free NVENC session ({cap} in use — host encode cap)")
+            }
         }
     }
 }
@@ -247,6 +307,9 @@ struct VmState {
     /// GPU-time budget remaining (µs). May dip slightly negative after an overrun.
     tokens_us: i64,
     last_refill_us: Micros,
+    /// Whether this VM holds a hardware-encode session (decremented from
+    /// `State::enc_sessions_used` on reap).
+    holds_encoder: bool,
     // ---- observability (FleetView) ----
     vram_reserved_mb: u64,
     gpu_time_used_us: Micros,
@@ -296,11 +359,18 @@ pub struct FleetView {
     pub vram_free_mb: u64,
     pub admitted_vms: u32,
     pub max_concurrent_gpu_vms: u32,
+    /// Hardware-encode sessions in use (PR8).
+    pub enc_sessions_used: u32,
+    /// Host encode-session cap, or `None` when unlimited.
+    pub max_enc_sessions: Option<u32>,
     pub vms: Vec<VmStat>,
 }
 
 struct State {
     vram_used_mb: u64,
+    /// Concurrent hardware-encode sessions currently held (sum of admitted VMs with
+    /// `holds_encoder`). Checked against `BrokerConfig::max_enc_sessions` at admit.
+    enc_sessions_used: u32,
     vms: HashMap<String, VmState>,
 }
 
@@ -321,6 +391,7 @@ impl GpuBroker {
             clock,
             state: Mutex::new(State {
                 vram_used_mb: 0,
+                enc_sessions_used: 0,
                 vms: HashMap::new(),
             }),
             run_lock: Mutex::new(()),
@@ -340,7 +411,18 @@ impl GpuBroker {
     /// denies the VM. On success the VRAM is reserved in the ledger and the VM is
     /// registered with a full burst bucket; the returned [`VmTicket`] releases both on
     /// drop (the reap).
-    pub fn admit(self: &Arc<Self>, cfg: VmConfig, vram_mb: u64) -> Result<VmTicket, AdmitError> {
+    ///
+    /// `req` is anything `Into<AdmitRequest>`: a bare `vram_mb: u64` reserves VRAM only (the
+    /// pre-PR8 behavior), while `AdmitRequest::streaming(mb)` also claims one hardware-encode
+    /// session against [`BrokerConfig::max_enc_sessions`] — an over-cap streaming VM is denied
+    /// with [`AdmitError::NoEncoderSession`] rather than silently getting a black stream.
+    pub fn admit(
+        self: &Arc<Self>,
+        cfg: VmConfig,
+        req: impl Into<AdmitRequest>,
+    ) -> Result<VmTicket, AdmitError> {
+        let req = req.into();
+        let vram_mb = req.vram_mb;
         let now = self.clock.now_us();
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -358,6 +440,15 @@ impl GpuBroker {
                 cap_mb: cfg.vram_cap_mb,
             });
         }
+        // Hardware-encode session admission (checked BEFORE the ledger is mutated, so a denial
+        // leaves the VRAM ledger untouched). `None` = unlimited → never denies.
+        if req.needs_encoder {
+            if let Some(cap) = self.cfg.max_enc_sessions {
+                if st.enc_sessions_used >= cap {
+                    return Err(AdmitError::NoEncoderSession { cap });
+                }
+            }
+        }
         let budget = self
             .cfg
             .total_vram_mb
@@ -371,6 +462,9 @@ impl GpuBroker {
         }
 
         st.vram_used_mb += vram_mb;
+        if req.needs_encoder {
+            st.enc_sessions_used += 1;
+        }
         let vm_id = cfg.vm_id.clone();
         st.vms.insert(
             vm_id.clone(),
@@ -378,6 +472,7 @@ impl GpuBroker {
                 cfg,
                 tokens_us: self.cfg.bucket_burst_us as i64,
                 last_refill_us: now,
+                holds_encoder: req.needs_encoder,
                 vram_reserved_mb: vram_mb,
                 gpu_time_used_us: 0,
                 vruntime_us: 0,
@@ -387,9 +482,11 @@ impl GpuBroker {
             },
         );
         log::info!(
-            "admit: vm={vm_id} vram={vram_mb}MB (used {}/{} MB, {} VMs)",
+            "admit: vm={vm_id} vram={vram_mb}MB enc={} (used {}/{} MB, {} enc, {} VMs)",
+            req.needs_encoder,
             st.vram_used_mb,
             budget,
+            st.enc_sessions_used,
             st.vms.len()
         );
         Ok(VmTicket {
@@ -397,6 +494,38 @@ impl GpuBroker {
             vm_id,
             released: false,
         })
+    }
+
+    /// PR8: revise a VM's VRAM reservation after admission — used once the guest negotiates its
+    /// real framebuffer size (admission happens at attach with a baseline estimate; the per-VM
+    /// `ScanoutTarget` is only sized at the first present). Fail-closed: if the new reservation
+    /// would exceed the free budget it is **rejected** and the old reservation stands (the caller
+    /// keeps running on its baseline — never a hard failure, never black). Shrinking always
+    /// succeeds. Returns the reservation now in force.
+    pub fn adjust_vram(&self, vm_id: &str, new_mb: u64) -> Result<u64, AdmitError> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let old = match st.vms.get(vm_id) {
+            Some(vm) => vm.vram_reserved_mb,
+            None => return Err(AdmitError::AlreadyAdmitted), // not admitted / already reaped
+        };
+        if new_mb > old {
+            let budget = self.cfg.total_vram_mb.saturating_sub(self.cfg.vram_reserve_mb);
+            let available = budget.saturating_sub(st.vram_used_mb);
+            let delta = new_mb - old;
+            if delta > available {
+                return Err(AdmitError::InsufficientVram {
+                    requested_mb: delta,
+                    available_mb: available,
+                });
+            }
+            st.vram_used_mb += delta;
+        } else {
+            st.vram_used_mb = st.vram_used_mb.saturating_sub(old - new_mb);
+        }
+        if let Some(vm) = st.vms.get_mut(vm_id) {
+            vm.vram_reserved_mb = new_mb;
+        }
+        Ok(new_mb)
     }
 
     /// Refill + check whether `vm_id` may run now. `Ready` if it has budget, else the
@@ -507,6 +636,8 @@ impl GpuBroker {
             vram_free_mb: budget.saturating_sub(st.vram_used_mb),
             admitted_vms: st.vms.len() as u32,
             max_concurrent_gpu_vms: self.cfg.max_concurrent_gpu_vms,
+            enc_sessions_used: st.enc_sessions_used,
+            max_enc_sessions: self.cfg.max_enc_sessions,
             vms,
         }
     }
@@ -517,10 +648,15 @@ impl GpuBroker {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(vm) = st.vms.remove(vm_id) {
             st.vram_used_mb = st.vram_used_mb.saturating_sub(vm.vram_reserved_mb);
+            if vm.holds_encoder {
+                st.enc_sessions_used = st.enc_sessions_used.saturating_sub(1);
+            }
             log::info!(
-                "reap: vm={vm_id} freed {}MB (used {} MB, {} VMs)",
+                "reap: vm={vm_id} freed {}MB enc={} (used {} MB, {} enc, {} VMs)",
                 vm.vram_reserved_mb,
+                vm.holds_encoder,
                 st.vram_used_mb,
+                st.enc_sessions_used,
                 st.vms.len()
             );
         }
@@ -544,6 +680,12 @@ impl VmTicket {
     /// Run one GPU submission for this VM under the scheduler (see [`GpuBroker::run`]).
     pub fn run<R>(&self, f: impl FnOnce() -> R) -> Result<R, RunError> {
         self.broker.run(&self.vm_id, f)
+    }
+
+    /// Revise this VM's VRAM reservation (see [`GpuBroker::adjust_vram`]) — called once the real
+    /// framebuffer size is negotiated. Fail-closed: a rejected grow leaves the old reservation.
+    pub fn adjust_vram(&self, new_mb: u64) -> Result<u64, AdmitError> {
+        self.broker.adjust_vram(&self.vm_id, new_mb)
     }
 }
 
@@ -797,5 +939,98 @@ mod tests {
         // The run-lock is NOT poisoned: another VM — and 'a' itself — still submit fine.
         assert_eq!(other.run(|| 7).unwrap(), 7);
         assert_eq!(a.run(|| 9).unwrap(), 9);
+    }
+
+    // ---- PR8: VRAM + NVENC-session admission ------------------------------------------------
+
+    #[test]
+    fn encoder_session_admission_is_fail_closed() {
+        // A host that caps concurrent NVENC sessions at 1 (the GA102 failure mode PR8 surfaces).
+        let cfg = BrokerConfig { max_enc_sessions: Some(1), ..Default::default() };
+        let b = broker_with(Arc::new(ManualClock::default()), cfg);
+
+        // First streaming VM claims the single session.
+        let a = b.admit(VmConfig::new("a", 1, 4_000), AdmitRequest::streaming(500)).unwrap();
+        assert_eq!(b.fleet_view().enc_sessions_used, 1);
+        // A second streaming VM is denied-with-reason (not a silent black stream) — and its VRAM
+        // ledger is untouched by the denial.
+        let before = b.fleet_view().vram_used_mb;
+        assert_eq!(
+            b.admit(VmConfig::new("b", 1, 4_000), AdmitRequest::streaming(500)).unwrap_err(),
+            AdmitError::NoEncoderSession { cap: 1 }
+        );
+        assert_eq!(b.fleet_view().vram_used_mb, before, "denied admit must not reserve VRAM");
+        // A NON-streaming VM still admits (it needs no encode session).
+        let _c = b.admit(VmConfig::new("c", 1, 4_000), AdmitRequest::vram(500)).unwrap();
+        assert_eq!(b.fleet_view().enc_sessions_used, 1);
+        // Reaping the holder frees the session so a new streaming VM can take it.
+        drop(a);
+        assert_eq!(b.fleet_view().enc_sessions_used, 0);
+        let _d = b.admit(VmConfig::new("d", 1, 4_000), AdmitRequest::streaming(500)).unwrap();
+        assert_eq!(b.fleet_view().enc_sessions_used, 1);
+    }
+
+    #[test]
+    fn unlimited_encoder_sessions_never_deny() {
+        // Default (None) = modern driver, no consumer NVENC cap → streaming never denies on it.
+        let b = broker_with(Arc::new(ManualClock::default()), BrokerConfig::default());
+        let mut held = Vec::new();
+        for i in 0..5 {
+            held.push(
+                b.admit(VmConfig::new(&format!("vm{i}"), 1, 4_000), AdmitRequest::streaming(100))
+                    .unwrap(),
+            );
+        }
+        let fv = b.fleet_view();
+        assert_eq!(fv.enc_sessions_used, 5);
+        assert_eq!(fv.max_enc_sessions, None);
+    }
+
+    #[test]
+    fn bare_u64_admit_claims_no_encoder_session() {
+        // The From<u64> path (every pre-PR8 call site) must NOT consume an encode session.
+        let cfg = BrokerConfig { max_enc_sessions: Some(1), ..Default::default() };
+        let b = broker_with(Arc::new(ManualClock::default()), cfg);
+        let _a = b.admit(VmConfig::new("a", 1, 4_000), 1_000).unwrap();
+        let _c = b.admit(VmConfig::new("c", 1, 4_000), 1_000).unwrap();
+        assert_eq!(b.fleet_view().enc_sessions_used, 0, "vram-only admits hold no session");
+    }
+
+    #[test]
+    fn adjust_vram_trues_up_and_is_fail_closed() {
+        // 9000 MB admittable.
+        let cfg = BrokerConfig {
+            total_vram_mb: 10_000,
+            vram_reserve_mb: 1_000,
+            ..Default::default()
+        };
+        let b = broker_with(Arc::new(ManualClock::default()), cfg);
+        // Admit at a baseline, then true up to the real per-VM ScanoutTarget footprint.
+        let _a = b.admit(VmConfig::new("a", 1, 9_000), 256).unwrap();
+        assert_eq!(b.adjust_vram("a", 2_000).unwrap(), 2_000);
+        assert_eq!(b.fleet_view().vram_used_mb, 2_000);
+        // A second VM eats most of the rest.
+        let _c = b.admit(VmConfig::new("c", 1, 9_000), 6_500).unwrap(); // 8500 used, 500 free
+        // Truing 'a' up beyond the free budget is REJECTED and the old reservation stands.
+        let err = b.adjust_vram("a", 3_000).unwrap_err(); // needs +1000, only 500 free
+        assert!(matches!(err, AdmitError::InsufficientVram { .. }));
+        assert_eq!(b.fleet_view().vram_used_mb, 8_500, "rejected true-up must not change the ledger");
+        // Shrinking always succeeds and returns capacity.
+        assert_eq!(b.adjust_vram("a", 500).unwrap(), 500);
+        assert_eq!(b.fleet_view().vram_used_mb, 7_000);
+        // Adjusting an unknown VM is rejected, not a panic.
+        assert!(b.adjust_vram("ghost", 100).is_err());
+    }
+
+    #[test]
+    fn scanout_vram_estimate_is_overflow_safe_and_rounds_up() {
+        // 1080p BGRA × 3 working-set = 1920*1080*4*3 = 24_883_200 B → 24 MB (ceil).
+        assert_eq!(scanout_vram_estimate_mb(1920, 1080, 3), 24);
+        // Sub-MB surface still counts as at least 1 MB.
+        assert_eq!(scanout_vram_estimate_mb(16, 16, 1), 1);
+        // factor 0 is treated as 1 (never zero-cost).
+        assert_eq!(scanout_vram_estimate_mb(1920, 1080, 0), scanout_vram_estimate_mb(1920, 1080, 1));
+        // A hostile u32::MAX geometry saturates instead of wrapping to a small value.
+        assert!(scanout_vram_estimate_mb(u32::MAX, u32::MAX, 3) > 0);
     }
 }

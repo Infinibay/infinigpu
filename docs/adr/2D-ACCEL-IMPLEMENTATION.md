@@ -149,13 +149,25 @@ the pivot that makes everything after it reusable for 3D.
 - **Accept:** `can_export()==true` → correct colors, readback bytes-to-host counter ~0;
   `false` → `submit_bgra` unchanged; measure glass-to-glass latency drop vs PR5.
 
-### PR8 — Multitenant accounting: VRAM + NVENC-session admission *(S, ~0.5 wk)*
+### PR8 — Multitenant accounting: VRAM + NVENC-session admission *(S, ~0.5 wk)* — **SHIPPED**
 - Parameterize `VRAM_ESTIMATE_MB` by the negotiated framebuffer size so each per-VM
   `ScanoutTarget` (~2–3× `w*h*4`) is counted in admission; count NVENC sessions at admission
   (GA102 `max_sessions=1`) so a second per-VM encoder is **denied-with-reason**, not a silent
   black stream.
 - **Accept:** admit two 1080p GPU VMs → ledger reflects ~2× per-VM scanout VRAM; admission
   denies fail-closed when the estimate exceeds the reservation.
+- *Status (shipped, unit-tested off-hardware):* `infinigpu-sched` gained `AdmitRequest`
+  (`vram`/`streaming`, `From<u64>` so every pre-PR8 call site is untouched),
+  `BrokerConfig::max_enc_sessions` (`None`=unlimited; env `INFINIGPU_MAX_ENC_SESSIONS`),
+  `AdmitError::NoEncoderSession`, per-session accounting (reaped on ticket drop),
+  `scanout_vram_estimate_mb(w,h,factor)`, and `adjust_vram`/`VmTicket::adjust_vram` (fail-closed
+  post-attach true-up — a refused grow keeps the baseline, never black). The device claims a
+  session when it streams (`ensure_admitted` → `streaming` iff a pixel port is bound) and trues up
+  the VRAM reservation on the first present at each size (`account_scanout_vram`, once per size).
+  5 sched tests cover the session cap (deny-with-reason + reap-frees-it), the unlimited default,
+  the `From<u64>` no-session path, the fail-closed true-up, and the overflow-safe estimate. The
+  only hardware-gated piece is the **E2E benchmark** (two live 1080p GPU VMs on the A5000 showing
+  ~2× ledger VRAM) — the admission *logic* is complete and verified.
 
 ## Biggest risks
 - **Blocking the vfio-user callback thread** (freezes the guest vCPU). The per-VM
