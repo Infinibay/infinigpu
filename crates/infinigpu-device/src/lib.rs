@@ -135,6 +135,34 @@ pub mod dbg {
     pub const DMA_DATA: u64 = 0x0F08;
 }
 
+/// A persistent per-VM BGRA scanout surface for the accelerated 2D damage path.
+///
+/// The full-frame path (`DISPLAY_SCANOUT`) rebuilds the whole BGRA frame from a full
+/// framebuffer DMA-read every present. The damage path (`DISPLAY_SCANOUT_DAMAGE`) instead
+/// keeps this surface across presents and patches **only the dirty sub-rectangle** into it,
+/// then streams the whole surface — so the encoder still sees a complete frame (its P-frames
+/// diff it) while the device DMA-reads + repacks only `dw*dh*4` bytes instead of the entire
+/// `pitch*height`. Reset to `None` on any resize/first-frame so a stale surface can never
+/// leak partial-frame corruption (the guest re-sends a full frame on modeset).
+struct ScanoutBuffer {
+    w: usize,
+    h: usize,
+    /// Tightly-packed BGRA, `w*h*4` bytes (what the encoder ingests).
+    bgra: Vec<u8>,
+}
+
+/// Clamp a guest-supplied damage rect into the `[0,w]×[0,h]` frame. Saturating `min`
+/// math guarantees the result satisfies `dx+dw <= w` and `dy+dh <= h` for **any** `u32`
+/// input (including `u32::MAX`), so a hostile guest can never drive an out-of-bounds
+/// framebuffer index. Returns `(dx, dy, dw, dh)` in pixels.
+fn clamp_damage(w: usize, h: usize, dx: u32, dy: u32, dw: u32, dh: u32) -> (usize, usize, usize, usize) {
+    let dx = (dx as usize).min(w);
+    let dy = (dy as usize).min(h);
+    let dw = (dw as usize).min(w - dx);
+    let dh = (dh as usize).min(h - dy);
+    (dx, dy, dw, dh)
+}
+
 /// The infinigpu vfio-user device backend.
 pub struct InfinigpuBackend {
     config: Vec<u8>,
@@ -173,6 +201,14 @@ pub struct InfinigpuBackend {
     /// in a browser. The WebSocket server binds eagerly; the encoder is created on the
     /// first present, sized to the guest framebuffer.
     pixel: Option<infinigpu_pixel::PixelStreamer>,
+    /// Persistent BGRA surface for the accelerated 2D damage path (`ScanoutBuffer`).
+    /// `None` until the first present, and re-set to `None`/rebuilt on any resize so the
+    /// damage path never patches into a stale-sized buffer.
+    last_scanout: Option<ScanoutBuffer>,
+    /// Guest-framebuffer bytes DMA-read for the most recent present — the whole
+    /// `pitch*height` for a full-frame present, `~dw*dh*4` for a damage present. Surfaced
+    /// in the periodic infiniPixel stats line so the damage-path win is observable.
+    bytes_read_last: usize,
 }
 
 impl Default for InfinigpuBackend {
@@ -263,6 +299,8 @@ impl InfinigpuBackend {
             present_count: 0,
             present_dir,
             pixel,
+            last_scanout: None,
+            bytes_read_last: 0,
         }
     }
 
@@ -309,6 +347,9 @@ impl InfinigpuBackend {
         self.admission_denied = false;
         self.ring_base.iter_mut().for_each(|b| *b = 0);
         self.ring_retired.iter_mut().for_each(|r| *r = 0);
+        // Drop the persistent damage surface: after a reset the guest re-negotiates and
+        // sends a fresh full-frame present, so a retained buffer would only risk staleness.
+        self.last_scanout = None;
         // DMA maps persist across device reset (the client re-sends DMA_UNMAP/MAP).
     }
 
@@ -340,7 +381,7 @@ impl InfinigpuBackend {
         match off {
             DEV_MAGIC => infinigpu_abi::DEV_MAGIC,
             ABI_VERSION => infinigpu_abi::abi_version(),
-            DEV_CAPS => regs::PHASE0_DEV_CAPS,
+            DEV_CAPS => regs::PHASE1_DEV_CAPS,
             NUM_CONTEXTS => crate::NUM_CONTEXTS as u32,
             MAX_RING_ENTRIES => 256,
             BAR2_APERTURE_MB => 0, // no blob aperture yet
@@ -454,7 +495,8 @@ impl InfinigpuBackend {
     /// `ctx`'s retired seqno and raises MSI-X vector `ctx+1`.
     fn process_ring(&mut self, ctx: usize) {
         use infinigpu_abi::wire::{
-            encoding, msg_type, ClearPresent, Descriptor, ScanoutPresent, SubmitCmd,
+            encoding, msg_type, ClearPresent, Descriptor, ScanoutPresent, ScanoutPresentDamaged,
+            SubmitCmd,
         };
         use zerocopy::FromBytes;
 
@@ -500,6 +542,23 @@ impl InfinigpuBackend {
                 let sp = ScanoutPresent::read_from_bytes(&pb).unwrap();
                 self.present_scanout(&sp, sc.seqno, ctx);
             }
+            encoding::DISPLAY_SCANOUT_DAMAGE => {
+                // Bounded, zero-filled read (ADR-0004 forward-compat): honor `payload_len`
+                // so a future guest that appends trailing fields still parses here (we read
+                // the prefix we understand, zero-fill the rest), and an unset `payload_len`
+                // falls back to the full struct size. Never reads past the struct.
+                let mut pb = [0u8; core::mem::size_of::<ScanoutPresentDamaged>()];
+                let n = if sc.payload_len == 0 {
+                    pb.len()
+                } else {
+                    (sc.payload_len as usize).min(pb.len())
+                };
+                if !self.dma.read(payload_addr, &mut pb[..n]) {
+                    return;
+                }
+                let sp = ScanoutPresentDamaged::read_from_bytes(&pb).unwrap();
+                self.present_scanout_damaged(&sp, sc.seqno, ctx);
+            }
             other => log::warn!("unsupported encoding {:#x}", other),
         }
     }
@@ -543,6 +602,10 @@ impl InfinigpuBackend {
             );
             return;
         }
+        // A full-frame present invalidates any damage surface (this is the resize/modeset
+        // path in practice) and reads the whole framebuffer.
+        self.last_scanout = None;
+        self.bytes_read_last = total;
 
         // Byte order of one 32-bpp pixel. fbcon's XRGB8888 is little-endian
         // [B,G,R,X]; R8G8B8A8 is [R,G,B,A].
@@ -605,7 +668,150 @@ impl InfinigpuBackend {
             if self.present_count.is_multiple_of(60) {
                 if let Some(p) = &self.pixel {
                     let (sent, skipped) = p.stats();
-                    info!("infiniPixel: {sent} frames encoded, {skipped} idle-skipped (unchanged)");
+                    info!(
+                        "infiniPixel: {sent} frames encoded, {skipped} idle-skipped (unchanged); \
+                         last present read {} KiB from guest",
+                        self.bytes_read_last / 1024
+                    );
+                }
+            }
+        }
+    }
+
+    /// Accelerated 2D present (`DISPLAY_SCANOUT_DAMAGE`): patch only the guest-reported
+    /// damage rect into the persistent [`ScanoutBuffer`] and stream the whole surface.
+    ///
+    /// The encoder still receives a complete BGRA frame (its P-frames encode only the delta),
+    /// but the device DMA-reads + repacks just the `dw*dh*4` dirty bytes instead of the whole
+    /// `pitch*height` framebuffer — the win during drags/scrolls. Fail-closed on every guest-
+    /// controlled value: bad geometry is rejected, the damage rect is clamped into the frame,
+    /// and a resize/first-frame/stale buffer forces a full rebuild (never partial-frame
+    /// corruption). If any damaged row is unmapped we bail **without** retiring, so the guest
+    /// can re-present rather than seeing a torn surface.
+    fn present_scanout_damaged(
+        &mut self,
+        sp: &infinigpu_abi::wire::ScanoutPresentDamaged,
+        seqno: u64,
+        ctx: usize,
+    ) {
+        use infinigpu_abi::wire::format;
+
+        // Admission gate (fail-closed): a VM the broker didn't admit cannot present.
+        if !self.ensure_admitted() {
+            return;
+        }
+        let (w, h, pitch) = (sp.width as usize, sp.height as usize, sp.pitch as usize);
+        // Same fail-closed geometry guard as `present_scanout`: pitch covers a row, the
+        // framebuffer fits in 64 MiB, non-zero dims.
+        let fb_bytes = w
+            .checked_mul(4)
+            .filter(|min_pitch| pitch >= *min_pitch)
+            .and_then(|_| pitch.checked_mul(h));
+        let fb_bytes = match fb_bytes {
+            Some(t) if w != 0 && h != 0 && t <= 64 * 1024 * 1024 => t,
+            _ => {
+                log::error!("present(dmg): bad geometry {w}x{h} pitch {pitch}");
+                return;
+            }
+        };
+
+        // Clamp the guest damage rect into [0,w]×[0,h] (see `clamp_damage`): a hostile
+        // origin or width can never index outside the frame.
+        let (dx, dy, dw, dh) = clamp_damage(w, h, sp.dx, sp.dy, sp.dw, sp.dh);
+
+        // One pixel's source byte order → BGRA. fbcon XRGB8888 is [B,G,R,X]; R8G8B8A8 is [R,G,B,A].
+        let (ri, gi, bi) = match sp.format {
+            format::R8G8B8A8 => (0usize, 1usize, 2usize),
+            _ => (2usize, 1usize, 0usize),
+        };
+
+        // Full rebuild when there is no matching surface (first frame / resize / post-reset).
+        let need_full = !matches!(&self.last_scanout, Some(b) if b.w == w && b.h == h);
+
+        if need_full {
+            let mut buf = vec![0u8; fb_bytes];
+            if !self.dma.read(sp.scanout_addr, &mut buf) {
+                log::error!("present(dmg): framebuffer {:#x} not mapped", sp.scanout_addr);
+                return;
+            }
+            let mut bgra = vec![0u8; w * h * 4];
+            for y in 0..h {
+                let row = &buf[y * pitch..y * pitch + w * 4];
+                for x in 0..w {
+                    let px = &row[x * 4..x * 4 + 4];
+                    let o4 = (y * w + x) * 4;
+                    bgra[o4] = px[bi];
+                    bgra[o4 + 1] = px[gi];
+                    bgra[o4 + 2] = px[ri];
+                    bgra[o4 + 3] = 255;
+                }
+            }
+            self.last_scanout = Some(ScanoutBuffer { w, h, bgra });
+            self.bytes_read_last = fb_bytes;
+        } else if dw > 0 && dh > 0 {
+            // Incremental: DMA-read only the `dh` damaged rows (each `dw*4` bytes) straight
+            // from the sub-rectangle and repack them into the persistent surface. `unwrap`
+            // is sound — `need_full` was false, so `last_scanout` is `Some`.
+            let b = self.last_scanout.as_mut().unwrap();
+            let mut row_buf = vec![0u8; dw * 4];
+            for r in 0..dh {
+                let y = dy + r;
+                let src = sp.scanout_addr + (y as u64) * (pitch as u64) + (dx as u64) * 4;
+                if !self.dma.read(src, &mut row_buf) {
+                    // Fail-closed: leave the surface untouched and do NOT retire, so the
+                    // guest re-presents instead of the viewer seeing a torn row.
+                    log::error!("present(dmg): damaged row {y} @ {src:#x} not mapped");
+                    return;
+                }
+                let dst_row = (y * w + dx) * 4;
+                for x in 0..dw {
+                    let px = &row_buf[x * 4..x * 4 + 4];
+                    let o4 = dst_row + x * 4;
+                    b.bgra[o4] = px[bi];
+                    b.bgra[o4 + 1] = px[gi];
+                    b.bgra[o4 + 2] = px[ri];
+                    b.bgra[o4 + 3] = 255;
+                }
+            }
+            self.bytes_read_last = dw * dh * 4;
+        } else {
+            // Empty damage after clamp: nothing changed — re-stream the persistent surface
+            // (so a freshly-connected viewer still gets a frame) without reading guest RAM.
+            self.bytes_read_last = 0;
+        }
+
+        self.present_count += 1;
+        if self.present_count.is_multiple_of(120) {
+            info!(
+                "present(dmg): frame {} {w}x{h} damage {dw}x{dh}@({dx},{dy}) — read {} KiB",
+                self.present_count,
+                self.bytes_read_last / 1024
+            );
+        }
+        if let Some(dir) = self.present_dir.clone() {
+            if let Some(b) = &self.last_scanout {
+                // Diagnostic PPM from the persistent BGRA surface (BGRA→RGB), dev-only.
+                let mut rgb = vec![0u8; w * h * 3];
+                for i in 0..w * h {
+                    rgb[i * 3] = b.bgra[i * 4 + 2];
+                    rgb[i * 3 + 1] = b.bgra[i * 4 + 1];
+                    rgb[i * 3 + 2] = b.bgra[i * 4];
+                }
+                let _ = self.write_ppm(&dir.join("latest.ppm"), w, h, &rgb);
+            }
+        }
+
+        // Retire BEFORE streaming — the guest framebuffer is fully consumed into the
+        // persistent surface, so let the scanout doorbell return immediately (keeps the
+        // guest vCPU / QEMU BQL off the encode handoff; see `present_scanout`).
+        self.ring_retired[ctx] = seqno;
+
+        // Stream the whole persistent surface. Borrow `last_scanout` (shared) and `pixel`
+        // (mut) as disjoint fields directly so the borrow checker allows both at once.
+        if let (Some(b), Some(p)) = (self.last_scanout.as_ref(), self.pixel.as_mut()) {
+            if let Err(e) = p.submit_bgra(&b.bgra, b.w as u32, b.h as u32) {
+                if self.present_count.is_multiple_of(60) {
+                    log::warn!("infiniPixel: frame submit failed ({e}); stream may be down");
                 }
             }
         }
@@ -943,5 +1149,35 @@ mod tests {
         b.reset_state();
         assert_eq!(b.ring_base[2], 0);
         assert_eq!(b.ring_retired[2], 0);
+    }
+
+    #[test]
+    fn advertises_2d_display_accel() {
+        // The guest reads DEV_CAPS to decide whether to send DISPLAY_SCANOUT_DAMAGE.
+        let mut b = InfinigpuBackend::new();
+        let caps = b.bar0_read_u32(ctrl::DEV_CAPS);
+        assert!(
+            caps & regs::caps::DISPLAY_ACCEL != 0,
+            "device must advertise DISPLAY_ACCEL for the 2D damage path"
+        );
+        // Still a Phase-0 superset — the base submission model is unchanged.
+        assert!(caps & regs::caps::POLL_SUBMIT != 0);
+    }
+
+    #[test]
+    fn clamp_damage_never_exceeds_frame() {
+        // A well-formed rect passes through unchanged.
+        assert_eq!(clamp_damage(1920, 1080, 10, 20, 100, 50), (10, 20, 100, 50));
+        // dx+dw past the right edge → dw shrunk so the rect ends exactly at the edge.
+        let (dx, _, dw, _) = clamp_damage(1920, 1080, 1900, 0, 100, 10);
+        assert!(dx + dw <= 1920 && dw == 20);
+        // Origin beyond the frame → zero-area, still fully in bounds (no underflow).
+        let (dx, dy, dw, dh) = clamp_damage(1920, 1080, 5000, 5000, 100, 100);
+        assert!(dx <= 1920 && dy <= 1080 && dx + dw <= 1920 && dy + dh <= 1080);
+        // Hostile u32::MAX dimensions must not overflow into an OOB index.
+        let (dx, dy, dw, dh) = clamp_damage(1920, 1080, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
+        assert!(dx + dw <= 1920 && dy + dh <= 1080);
+        // Full-frame damage (the guest's "no damage known" / first-flip sentinel) is preserved.
+        assert_eq!(clamp_damage(1920, 1080, 0, 0, 1920, 1080), (0, 0, 1920, 1080));
     }
 }

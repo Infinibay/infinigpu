@@ -91,7 +91,12 @@ fn loopback_seam_smoke() {
         VFIO_PCI_BAR0_REGION_INDEX,
         regs::ctrl::DEV_CAPS,
     );
-    assert_eq!(caps, regs::PHASE0_DEV_CAPS);
+    // Phase-1: the device advertises the 2D damage path (DISPLAY_ACCEL) on top of Phase-0.
+    assert_eq!(caps, regs::PHASE1_DEV_CAPS);
+    assert!(
+        caps & regs::caps::DISPLAY_ACCEL != 0,
+        "must advertise DISPLAY_ACCEL (2D damage path)"
+    );
     assert!(
         caps & regs::caps::POLL_SUBMIT != 0,
         "must advertise POLL_SUBMIT"

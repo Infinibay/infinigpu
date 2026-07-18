@@ -37,6 +37,8 @@
 #include <drm/drm_managed.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic_state_helper.h>
+#include <drm/drm_damage_helper.h>
+#include <drm/drm_rect.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
@@ -75,8 +77,12 @@
 /* wire enums (infinigpu-abi wire) */
 #define MSG_SUBMIT_CMD       0x0030u
 #define ENC_DISPLAY_SCANOUT  0x0101u
+#define ENC_DISPLAY_SCANOUT_DAMAGE 0x0102u
 #define WIRE_FMT_XRGB8888    3u  /* = wire::format::B8G8R8X8; XRGB8888 LE = [B,G,R,X] */
 #define DESC_FLAG_FENCED     0x1u
+
+/* DEV_CAPS bits (infinigpu-abi regs::caps) */
+#define CAP_DISPLAY_ACCEL    (1u << 5)  /* device accepts DISPLAY_SCANOUT_DAMAGE */
 
 struct igpu_descriptor {
 	u32 msg_type, flags, len, data_offset;
@@ -90,6 +96,14 @@ struct igpu_scanout_present {
 	u32 width, height, pitch, format;
 	u64 scanout_addr;
 };
+/* Superset of igpu_scanout_present + a trailing damage rect (dx,dy,dw,dh). The prefix is
+ * byte-identical (scanout_addr@16), so the host reads the common fields from either.
+ * Mirrors wire::ScanoutPresentDamaged; pinned by BUILD_BUG_ON in igpu_probe. */
+struct igpu_scanout_present_damaged {
+	u32 width, height, pitch, format;
+	u64 scanout_addr;
+	u32 dx, dy, dw, dh;
+};
 
 struct igpu_device {
 	struct drm_device drm;
@@ -101,6 +115,7 @@ struct igpu_device {
 	dma_addr_t ring_dma;
 	struct mutex ring_lock; /* serialises submissions (selftest vs fbcon) */
 	u64 seqno;
+	bool accel_2d;         /* device advertised CAP_DISPLAY_ACCEL → send damage rects */
 };
 
 #define to_igpu(d) container_of(d, struct igpu_device, drm)
@@ -109,12 +124,15 @@ static const u32 igpu_formats[] = { DRM_FORMAT_XRGB8888 };
 
 /* ---- device submission: hand the host one framebuffer to scan out ---- */
 
-static u32 igpu_submit_scanout(struct igpu_device *idev, dma_addr_t fb, u32 w,
-			       u32 h, u32 pitch, u32 fmt)
+/* Build a SUBMIT_CMD descriptor around an opaque `encoding` payload, ring the doorbell,
+ * and return the retired seqno. Shared by the full-frame (DISPLAY_SCANOUT) and damage
+ * (DISPLAY_SCANOUT_DAMAGE) paths, which differ only in the payload struct + encoding. */
+static u32 igpu_ring_submit(struct igpu_device *idev, u32 encoding,
+			    const void *payload, u32 payload_len)
 {
 	struct igpu_descriptor *d = idev->ring;
 	struct igpu_submit_cmd *s = idev->ring + sizeof(*d);
-	struct igpu_scanout_present *p = idev->ring + sizeof(*d) + sizeof(*s);
+	void *p = idev->ring + sizeof(*d) + sizeof(*s);
 	u32 retired;
 	u64 seq;
 
@@ -123,24 +141,20 @@ static u32 igpu_submit_scanout(struct igpu_device *idev, dma_addr_t fb, u32 w,
 
 	d->msg_type = MSG_SUBMIT_CMD;
 	d->flags = DESC_FLAG_FENCED;
-	d->len = sizeof(*p);
+	d->len = payload_len;
 	d->data_offset = sizeof(*d) + sizeof(*s);
 	d->seqno = seq;
 	d->reserved = 0;
 
 	s->ctx_id = 0;
-	s->encoding = ENC_DISPLAY_SCANOUT;
-	s->payload_len = sizeof(*p);
+	s->encoding = encoding;
+	s->payload_len = payload_len;
 	s->flags = 0;
 	s->seqno = seq;
 	s->in_fence = 0;
 	s->out_fence = seq;
 
-	p->width = w;
-	p->height = h;
-	p->pitch = pitch;
-	p->format = fmt;
-	p->scanout_addr = fb;
+	memcpy(p, payload, payload_len);
 
 	wmb(); /* ring visible before the doorbell */
 
@@ -155,6 +169,29 @@ static u32 igpu_submit_scanout(struct igpu_device *idev, dma_addr_t fb, u32 w,
 	return retired;
 }
 
+static u32 igpu_submit_scanout(struct igpu_device *idev, dma_addr_t fb, u32 w,
+			       u32 h, u32 pitch, u32 fmt)
+{
+	struct igpu_scanout_present p = {
+		.width = w, .height = h, .pitch = pitch, .format = fmt,
+		.scanout_addr = fb,
+	};
+	return igpu_ring_submit(idev, ENC_DISPLAY_SCANOUT, &p, sizeof(p));
+}
+
+/* Like igpu_submit_scanout but tells the host only (dx,dy,dw,dh) changed, so it
+ * DMA-reads/repacks just that sub-rectangle into its persistent scanout surface. */
+static u32 igpu_submit_scanout_damaged(struct igpu_device *idev, dma_addr_t fb,
+				       u32 w, u32 h, u32 pitch, u32 fmt,
+				       u32 dx, u32 dy, u32 dw, u32 dh)
+{
+	struct igpu_scanout_present_damaged p = {
+		.width = w, .height = h, .pitch = pitch, .format = fmt,
+		.scanout_addr = fb, .dx = dx, .dy = dy, .dw = dw, .dh = dh,
+	};
+	return igpu_ring_submit(idev, ENC_DISPLAY_SCANOUT_DAMAGE, &p, sizeof(p));
+}
+
 static void igpu_flush(struct igpu_device *idev, struct drm_plane_state *state)
 {
 	struct drm_framebuffer *fb = state->fb;
@@ -165,6 +202,46 @@ static void igpu_flush(struct igpu_device *idev, struct drm_plane_state *state)
 	addr = drm_fb_dma_get_gem_addr(fb, state, 0);
 	igpu_submit_scanout(idev, addr, fb->width, fb->height, fb->pitches[0],
 			    WIRE_FMT_XRGB8888);
+}
+
+/* Accelerated present: submit only the merged damage rect the compositor/fbcon attached.
+ * Falls back to a full-frame present when there is no usable damage — a framebuffer swap,
+ * a scaled plane, or the first flip after modeset (drm_atomic_helper_damage_merged returns
+ * false), which is exactly when the host's persistent surface must be fully refreshed. */
+static void igpu_flush_damaged(struct igpu_device *idev,
+			       struct drm_plane_state *old_state,
+			       struct drm_plane_state *state)
+{
+	struct drm_framebuffer *fb = state->fb;
+	struct drm_rect damage;
+	dma_addr_t addr;
+
+	if (!fb)
+		return;
+	addr = drm_fb_dma_get_gem_addr(fb, state, 0);
+
+	if (!drm_atomic_helper_damage_merged(old_state, state, &damage)) {
+		igpu_submit_scanout(idev, addr, fb->width, fb->height,
+				    fb->pitches[0], WIRE_FMT_XRGB8888);
+		return;
+	}
+
+	/* Clamp the merged box to the framebuffer (defensive; the host clamps too). */
+	if (damage.x1 < 0)
+		damage.x1 = 0;
+	if (damage.y1 < 0)
+		damage.y1 = 0;
+	if (damage.x2 > (int)fb->width)
+		damage.x2 = fb->width;
+	if (damage.y2 > (int)fb->height)
+		damage.y2 = fb->height;
+	if (damage.x2 <= damage.x1 || damage.y2 <= damage.y1)
+		return; /* zero-area after clamp: nothing changed */
+
+	igpu_submit_scanout_damaged(idev, addr, fb->width, fb->height,
+				    fb->pitches[0], WIRE_FMT_XRGB8888,
+				    damage.x1, damage.y1,
+				    damage.x2 - damage.x1, damage.y2 - damage.y1);
 }
 
 /* ---- simple display pipe ---- */
@@ -185,8 +262,12 @@ static void igpu_pipe_update(struct drm_simple_display_pipe *pipe,
 			     struct drm_plane_state *old_state)
 {
 	struct drm_crtc *crtc = &pipe->crtc;
+	struct igpu_device *idev = to_igpu(crtc->dev);
 
-	igpu_flush(to_igpu(crtc->dev), pipe->plane.state);
+	if (idev->accel_2d)
+		igpu_flush_damaged(idev, old_state, pipe->plane.state);
+	else
+		igpu_flush(idev, pipe->plane.state);
 
 	/* No hardware vblank: complete any flip event immediately. */
 	if (crtc->state->event) {
@@ -298,6 +379,9 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct igpu_descriptor) != 32);
 	BUILD_BUG_ON(sizeof(struct igpu_submit_cmd) != 40);
 	BUILD_BUG_ON(sizeof(struct igpu_scanout_present) != 24);
+	BUILD_BUG_ON(sizeof(struct igpu_scanout_present_damaged) != 40);
+	BUILD_BUG_ON(offsetof(struct igpu_scanout_present_damaged, scanout_addr) != 16);
+	BUILD_BUG_ON(offsetof(struct igpu_scanout_present_damaged, dx) != 24);
 
 	ret = pcim_enable_device(pdev);
 	if (ret)
@@ -327,6 +411,7 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return PTR_ERR(idev);
 	drm = &idev->drm;
 	idev->bar0 = bar0;
+	idev->accel_2d = !!(caps & CAP_DISPLAY_ACCEL);
 	mutex_init(&idev->ring_lock);
 	pci_set_drvdata(pdev, idev);
 
@@ -358,6 +443,13 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		return ret;
 
+	/* Expose FB_DAMAGE_CLIPS so an atomic compositor (weston/mutter) can attach damage
+	 * rects; the fbcon dirtyfb path sets damage directly on the plane state regardless.
+	 * Without this, compositors commit full-frame and the accel path degrades to full
+	 * presents — correct, just not accelerated. */
+	if (idev->accel_2d)
+		drm_plane_enable_fb_damage_clips(&idev->pipe.plane);
+
 	drm_mode_config_reset(drm);
 
 	ret = drm_dev_register(drm, 0);
@@ -370,7 +462,8 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	/* Bring up fbdev emulation → fbcon renders the console on our framebuffer. */
 	drm_client_setup(drm, NULL);
 
-	dev_info(&pdev->dev, "INFINIGPU-KMS: registered /dev/dri/card%d\n", drm->primary->index);
+	dev_info(&pdev->dev, "INFINIGPU-KMS: registered /dev/dri/card%d (2D accel %s)\n",
+		 drm->primary->index, idev->accel_2d ? "on" : "off");
 	return 0;
 }
 
