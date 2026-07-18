@@ -89,6 +89,20 @@ impl DmaTable {
         }
     }
 
+    /// Resolve `[addr, addr+len)` to a host pointer, or `None` if it isn't fully inside a single
+    /// mapping (fail-closed; never a partial/OOB pointer). The 2D-ADR PR4 ring drainer uses this to
+    /// validate a guest IOVA / resource backing **before** any host dereference, for the zero-copy
+    /// present/convert paths (vs `read`/`write`, which copy). The pointer is valid only while the
+    /// `DmaTable` is borrowed and the mapping stays mapped.
+    ///
+    /// # Safety
+    /// The returned pointer aliases shared guest memory: a hostile guest may mutate it concurrently,
+    /// so callers must treat reads as untrusted (re-validate any offsets derived from the bytes) and
+    /// must not assume exclusive access.
+    pub unsafe fn host_ptr(&self, addr: u64, len: usize) -> Option<*mut u8> {
+        self.resolve(addr, len)
+    }
+
     /// Copy `buf.len()` bytes from guest memory at `addr`. Returns false if the
     /// range is not fully mapped.
     pub fn read(&self, addr: u64, buf: &mut [u8]) -> bool {

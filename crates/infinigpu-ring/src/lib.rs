@@ -90,7 +90,15 @@ impl<T> Slot<T> {
 /// The atomic index words — the runtime, in-memory view of
 /// [`infinigpu_abi::wire::RingIndices`]. Field semantics and ownership match that
 /// struct exactly; only the representation (atomics vs. plain ints) differs.
+///
+/// `#[repr(C, align(64))]` makes the (non-loom) layout **byte-identical** to `RingIndices`
+/// (`tail@0, head@4, seqno_submit@8, seqno_retired@16, status@24`, one 64-byte cacheline), so the
+/// host can run this loom-verified SPSC protocol directly over the guest-shared sparse-mmap index
+/// page via [`Indices::from_ptr`] — no copy, no separate host mirror. (Under `--cfg loom` the
+/// fields are loom's instrumented atomics, which are not layout-compatible; `from_ptr` is therefore
+/// non-loom only, and loom tests use an owned `Indices`.)
 #[derive(Debug)]
+#[repr(C, align(64))]
 pub struct Indices {
     tail: AtomicU32,
     head: AtomicU32,
@@ -111,6 +119,35 @@ impl Indices {
         }
     }
 }
+
+#[cfg(not(loom))]
+impl Indices {
+    /// Reinterpret a shared-page pointer as the atomic index words, so the SPSC protocol runs
+    /// directly over the guest-shared index page.
+    ///
+    /// # Safety
+    /// `ptr` must point to at least 64 readable+writable bytes laid out as [`Indices`]
+    /// (== `RingIndices`), aligned to 64, valid for `'a`, and be the sole typed view (all access
+    /// goes through the returned atomics). An all-zero page is a valid, empty ring.
+    #[inline]
+    pub unsafe fn from_ptr<'a>(ptr: *const u8) -> &'a Indices {
+        &*(ptr as *const Indices)
+    }
+}
+
+// Layout pinned to the wire struct (non-loom only — loom atomics are not repr-compatible).
+#[cfg(not(loom))]
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<Indices>() == size_of::<infinigpu_abi::wire::RingIndices>());
+    assert!(size_of::<Indices>() == 64);
+    assert!(align_of::<Indices>() == 64);
+    assert!(offset_of!(Indices, tail) == 0x00);
+    assert!(offset_of!(Indices, head) == 0x04);
+    assert!(offset_of!(Indices, seqno_submit) == 0x08);
+    assert!(offset_of!(Indices, seqno_retired) == 0x10);
+    assert!(offset_of!(Indices, status) == 0x18);
+};
 
 impl Default for Indices {
     fn default() -> Self {
