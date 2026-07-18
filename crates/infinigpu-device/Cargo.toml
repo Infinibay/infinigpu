@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 infinigpu-abi = { path = "../infinigpu-abi" }
+infinigpu-ring = { path = "../infinigpu-ring" }
 infinigpu-replay = { path = "../infinigpu-replay" }
 infinigpu-sched = { path = "../infinigpu-sched" }
 infinigpu-pixel = { path = "../infinigpu-pixel" }

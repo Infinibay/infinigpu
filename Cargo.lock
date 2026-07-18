@@ -701,6 +701,7 @@ dependencies = [
  "infinigpu-nvml",
  "infinigpu-pixel",
  "infinigpu-replay",
+ "infinigpu-ring",
  "infinigpu-sched",
  "libc",
  "log",

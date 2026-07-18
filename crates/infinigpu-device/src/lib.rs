@@ -15,6 +15,7 @@
 
 mod config;
 pub mod dma;
+pub mod drain;
 pub mod resource;
 
 use dma::DmaTable;

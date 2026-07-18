@@ -88,6 +88,19 @@ the pivot that makes everything after it reusable for 3D.
   test with `dx+dw>width` / overflowing dims → rejected-or-clamped, seqno still retires, no OOB.
 
 ### PR4 — Real ring drainer + sparse-mmap index page + per-VM `ResourceTable` + fence retire **(THE 3D FOUNDATION)** *(L, ~3–3.5 wk device + ~1 wk guest)*
+
+> **Status (core landed, transport + guest hardware-gated):** the pieces that are *pure logic* are
+> built and unit-tested off-hardware — the loom-`repr(C)` `Indices`/`from_ptr` view (PR1.3,
+> `infinigpu-ring`), the fail-closed `ResourceTable` (`resource.rs`, 5 tests), `DmaTable::host_ptr`,
+> and now the **two-phase bounded drainer** (`drain.rs`: `pop_batch` + `ring_over_shared` +
+> `retire_over_shared`, 6 tests including the full push-N → pop-bounded → retire cycle over one
+> shared page — the ADR's *biggest structural risk*, the `repr(C)` viewer + the borrow split,
+> proven with owned buffers standing in for the sparse-mmap page). **Remaining (needs QEMU + guest
+> KMD):** the `build_regions(index_fd)` sparse-mmap **transport** (a vfio-user region — only
+> exercisable under QEMU), the `RESOURCE_CREATE_BLOB/ATTACH_BACKING/SET_SCANOUT_BLOB/RESOURCE_FLUSH`
+> `execute_descriptor` phase-2 dispatch wiring into `process_ring`, and the guest registering each
+> dumb FB once + flipping via `RESOURCE_FLUSH`. The PR3 CPU-patch path stays the live fallback.
+
 - `infinigpu-ring` becomes a device dep; `#[repr(C)]` on `Indices` + `Indices::from_ptr` so the
   loom-verified SPSC pop/retire/len runs over the shared page. New `index.rs`
   (memfd-backed `SharedIndexPage`, sparse-mmap'd via `build_regions(index_fd)`). New
