@@ -57,6 +57,40 @@ impl Frame {
     }
 }
 
+/// A graphics draw whose shaders + minimal pipeline state are **forwarded from the guest**
+/// (the guest ICD serialized a real app's `vkCreateShaderModule`/`vkCreateGraphicsPipelines`
+/// into the wire; see `docs/adr/GUEST-ICD-IMPLEMENTATION.md` Phase 1). The host compiles the
+/// SPIR-V with the real driver — SPIR-V is vendor-neutral, so no in-guest compile — and
+/// replays the draw on the physical GPU. This is the "narrow-faithful" subset: fixed single
+/// R8G8B8A8 color target, no vertex buffers/descriptors yet; later phases forward full state.
+pub struct ForwardedDraw<'a> {
+    /// Vertex-stage SPIR-V (as u32 words) + its entry point.
+    pub vertex_spirv: &'a [u32],
+    pub vertex_entry: &'a CStr,
+    /// Fragment-stage SPIR-V + entry point. May alias `vertex_spirv` for a combined module.
+    pub fragment_spirv: &'a [u32],
+    pub fragment_entry: &'a CStr,
+    /// Vertices for the `draw(vertex_count, 1, 0, 0)` (no vertex buffers — SM-generated).
+    pub vertex_count: u32,
+    pub topology: vk::PrimitiveTopology,
+}
+
+impl<'a> ForwardedDraw<'a> {
+    /// The built-in RGB triangle (the embedded [`shaders::TRIANGLE_SPV`], entries
+    /// `vs_main`/`fs_main`, 3 vertices, triangle-list) — used to drive the host executor
+    /// through the forwarded path with a known-good workload.
+    pub fn builtin_triangle() -> Self {
+        ForwardedDraw {
+            vertex_spirv: &shaders::TRIANGLE_SPV,
+            vertex_entry: c"vs_main",
+            fragment_spirv: &shaders::TRIANGLE_SPV,
+            fragment_entry: c"fs_main",
+            vertex_count: 3,
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+        }
+    }
+}
+
 /// A GPU render result exported as an OS file descriptor for **zero-copy** hand-off to
 /// another process/consumer (a compositor, an encoder, a peer VM's replay). The fd owns
 /// its lifetime — it is closed on drop. Preferred handle type is a Linux **dma-buf**;
@@ -834,7 +868,24 @@ impl HostGpu {
     /// but proving real SM execution (interpolated gradient), not just a fixed-function
     /// clear. Returns the read-back frame.
     pub fn render_triangle(&self, width: u32, height: u32, bg: [f32; 4]) -> R<Frame> {
-        let (frame, _) = self.render_triangle_inner(width, height, bg, false)?;
+        let (frame, _) =
+            self.render_triangle_inner(width, height, bg, &ForwardedDraw::builtin_triangle(), false)?;
+        Ok(frame)
+    }
+
+    /// Replay a **forwarded** guest draw ([`ForwardedDraw`]) on the physical GPU: compile the
+    /// forwarded SPIR-V with the real driver, build the pipeline, clear to `bg`, draw, and read
+    /// the `R8G8B8A8` result back. This is the host half of the Phase-1 own-ICD 3D path — the
+    /// guest ICD serializes a real app's shaders + draw into the wire and the host executes them
+    /// here (no fixed workload). Proven on real silicon by `render_forwarded_matches_builtin`.
+    pub fn render_forwarded(
+        &self,
+        width: u32,
+        height: u32,
+        bg: [f32; 4],
+        draw: &ForwardedDraw,
+    ) -> R<Frame> {
+        let (frame, _) = self.render_triangle_inner(width, height, bg, draw, false)?;
         Ok(frame)
     }
 
@@ -846,7 +897,13 @@ impl HostGpu {
     /// reads the frame back (host-visible copy) so the caller can verify the render.
     /// Errors if the device can't export memory ([`can_export`](Self::can_export)).
     pub fn export_triangle_dmabuf(&self, width: u32, height: u32) -> R<(Frame, DmaBufExport)> {
-        let (frame, export) = self.render_triangle_inner(width, height, [0.05, 0.05, 0.08, 1.0], true)?;
+        let (frame, export) = self.render_triangle_inner(
+            width,
+            height,
+            [0.05, 0.05, 0.08, 1.0],
+            &ForwardedDraw::builtin_triangle(),
+            true,
+        )?;
         let export = export.ok_or("device does not support external-memory fd export")?;
         Ok((frame, export))
     }
@@ -856,6 +913,7 @@ impl HostGpu {
         width: u32,
         height: u32,
         bg: [f32; 4],
+        draw: &ForwardedDraw,
         export: bool,
     ) -> R<(Frame, Option<DmaBufExport>)> {
         if export && self.external_fd.is_none() {
@@ -940,10 +998,19 @@ impl HostGpu {
             )?
         };
 
-        // ---- graphics pipeline (our SPIR-V; no vertex buffers) ----
-        let module = unsafe {
+        // ---- graphics pipeline (FORWARDED SPIR-V; no vertex buffers) ----
+        // Two modules even when both stages alias one blob (the combined builtin case) — a
+        // real app forwards separate vertex/fragment modules, and creating two from identical
+        // code is valid. The host driver compiles the vendor-neutral SPIR-V.
+        let vs_module = unsafe {
             dev.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(&shaders::TRIANGLE_SPV),
+                &vk::ShaderModuleCreateInfo::default().code(draw.vertex_spirv),
+                None,
+            )?
+        };
+        let fs_module = unsafe {
+            dev.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(draw.fragment_spirv),
                 None,
             )?
         };
@@ -953,16 +1020,16 @@ impl HostGpu {
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(module)
-                .name(c"vs_main"),
+                .module(vs_module)
+                .name(draw.vertex_entry),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(module)
-                .name(c"fs_main"),
+                .module(fs_module)
+                .name(draw.fragment_entry),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_asm = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            .topology(draw.topology);
         let viewports = [vk::Viewport {
             x: 0.0,
             y: 0.0,
@@ -1103,7 +1170,7 @@ impl HostGpu {
                 vk::SubpassContents::INLINE,
             );
             dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            dev.cmd_draw(cmd, 3, 1, 0, 0); // 3 vertices, no vertex buffer → SM execution
+            dev.cmd_draw(cmd, draw.vertex_count, 1, 0, 0); // no vertex buffer → SM execution
             dev.cmd_end_render_pass(cmd);
 
             // image is TRANSFER_SRC_OPTIMAL; copy it into the readback (and export) buffers.
@@ -1180,7 +1247,8 @@ impl HostGpu {
             dev.free_memory(rb_mem, None);
             dev.destroy_pipeline(pipeline, None);
             dev.destroy_pipeline_layout(layout, None);
-            dev.destroy_shader_module(module, None);
+            dev.destroy_shader_module(vs_module, None);
+            dev.destroy_shader_module(fs_module, None);
             dev.destroy_framebuffer(framebuffer, None);
             dev.destroy_render_pass(render_pass, None);
             dev.destroy_image_view(view, None);
@@ -1370,5 +1438,47 @@ mod tests {
         let dup = unsafe { libc::dup(export.raw_fd()) };
         assert!(dup >= 0, "exported fd not dup-able");
         unsafe { libc::close(dup) };
+    }
+
+    // Phase-1 host half: the FORWARDED-SPIR-V path must produce the same GPU render as the
+    // fixed embedded path. Drives `render_forwarded` with the built-in triangle blob (i.e. the
+    // SPIR-V arrives as a parameter, not a hardcoded const) and asserts it (a) draws a real
+    // triangle — some but not all pixels differ from the background — and (b) is byte-identical
+    // to `render_triangle`. Same inputs → deterministic rasterization → identical bytes. Proves
+    // the host compiles + runs forwarded SPIR-V, the load-bearing assumption for the guest ICD.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn render_forwarded_matches_builtin() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let (w, h): (u32, u32) = (64, 64);
+        let bg = [0.02, 0.02, 0.05, 1.0];
+        let builtin = gpu.render_triangle(w, h, bg).expect("render_triangle");
+        let forwarded = gpu
+            .render_forwarded(w, h, bg, &ForwardedDraw::builtin_triangle())
+            .expect("render_forwarded");
+
+        assert_eq!((forwarded.width, forwarded.height), (w, h));
+        // A real triangle: some pixels lit (differ from bg), but not the whole frame.
+        let bg8 = [
+            (bg[0] * 255.0).round() as u8,
+            (bg[1] * 255.0).round() as u8,
+            (bg[2] * 255.0).round() as u8,
+        ];
+        let lit = forwarded
+            .rgba
+            .chunks_exact(4)
+            .filter(|px| px[0..3] != bg8)
+            .count();
+        let total = (w * h) as usize;
+        assert!(lit > 0 && lit < total, "expected a triangle, got lit={lit}/{total}");
+        // Faithful forwarding: identical to the fixed path, byte-for-byte.
+        assert_eq!(forwarded.rgba, builtin.rgba, "forwarded render differs from builtin");
+        eprintln!("render_forwarded: lit={lit}/{total}, matches builtin");
     }
 }
