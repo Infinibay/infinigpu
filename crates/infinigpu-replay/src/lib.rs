@@ -452,6 +452,279 @@ impl HostGpu {
         })
     }
 
+    /// PR5 host-GPU present convert (2D-ADR): upload a guest framebuffer (`src_format`, `pitch`
+    /// bytes/row) to the GPU, convert it to tightly-packed **`B8G8R8A8`** via a format-converting
+    /// `vkCmdBlitImage` on the A5000, and read it back. This is the host-GPU half of the accelerated
+    /// 2D convert path — the layer the device's CPU repack (`present_scanout_damaged`) moves onto the
+    /// GPU, and the source of the dma-buf the NVENC ingest (PR7) will consume. Proven on real silicon
+    /// by `convert_present_bgra_on_gpu`. Fail-closed on a geometry that overruns `src_bytes`.
+    pub fn convert_present(
+        &self,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        src_format: vk::Format,
+        src_bytes: &[u8],
+    ) -> R<Frame> {
+        const DST: vk::Format = vk::Format::B8G8R8A8_UNORM;
+        let dev = &self.device;
+        if width == 0 || height == 0 || pitch < width.saturating_mul(4) {
+            return Err("convert_present: bad geometry".into());
+        }
+        if (pitch as u64).saturating_mul(height as u64) > src_bytes.len() as u64 {
+            return Err("convert_present: src_bytes too small for geometry".into());
+        }
+
+        // ---- staging buffer (host-visible) holding the guest bytes ----
+        let staging_size = pitch as u64 * height as u64;
+        let staging = unsafe {
+            dev.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(staging_size)
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )?
+        };
+        let st_req = unsafe { dev.get_buffer_memory_requirements(staging) };
+        let st_mem = unsafe {
+            dev.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(st_req.size)
+                    .memory_type_index(self.find_mem(
+                        st_req.memory_type_bits,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )?),
+                None,
+            )?
+        };
+        unsafe {
+            dev.bind_buffer_memory(staging, st_mem, 0)?;
+            let ptr = dev.map_memory(st_mem, 0, staging_size, vk::MemoryMapFlags::empty())? as *mut u8;
+            std::ptr::copy_nonoverlapping(src_bytes.as_ptr(), ptr, staging_size as usize);
+            dev.unmap_memory(st_mem);
+        }
+
+        // ---- src image (guest format) + dst image (BGRA), both device-local ----
+        let mk_image = |format: vk::Format| -> R<(vk::Image, vk::DeviceMemory)> {
+            let img = unsafe {
+                dev.create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(format)
+                        .extent(vk::Extent3D { width, height, depth: 1 })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )?
+            };
+            let req = unsafe { dev.get_image_memory_requirements(img) };
+            let mem = unsafe {
+                dev.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(
+                            self.find_mem(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?,
+                        ),
+                    None,
+                )?
+            };
+            unsafe { dev.bind_image_memory(img, mem, 0)? };
+            Ok((img, mem))
+        };
+        let (src_img, src_mem) = mk_image(src_format)?;
+        let (dst_img, dst_mem) = mk_image(DST)?;
+
+        // ---- tight readback buffer (host-visible) ----
+        let rb_size = width as u64 * height as u64 * 4;
+        let rb = unsafe {
+            dev.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(rb_size)
+                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )?
+        };
+        let rb_req = unsafe { dev.get_buffer_memory_requirements(rb) };
+        let rb_mem = unsafe {
+            dev.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(rb_req.size)
+                    .memory_type_index(self.find_mem(
+                        rb_req.memory_type_bits,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )?),
+                None,
+            )?
+        };
+        unsafe { dev.bind_buffer_memory(rb, rb_mem, 0)? };
+
+        // ---- record: staging→src, blit src→dst (format convert), dst→readback ----
+        let pool = unsafe {
+            dev.create_command_pool(
+                &vk::CommandPoolCreateInfo::default().queue_family_index(self.queue_family),
+                None,
+            )?
+        };
+        let cmd = unsafe {
+            dev.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0]
+        };
+        let barrier = |img: vk::Image, from: vk::ImageLayout, to: vk::ImageLayout| {
+            vk::ImageMemoryBarrier::default()
+                .old_layout(from)
+                .new_layout(to)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(img)
+                .subresource_range(color_range())
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        };
+        unsafe {
+            dev.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            // src: UNDEFINED -> TRANSFER_DST, then upload (honoring pitch via buffer_row_length).
+            let pre = [
+                barrier(src_img, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                barrier(dst_img, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+            ];
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &pre,
+            );
+            let copy = vk::BufferImageCopy::default()
+                .buffer_row_length(pitch / 4) // texels/row (BGRA/RGBA are 4 bytes)
+                .buffer_image_height(height)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+            dev.cmd_copy_buffer_to_image(
+                cmd,
+                staging,
+                src_img,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy],
+            );
+            // src -> TRANSFER_SRC for the blit.
+            let to_src = [barrier(
+                src_img,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            )];
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_src,
+            );
+            // Format-converting blit src(src_format) -> dst(B8G8R8A8): Vulkan swaps channels.
+            let sub = |()| {
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1)
+            };
+            let offsets = [
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D { x: width as i32, y: height as i32, z: 1 },
+            ];
+            let blit = vk::ImageBlit::default()
+                .src_subresource(sub(()))
+                .src_offsets(offsets)
+                .dst_subresource(sub(()))
+                .dst_offsets(offsets);
+            dev.cmd_blit_image(
+                cmd,
+                src_img,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst_img,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[blit],
+                vk::Filter::NEAREST,
+            );
+            // dst -> TRANSFER_SRC, then copy to the tight readback buffer.
+            let to_rb = [barrier(
+                dst_img,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            )];
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_rb,
+            );
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+            dev.cmd_copy_image_to_buffer(
+                cmd,
+                dst_img,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                rb,
+                &[region],
+            );
+            dev.end_command_buffer(cmd)?;
+        }
+
+        let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None)? };
+        let cmds = [cmd];
+        let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+        unsafe {
+            dev.queue_submit(self.queue, &submit, fence)?;
+            dev.wait_for_fences(&[fence], true, u64::MAX)?;
+        }
+        let rgba = unsafe {
+            let ptr = dev.map_memory(rb_mem, 0, rb_size, vk::MemoryMapFlags::empty())? as *const u8;
+            let out = std::slice::from_raw_parts(ptr, rb_size as usize).to_vec();
+            dev.unmap_memory(rb_mem);
+            out
+        };
+        unsafe {
+            dev.destroy_fence(fence, None);
+            dev.destroy_command_pool(pool, None);
+            dev.destroy_buffer(rb, None);
+            dev.free_memory(rb_mem, None);
+            dev.destroy_buffer(staging, None);
+            dev.free_memory(st_mem, None);
+            dev.destroy_image(dst_img, None);
+            dev.free_memory(dst_mem, None);
+            dev.destroy_image(src_img, None);
+            dev.free_memory(src_mem, None);
+        }
+        Ok(Frame { width, height, rgba })
+    }
+
     /// Render a **shader-executed** triangle: a graphics pipeline built from our
     /// precompiled SPIR-V (see [`shaders`]) draws 3 hardcoded, per-vertex-coloured
     /// vertices over a cleared `bg`, on the GPU's shader cores — a bare `draw(3,1,0,0)`
@@ -872,4 +1145,89 @@ fn cstr_to_string(buf: &[std::os::raw::c_char]) -> String {
 fn cstr_from_arr(buf: &[c_char]) -> &CStr {
     // SAFETY: Vulkan guarantees these fixed-size name arrays are NUL-terminated.
     unsafe { CStr::from_ptr(buf.as_ptr()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // GPU-touching; #[ignore]'d so `cargo test` stays green on hosts without a Vulkan device.
+    // Run on real silicon with: `cargo test -p infinigpu-replay -- --ignored`.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn convert_present_bgra_on_gpu() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        // A guest scanout delivered as R8G8B8A8 with a padded stride: 4 px wide, 3 rows,
+        // pitch = 24 bytes (6 texels) — 2 texels of row padding the convert must skip.
+        let (w, h): (u32, u32) = (4, 3);
+        let pitch = 24u32; // 6 texels/row
+        let mut src = vec![0u8; (pitch * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * pitch + x * 4) as usize;
+                src[o] = (x * 60 + 5) as u8; // R
+                src[o + 1] = (y * 80 + 7) as u8; // G
+                src[o + 2] = (x * 20 + y * 3 + 11) as u8; // B
+                src[o + 3] = 0xF0; // A
+            }
+        }
+        let frame = gpu
+            .convert_present(w, h, pitch, vk::Format::R8G8B8A8_UNORM, &src)
+            .expect("convert_present");
+        assert_eq!((frame.width, frame.height), (w, h));
+        assert_eq!(frame.rgba.len(), (w * h * 4) as usize);
+        // The GPU blit R8G8B8A8 -> B8G8R8A8 swaps R and B in memory; output is tightly packed.
+        for y in 0..h {
+            for x in 0..w {
+                let si = (y * pitch + x * 4) as usize;
+                let di = ((y * w + x) * 4) as usize;
+                assert_eq!(frame.rgba[di], src[si + 2], "B slot @({x},{y})"); // dst.B = src.B
+                assert_eq!(frame.rgba[di + 1], src[si + 1], "G slot @({x},{y})"); // dst.G = src.G
+                assert_eq!(frame.rgba[di + 2], src[si], "R slot @({x},{y})"); // dst.R = src.R
+                assert_eq!(frame.rgba[di + 3], src[si + 3], "A slot @({x},{y})"); // dst.A = src.A
+            }
+        }
+    }
+
+    // A same-format convert (R8G8B8A8 -> ... via BGRA -> compare against a manual swap) also proves
+    // the pitch/stride handling: the padded input rows must not leak into the tight output.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn convert_present_strips_row_padding() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let (w, h): (u32, u32) = (2, 2);
+        let pitch = 16u32; // 4 texels/row: 2 real + 2 padding
+        let mut src = vec![0xAAu8; (pitch * h) as usize]; // padding = 0xAA everywhere
+        // real pixels
+        let px = [[1u8, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]];
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * pitch + x * 4) as usize;
+                src[o..o + 4].copy_from_slice(&px[(y * w + x) as usize]);
+            }
+        }
+        let frame = gpu
+            .convert_present(w, h, pitch, vk::Format::R8G8B8A8_UNORM, &src)
+            .expect("convert_present");
+        // No 0xAA padding byte should survive into the tight output.
+        for (i, p) in px.iter().enumerate() {
+            let di = i * 4;
+            assert_eq!(frame.rgba[di], p[2]); // B
+            assert_eq!(frame.rgba[di + 1], p[1]); // G
+            assert_eq!(frame.rgba[di + 2], p[0]); // R
+            assert_eq!(frame.rgba[di + 3], p[3]); // A
+        }
+    }
 }
