@@ -29,6 +29,15 @@ _Static_assert(offsetof(struct ScanoutPresentDamaged, scanout_addr) == 16, "Scan
 _Static_assert(offsetof(struct ScanoutPresentDamaged, dx) == 24, "ScanoutPresentDamaged.dx offset");
 _Static_assert(offsetof(struct ScanoutPresentDamaged, dh) == 36, "ScanoutPresentDamaged.dh offset");
 
+/* CursorUpdate: 48 bytes, padding-free — the cursor-plane sideband body (ABI 0.3). */
+_Static_assert(sizeof(struct CursorUpdate) == 48, "CursorUpdate size");
+_Static_assert(offsetof(struct CursorUpdate, pos_x) == 8, "CursorUpdate.pos_x offset");
+_Static_assert(offsetof(struct CursorUpdate, hot_x) == 16, "CursorUpdate.hot_x offset");
+_Static_assert(offsetof(struct CursorUpdate, pitch) == 24, "CursorUpdate.pitch offset");
+_Static_assert(offsetof(struct CursorUpdate, format) == 28, "CursorUpdate.format offset");
+_Static_assert(offsetof(struct CursorUpdate, shape_ref) == 32, "CursorUpdate.shape_ref offset");
+_Static_assert(offsetof(struct CursorUpdate, _reserved) == 40, "CursorUpdate._reserved offset");
+
 _Static_assert(sizeof(struct ResourceCreateBlob) == 24, "ResourceCreateBlob size");
 _Static_assert(sizeof(struct SetScanoutBlob) == 24, "SetScanoutBlob size");
 _Static_assert(sizeof(struct ResourceFlush) == 24, "ResourceFlush size");

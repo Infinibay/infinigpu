@@ -271,3 +271,69 @@ struct ScanoutPresentDamaged {
    */
   uint32_t dh;
 };
+
+/**
+ * `CURSOR_UPDATE` (`msg_type::CURSOR_UPDATE = 0x0042`) body — the guest reports its cursor plane
+ * out-of-band so the cursor leaves the primary framebuffer (see
+ * `docs/adr/CLIENT-PLANE-COMPOSITOR.md`). The device forwards it to a client-side overlay (the
+ * zero-lag path) or composites it host-side (deferred fallback). Position/hotspot are carried for
+ * the fallback, for view-only viewers in the multi-client case, and for `WARP` correction — even
+ * though a driving client-composite viewer normally draws at its own local pointer. Additive
+ * (ABI 0.3); a peer that doesn't negotiate `caps::CURSOR_PLANE` never sends or receives it.
+ *
+ * The decoder reads it with the `min(payload_len, size_of)` zero-filled rule (ADR-0004), so a
+ * future field carved out of `_reserved` never breaks an older host.
+ */
+struct CursorUpdate {
+  /**
+   * Which head (`MAX_SCANOUTS == 1` today; cheap future-proofing for multi-head).
+   */
+  uint32_t scanout_id;
+  /**
+   * [`cursor_flags`] bits.
+   */
+  uint32_t flags;
+  /**
+   * Cursor origin x (`crtc_x`) — **signed**: the hotspot pushes the origin negative at a screen
+   * edge, which a `u32` would silently drop.
+   */
+  int32_t pos_x;
+  /**
+   * Cursor origin y (`crtc_y`).
+   */
+  int32_t pos_y;
+  /**
+   * Hotspot x within the sprite.
+   */
+  uint16_t hot_x;
+  /**
+   * Hotspot y within the sprite.
+   */
+  uint16_t hot_y;
+  /**
+   * Sprite width in pixels (`0` when `MOVE_ONLY` / hidden).
+   */
+  uint16_t width;
+  /**
+   * Sprite height in pixels.
+   */
+  uint16_t height;
+  /**
+   * Sprite bytes per row (validated `>= width*4`).
+   */
+  uint32_t pitch;
+  /**
+   * [`format`] tag; the DRM cursor default is premultiplied ARGB8888 = [`format::B8G8R8A8`]
+   * (the device accepts only this and fails closed otherwise).
+   */
+  uint32_t format;
+  /**
+   * Guest-physical address of the ARGB sprite, or a `ResourceTable` res_id when
+   * [`cursor_flags::SHAPE_BY_RESID`] is set.
+   */
+  uint64_t shape_ref;
+  /**
+   * Additive headroom (0 today).
+   */
+  uint64_t _reserved;
+};

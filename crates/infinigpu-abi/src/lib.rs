@@ -68,6 +68,15 @@ mod layout_asserts {
     const _: () = assert!(offset_of!(ScanoutPresentDamaged, scanout_addr) == 16);
     const _: () = assert!(offset_of!(ScanoutPresentDamaged, dx) == 24);
     const _: () = assert!(offset_of!(ScanoutPresentDamaged, dh) == 36);
+    // CursorUpdate: 48-byte, padding-free (pos_x signed@8, hot_x@16, pitch@24, format@28,
+    // shape_ref u64@32, _reserved@40). Frozen now so device/viewer build against a stable body.
+    const _: () = assert!(size_of::<CursorUpdate>() == 48);
+    const _: () = assert!(offset_of!(CursorUpdate, pos_x) == 8);
+    const _: () = assert!(offset_of!(CursorUpdate, hot_x) == 16);
+    const _: () = assert!(offset_of!(CursorUpdate, pitch) == 24);
+    const _: () = assert!(offset_of!(CursorUpdate, format) == 28);
+    const _: () = assert!(offset_of!(CursorUpdate, shape_ref) == 32);
+    const _: () = assert!(offset_of!(CursorUpdate, _reserved) == 40);
 }
 
 #[cfg(test)]
@@ -88,7 +97,7 @@ mod tests {
             abi_version(),
             (u32::from(ABI_MAJOR) << 16) | u32::from(ABI_MINOR)
         );
-        assert_eq!(abi_version(), 0x0000_0002);
+        assert_eq!(abi_version(), 0x0000_0003);
     }
 
     #[test]

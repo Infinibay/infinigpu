@@ -58,6 +58,46 @@ pub mod proto {
         /// start decoding here.
         pub const KEYFRAME: u8 = 1 << 0;
     }
+
+    /// The **plane sideband** protocol (see `docs/adr/CLIENT-PLANE-COMPOSITOR.md`). A typed
+    /// op-family multiplexed onto the same WebSocket as video frames. A message whose first four
+    /// bytes are [`plane::MAGIC`] (`"XIPL"`, distinct from the video [`MAGIC`] `"XIPI"`) is routed
+    /// to the plane handler; an un-updated client's [`super::FrameHeader::parse`] returns `None` on
+    /// the mismatched magic and safely drops it — sideband bytes never reach the video decoder. The
+    /// cursor is the first [`plane::kind`]; a future media region reuses the same header verbatim.
+    pub mod plane {
+        /// Plane-sideband header magic, read little-endian (`"XIPL"` bytes).
+        pub const MAGIC: u32 = 0x4C50_4958;
+        /// Header size in bytes; the op body (ARGB sprite / bitstream chunk) follows immediately.
+        pub const HEADER_LEN: usize = 36;
+        pub const VERSION: u8 = 1;
+
+        /// Plane op ([`super::super::PlaneHeader::op`]).
+        pub mod op {
+            /// Shape + dims + body (a cursor sprite / a media keyframe region).
+            pub const DEFINE: u8 = 1;
+            /// Header only — a fresh server position and/or visibility change.
+            pub const MOVE: u8 = 2;
+            /// A media bitstream chunk (the `VIDEO` plane kind).
+            pub const DATA: u8 = 3;
+            /// Header only — tear the plane down.
+            pub const DESTROY: u8 = 4;
+        }
+        /// Plane kind ([`super::super::PlaneHeader::plane_kind`]).
+        pub mod kind {
+            pub const CURSOR: u8 = 1;
+            pub const VIDEO: u8 = 2;
+        }
+        /// Sideband flag bits — a **repacked subset** of `infinigpu_abi::wire::cursor_flags`
+        /// (the `op` field already carries move-vs-define, and the device resolves the shape before
+        /// forwarding, so `MOVE_ONLY`/`SHAPE_BY_RESID` are not on the wire here).
+        pub mod flags {
+            pub const VISIBLE: u8 = 1 << 0;
+            pub const PREMULTIPLIED: u8 = 1 << 1;
+            pub const WARP: u8 = 1 << 2;
+            pub const RELATIVE: u8 = 1 << 3;
+        }
+    }
 }
 
 /// Which codec a stream carries.
@@ -193,6 +233,107 @@ impl FrameHeader {
     /// decoding here.
     pub fn is_keyframe(&self) -> bool {
         self.flags & proto::flags::KEYFRAME != 0
+    }
+}
+
+/// The plane-sideband header (see [`proto::plane`]). Little-endian, 36 bytes, mirrored in the JS
+/// client; the op body (a cursor's ARGB sprite on `DEFINE`, a media chunk on `DATA`, nothing on
+/// `MOVE`/`DESTROY`) follows immediately.
+///
+/// ```text
+///  off size field
+///   0   4   magic ("XIPL", LE u32)
+///   4   1   version
+///   5   1   op          (DEFINE=1 | MOVE=2 | DATA=3 | DESTROY=4)
+///   6   1   plane_kind  (CURSOR=1 | VIDEO=2)
+///   7   1   flags       (bit0 VISIBLE | bit1 PREMULTIPLIED | bit2 WARP | bit3 RELATIVE)
+///   8   4   plane_id (LE u32; 0 reserved = cursor)
+///  12   1   codec_or_format (cursor: pixel format; video: codec id)
+///  13   1   z_order
+///  14   2   (pad)
+///  16   2   width  (LE u16) — shape/region dims on DEFINE, else 0
+///  18   2   height (LE u16)
+///  20   2   hot_x  (LE u16) — cursor hotspot
+///  22   2   hot_y  (LE u16)
+///  24   4   pos_x  (LE i32) — authoritative server position, guest space
+///  28   4   pos_y  (LE i32)
+///  32   4   payload_len (LE u32)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaneHeader {
+    pub op: u8,
+    pub plane_kind: u8,
+    pub flags: u8,
+    pub plane_id: u32,
+    pub codec_or_format: u8,
+    pub z_order: u8,
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub pos_x: i32,
+    pub pos_y: i32,
+    pub payload_len: u32,
+}
+
+impl PlaneHeader {
+    /// Serialize into a fresh 36-byte buffer.
+    pub fn to_bytes(&self) -> [u8; proto::plane::HEADER_LEN] {
+        let mut b = [0u8; proto::plane::HEADER_LEN];
+        b[0..4].copy_from_slice(&proto::plane::MAGIC.to_le_bytes());
+        b[4] = proto::plane::VERSION;
+        b[5] = self.op;
+        b[6] = self.plane_kind;
+        b[7] = self.flags;
+        b[8..12].copy_from_slice(&self.plane_id.to_le_bytes());
+        b[12] = self.codec_or_format;
+        b[13] = self.z_order;
+        b[16..18].copy_from_slice(&self.width.to_le_bytes());
+        b[18..20].copy_from_slice(&self.height.to_le_bytes());
+        b[20..22].copy_from_slice(&self.hot_x.to_le_bytes());
+        b[22..24].copy_from_slice(&self.hot_y.to_le_bytes());
+        b[24..28].copy_from_slice(&self.pos_x.to_le_bytes());
+        b[28..32].copy_from_slice(&self.pos_y.to_le_bytes());
+        b[32..36].copy_from_slice(&self.payload_len.to_le_bytes());
+        b
+    }
+
+    /// Build a full wire message: header followed by the op body (empty for `MOVE`/`DESTROY`).
+    pub fn message(&self, body: &[u8]) -> Vec<u8> {
+        let mut m = Vec::with_capacity(proto::plane::HEADER_LEN + body.len());
+        m.extend_from_slice(&self.to_bytes());
+        m.extend_from_slice(body);
+        m
+    }
+
+    /// Parse from the first [`proto::plane::HEADER_LEN`] bytes of a wire message — the client half
+    /// of the same contract [`to_bytes`](Self::to_bytes) writes. Returns `None` if the buffer is too
+    /// short or the magic isn't [`proto::plane::MAGIC`] (so a video frame is never misread as a plane).
+    pub fn parse(buf: &[u8]) -> Option<PlaneHeader> {
+        if buf.len() < proto::plane::HEADER_LEN {
+            return None;
+        }
+        let u32le = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        let i32le = |o: usize| i32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        let u16le = |o: usize| u16::from_le_bytes([buf[o], buf[o + 1]]);
+        if u32le(0) != proto::plane::MAGIC {
+            return None;
+        }
+        Some(PlaneHeader {
+            op: buf[5],
+            plane_kind: buf[6],
+            flags: buf[7],
+            plane_id: u32le(8),
+            codec_or_format: buf[12],
+            z_order: buf[13],
+            width: u16le(16),
+            height: u16le(18),
+            hot_x: u16le(20),
+            hot_y: u16le(22),
+            pos_x: i32le(24),
+            pos_y: i32le(28),
+            payload_len: u32le(32),
+        })
     }
 }
 
@@ -1436,6 +1577,74 @@ mod tests {
         // Bad magic / short buffer → None.
         assert!(FrameHeader::parse(&[0u8; proto::HEADER_LEN]).is_none());
         assert!(FrameHeader::parse(&b[..10]).is_none());
+    }
+
+    #[test]
+    fn plane_header_round_trips_little_endian() {
+        let h = PlaneHeader {
+            op: proto::plane::op::DEFINE,
+            plane_kind: proto::plane::kind::CURSOR,
+            flags: proto::plane::flags::VISIBLE | proto::plane::flags::PREMULTIPLIED,
+            plane_id: 0,
+            codec_or_format: 1,
+            z_order: 7,
+            width: 32,
+            height: 48,
+            hot_x: 4,
+            hot_y: 5,
+            pos_x: -12, // signed: cursor origin goes negative at a screen edge
+            pos_y: 300,
+            payload_len: 32 * 48 * 4,
+        };
+        let b = h.to_bytes();
+        assert_eq!(b.len(), proto::plane::HEADER_LEN);
+        assert_eq!(u32::from_le_bytes([b[0], b[1], b[2], b[3]]), proto::plane::MAGIC);
+        assert_eq!(b[4], proto::plane::VERSION);
+
+        let p = PlaneHeader::parse(&b).expect("parse a valid plane header");
+        assert_eq!(p, h);
+        assert_eq!(p.pos_x, -12);
+        // Too-short / wrong-magic → None.
+        assert!(PlaneHeader::parse(&b[..20]).is_none());
+        assert!(PlaneHeader::parse(&[0u8; proto::plane::HEADER_LEN]).is_none());
+    }
+
+    #[test]
+    fn video_and_plane_magics_never_cross_parse() {
+        // The lockstep-demux invariant (ADR risk #1): an old client must NEVER feed a plane
+        // message to the video decoder, and a plane-aware client must NEVER feed a video frame
+        // to the plane handler. The distinct magics guarantee each parser rejects the other's wire.
+        let video = FrameHeader {
+            flags: proto::flags::KEYFRAME,
+            codec: proto::codec::H264,
+            frame_seq: 1,
+            width: 640,
+            height: 480,
+            pts_us: 0,
+            payload_len: 0,
+        }
+        .to_bytes();
+        let plane = PlaneHeader {
+            op: proto::plane::op::MOVE,
+            plane_kind: proto::plane::kind::CURSOR,
+            flags: proto::plane::flags::VISIBLE,
+            plane_id: 0,
+            codec_or_format: 0,
+            z_order: 0,
+            width: 0,
+            height: 0,
+            hot_x: 0,
+            hot_y: 0,
+            pos_x: 10,
+            pos_y: 20,
+            payload_len: 0,
+        }
+        .to_bytes();
+        assert_ne!(proto::MAGIC, proto::plane::MAGIC);
+        // A plane message is dropped by the video parser…
+        assert!(FrameHeader::parse(&plane).is_none());
+        // …and a video frame is dropped by the plane parser.
+        assert!(PlaneHeader::parse(&video).is_none());
     }
 
     #[test]

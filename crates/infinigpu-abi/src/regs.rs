@@ -109,6 +109,12 @@ pub mod caps {
     /// to full-frame `DISPLAY_SCANOUT` when it is clear — so an old device, or this device
     /// on a host without GPU acceleration, keeps working.
     pub const DISPLAY_ACCEL: u32 = 1 << 5;
+    /// The cursor is off the primary plane: the guest builds a DRM cursor plane and emits
+    /// `CURSOR_UPDATE` instead of blitting the cursor into the framebuffer. **Composite-neutral** —
+    /// whether the device forwards the cursor to a client-side overlay (zero-lag) or composites it
+    /// host-side is chosen on the device build + the device↔viewer sideband, not by this bit. Clear
+    /// = today's software-cursor-in-framebuffer path. See `docs/adr/CLIENT-PLANE-COMPOSITOR.md`.
+    pub const CURSOR_PLANE: u32 = 1 << 6;
 }
 
 /// `GLOBAL_CTRL` (`0x0020`) bits.
@@ -137,3 +143,8 @@ pub const PHASE0_DEV_CAPS: u32 = caps::POLL_SUBMIT | caps::SEQNO64 | caps::MULTI
 /// The `DEV_CAPS` a Phase-1 (2D-accelerated) device advertises: Phase-0 plus the
 /// damage-carrying present path ([`caps::DISPLAY_ACCEL`]).
 pub const PHASE1_DEV_CAPS: u32 = PHASE0_DEV_CAPS | caps::DISPLAY_ACCEL;
+
+/// The `DEV_CAPS` a Phase-2 device advertises: Phase-1 plus the off-primary cursor plane
+/// ([`caps::CURSOR_PLANE`]) that feeds the client-side cursor overlay. Orthogonal to
+/// `DISPLAY_ACCEL` — each bit is gated independently and fails safe to today's path when clear.
+pub const PHASE2_DEV_CAPS: u32 = PHASE1_DEV_CAPS | caps::CURSOR_PLANE;

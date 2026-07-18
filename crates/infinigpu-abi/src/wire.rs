@@ -35,6 +35,11 @@ pub mod msg_type {
     pub const SET_SCANOUT_BLOB: u32 = 0x0040;
     pub const RESOURCE_FLUSH: u32 = 0x0041;
     pub const CURSOR_UPDATE: u32 = 0x0042;
+    /// Reserved (body unfrozen) for the future media-redirection plane
+    /// (`docs/adr/CLIENT-PLANE-COMPOSITOR.md` — forward a guest video sub-region's original
+    /// bitstream to a client decode-into-overlay). Reserving the opcode now is additive and
+    /// costless; it prevents a later ABI-minor collision. "Reserve early, freeze late."
+    pub const MEDIA_REGION: u32 = 0x0043;
     // Control / async (host -> guest)
     pub const RESET: u32 = 0x0050;
     pub const EVENT: u32 = 0x0051;
@@ -93,6 +98,27 @@ pub mod format {
     pub const B8G8R8A8: u32 = 1;
     pub const R8G8B8A8: u32 = 2;
     pub const B8G8R8X8: u32 = 3;
+}
+
+/// [`CursorUpdate::flags`] bits (see `docs/adr/CLIENT-PLANE-COMPOSITOR.md` D2). All bits are
+/// frozen now — the runtime for `WARP`/`RELATIVE` is deferred, but reserving the bits is free and
+/// forecloses an expensive body re-freeze later.
+pub mod cursor_flags {
+    /// Clear = **hide** the cursor (text caret, plane HW→SW handoff, relative-lock). Set = visible.
+    pub const VISIBLE: u32 = 1 << 0;
+    /// Only `pos_*` is fresh; retain the last-defined shape (a pure move).
+    pub const MOVE_ONLY: u32 = 1 << 1;
+    /// `shape_ref` is a `ResourceTable` res_id (post-PR4); clear = a guest-physical address.
+    pub const SHAPE_BY_RESID: u32 = 1 << 2;
+    /// The sprite's alpha is premultiplied (the DRM cursor default) — the viewer blends
+    /// `ONE / ONE_MINUS_SRC_ALPHA`; clear = straight alpha.
+    pub const PREMULTIPLIED: u32 = 1 << 3;
+    /// `pos_*` is an authoritative **teleport**: a driving client-composite viewer must snap its
+    /// local pointer notion to it (guest-initiated warp / recenter), not ignore it as routine move.
+    pub const WARP: u32 = 1 << 4;
+    /// The guest entered pointer-lock / relative mode: the overlay hides and the viewer grabs the
+    /// pointer, sending relative deltas. Runtime deferred (PR-C7); the bit is frozen now.
+    pub const RELATIVE: u32 = 1 << 5;
 }
 
 /// [`Descriptor::flags`] bits.
@@ -334,4 +360,46 @@ pub struct ScanoutPresentDamaged {
     pub dw: u32,
     /// Damage rect height.
     pub dh: u32,
+}
+
+/// `CURSOR_UPDATE` (`msg_type::CURSOR_UPDATE = 0x0042`) body — the guest reports its cursor plane
+/// out-of-band so the cursor leaves the primary framebuffer (see
+/// `docs/adr/CLIENT-PLANE-COMPOSITOR.md`). The device forwards it to a client-side overlay (the
+/// zero-lag path) or composites it host-side (deferred fallback). Position/hotspot are carried for
+/// the fallback, for view-only viewers in the multi-client case, and for `WARP` correction — even
+/// though a driving client-composite viewer normally draws at its own local pointer. Additive
+/// (ABI 0.3); a peer that doesn't negotiate `caps::CURSOR_PLANE` never sends or receives it.
+///
+/// The decoder reads it with the `min(payload_len, size_of)` zero-filled rule (ADR-0004), so a
+/// future field carved out of `_reserved` never breaks an older host.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct CursorUpdate {
+    /// Which head (`MAX_SCANOUTS == 1` today; cheap future-proofing for multi-head).
+    pub scanout_id: u32,
+    /// [`cursor_flags`] bits.
+    pub flags: u32,
+    /// Cursor origin x (`crtc_x`) — **signed**: the hotspot pushes the origin negative at a screen
+    /// edge, which a `u32` would silently drop.
+    pub pos_x: i32,
+    /// Cursor origin y (`crtc_y`).
+    pub pos_y: i32,
+    /// Hotspot x within the sprite.
+    pub hot_x: u16,
+    /// Hotspot y within the sprite.
+    pub hot_y: u16,
+    /// Sprite width in pixels (`0` when `MOVE_ONLY` / hidden).
+    pub width: u16,
+    /// Sprite height in pixels.
+    pub height: u16,
+    /// Sprite bytes per row (validated `>= width*4`).
+    pub pitch: u32,
+    /// [`format`] tag; the DRM cursor default is premultiplied ARGB8888 = [`format::B8G8R8A8`]
+    /// (the device accepts only this and fails closed otherwise).
+    pub format: u32,
+    /// Guest-physical address of the ARGB sprite, or a `ResourceTable` res_id when
+    /// [`cursor_flags::SHAPE_BY_RESID`] is set.
+    pub shape_ref: u64,
+    /// Additive headroom (0 today).
+    pub _reserved: u64,
 }
