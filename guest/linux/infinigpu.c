@@ -35,6 +35,11 @@
 #include <drm/drm_drv.h>
 #include <drm/drm_device.h>
 #include <drm/drm_managed.h>
+#include <drm/drm_ioctl.h>
+#include <drm/drm_file.h>
+#include <drm/drm_gem.h>
+
+#include "infinigpu_drm.h"   /* render-node uAPI (guest/include, -I via the Makefile) */
 #include <linux/version.h>
 
 #include <drm/drm_atomic.h>
@@ -92,6 +97,10 @@
 #define MSG_RESOURCE_FLUSH         0x0041u
 #define ENC_DISPLAY_SCANOUT  0x0101u
 #define ENC_DISPLAY_SCANOUT_DAMAGE 0x0102u
+#define ENC_VULKAN_VENUSLIKE 1u   /* 3D own-remoting submit (host replays on the GPU) */
+/* vk_op (infinigpu-abi wire::vk_op) — the hand-rolled Vulkan workload the host replays. */
+#define VK_OP_CLEAR    0u
+#define VK_OP_TRIANGLE 1u
 #define WIRE_FMT_XRGB8888    3u  /* = wire::format::B8G8R8X8; XRGB8888 LE = [B,G,R,X] */
 #define WIRE_FMT_B8G8R8A8    1u  /* = wire::format::B8G8R8A8; the DRM ARGB8888 cursor byte order */
 #define DESC_FLAG_FENCED     0x1u
@@ -113,6 +122,13 @@ struct igpu_descriptor {
 struct igpu_submit_cmd {
 	u32 ctx_id, encoding, payload_len, flags;
 	u64 seqno, in_fence, out_fence;
+};
+/* Mirrors wire::VulkanWorkload (40B) — the VULKAN_VENUSLIKE SUBMIT_CMD body. `bg` is 4×f32 bits
+ * (u32 here so the kernel never touches the FPU; the host reinterprets them as f32). */
+struct igpu_vulkan_workload {
+	u32 op, width, height, _pad;
+	u32 bg[4];
+	u64 scanout_addr;
 };
 struct igpu_scanout_present {
 	u32 width, height, pitch, format;
@@ -171,7 +187,9 @@ struct igpu_resource_flush {
 /* Real-ring geometry: a power-of-two descriptor ring with a per-slot payload region, all in one
  * coherent buffer laid out [descriptors: CAP*32][payloads: CAP*IGPU_RING2_PSTRIDE]. */
 #define IGPU_RING2_CAP     16u   /* descriptor slots (pow2) */
-#define IGPU_RING2_PSTRIDE 64u   /* per-slot payload bytes (largest body is 48B) */
+/* per-slot payload bytes. Largest body is a SUBMIT_CMD (40B header + a 40B VulkanWorkload = 80B for
+ * the 3D render-node path); the RESOURCE_* bodies are ≤48B. 128 covers it with headroom. */
+#define IGPU_RING2_PSTRIDE 128u
 #define IGPU_FBCACHE       4     /* framebuffer->res_id registrations kept live */
 
 /* PR4 real ring-drainer path is off by default (bring-up gate): the tested-and-shipped default is
@@ -371,6 +389,86 @@ static u32 igpu_ring2_push(struct igpu_device *idev, u32 msg_type,
 
 	iowrite32(1, idev->bar0 + REG_DOORBELL_CMD0);
 	return (u32)smp_load_acquire(&idx->seqno_retired);
+}
+
+/* 3D render-node submit: wrap a VulkanWorkload as a SUBMIT_CMD{VULKAN_VENUSLIKE} on the command
+ * ring so the host replays it on the physical GPU. The vfio-user doorbell write is synchronous
+ * (the host has drained the ring by the time igpu_ring2_push returns), so the retire poll below
+ * almost always sees completion immediately; it's a bounded belt-and-suspenders wait. Returns 0 on
+ * completion, -EBUSY if the ring is full, -ETIMEDOUT if the host never retired. */
+static int igpu_submit_3d(struct igpu_device *idev, const struct igpu_vulkan_workload *wl)
+{
+	u8 buf[sizeof(struct igpu_submit_cmd) + sizeof(struct igpu_vulkan_workload)];
+	struct igpu_submit_cmd sc = {
+		.ctx_id = 0,
+		.encoding = ENC_VULKAN_VENUSLIKE,
+		.payload_len = sizeof(*wl),
+	};
+	u64 want;
+	int i;
+
+	memcpy(buf, &sc, sizeof(sc));
+	memcpy(buf + sizeof(sc), wl, sizeof(*wl));
+
+	mutex_lock(&idev->ring_lock);
+	if (!igpu_ring2_push(idev, MSG_SUBMIT_CMD, buf, sizeof(buf))) {
+		mutex_unlock(&idev->ring_lock);
+		return -EBUSY;   /* ring full — a real ICD would back-pressure/retry */
+	}
+	want = idev->ring2_idx->seqno_submit;   /* the seqno igpu_ring2_push just published */
+	mutex_unlock(&idev->ring_lock);
+
+	for (i = 0; i < 1000; i++) {
+		if (smp_load_acquire(&idev->ring2_idx->seqno_retired) >= want)
+			return 0;
+		udelay(10);
+	}
+	return -ETIMEDOUT;
+}
+
+/* DRM_IOCTL_INFINIGPU_SUBMIT3D: the render-node entrypoint. Replay one hand-rolled Vulkan workload
+ * on the host GPU and receive the R8G8B8A8 result into the caller's GEM buffer. This is the guest
+ * side of the own-remoting 3D datapath — a thin ICD (or the test submitter) drives it; the host's
+ * submit_vulkan executes it on the physical GPU and DMA-writes the pixels back to bo's dma_addr. */
+static int igpu_ioctl_submit3d(struct drm_device *dev, void *data, struct drm_file *file)
+{
+	struct igpu_device *idev = to_igpu(dev);
+	struct drm_infinigpu_submit3d *args = data;
+	struct drm_gem_object *obj;
+	struct drm_gem_dma_object *dma_obj;
+	struct igpu_vulkan_workload wl;
+	u64 need;
+	int ret;
+
+	if (!idev->ring_drainer)
+		return -ENODEV;   /* 3D submit rides the real command ring (infinigpu.ring_drainer=1) */
+	if (args->op > VK_OP_TRIANGLE)
+		return -EINVAL;
+	if (args->width == 0 || args->height == 0 ||
+	    args->width > 16384 || args->height > 16384)
+		return -EINVAL;
+
+	need = (u64)args->width * args->height * 4;
+
+	obj = drm_gem_object_lookup(file, args->bo_handle);
+	if (!obj)
+		return -ENOENT;
+	if (obj->size < need) {
+		drm_gem_object_put(obj);
+		return -EINVAL;   /* result buffer too small for the requested geometry */
+	}
+	dma_obj = to_drm_gem_dma_obj(obj);
+
+	memset(&wl, 0, sizeof(wl));
+	wl.op = args->op;
+	wl.width = args->width;
+	wl.height = args->height;
+	memcpy(wl.bg, args->bg, sizeof(wl.bg));   /* opaque f32 bits — passed straight through */
+	wl.scanout_addr = dma_obj->dma_addr;      /* host DMA-writes the render here */
+
+	ret = igpu_submit_3d(idev, &wl);
+	drm_gem_object_put(obj);
+	return ret;
 }
 
 /* Register `fb`'s backing as a host blob (CREATE_BLOB + ATTACH_BACKING + SET_SCANOUT_BLOB) once,
@@ -784,9 +882,18 @@ static const struct drm_mode_config_funcs igpu_mode_config_funcs = {
 
 DEFINE_DRM_GEM_DMA_FOPS(igpu_fops);
 
+/* Render-node ioctls (DRIVER_RENDER). SUBMIT3D replays a Vulkan workload on the host GPU — the
+ * guest half of the own-remoting 3D datapath. DRM_RENDER_ALLOW lets an unprivileged render-node
+ * client (/dev/dri/renderD128) call it, not just the card node's DRM master. */
+static const struct drm_ioctl_desc igpu_ioctls[] = {
+	DRM_IOCTL_DEF_DRV(INFINIGPU_SUBMIT3D, igpu_ioctl_submit3d, DRM_RENDER_ALLOW),
+};
+
 static const struct drm_driver igpu_drm_driver = {
-	.driver_features = DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM,
+	.driver_features = DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_GEM | DRIVER_RENDER,
 	.fops = &igpu_fops,
+	.ioctls = igpu_ioctls,
+	.num_ioctls = ARRAY_SIZE(igpu_ioctls),
 	DRM_GEM_DMA_DRIVER_OPS,
 	DRM_FBDEV_DMA_DRIVER_OPS,
 	.name = "infinigpu",
@@ -857,6 +964,10 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct igpu_mem_entry) != 16);
 	BUILD_BUG_ON(sizeof(struct igpu_set_scanout_blob) != 24);
 	BUILD_BUG_ON(sizeof(struct igpu_resource_flush) != 24);
+	BUILD_BUG_ON(sizeof(struct igpu_vulkan_workload) != 40);
+	BUILD_BUG_ON(offsetof(struct igpu_vulkan_workload, scanout_addr) != 32);
+	/* The 3D SUBMIT_CMD body (header + workload) must fit one ring payload slot. */
+	BUILD_BUG_ON(sizeof(struct igpu_submit_cmd) + sizeof(struct igpu_vulkan_workload) > IGPU_RING2_PSTRIDE);
 	BUILD_BUG_ON((IGPU_RING2_CAP & (IGPU_RING2_CAP - 1)) != 0); /* power of two */
 
 	ret = pcim_enable_device(pdev);
