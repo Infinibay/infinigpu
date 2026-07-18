@@ -92,8 +92,18 @@ echo ">> building a minimal initramfs (busybox + infinigpu.ko + DRM deps)"
 IR="$WORK/initramfs"
 mkdir -p "$IR"/{bin,proc,sys,dev,lib}
 cp "$BUSYBOX" "$IR/bin/busybox"
-for a in sh mount insmod dmesg sleep poweroff cat grep; do ln -sf busybox "$IR/bin/$a"; done
+for a in sh mount insmod dmesg sleep poweroff cat grep ls; do ln -sf busybox "$IR/bin/$a"; done
 cp "$KO" "$IR/infinigpu.ko"
+
+# Build the userspace 3D submitter (stands in for the thin ICD) so the boot exercises the render
+# node end-to-end: guest userspace → DRM_IOCTL_INFINIGPU_SUBMIT3D → host GPU replay → readback.
+# Best-effort: needs DRM uapi headers + a static libc; if absent, boot still validates display.
+SUBMIT3D_SRC="$ROOT/guest/linux/submit3d_test.c"
+if cc -static -O2 -I"$ROOT/guest/include" "$SUBMIT3D_SRC" -o "$IR/submit3d" 2>"$WORK/submit3d-cc.log"; then
+  echo "   + built submit3d (render-node 3D test)"
+else
+  echo "   ! submit3d not built (no DRM headers / static libc?) — display-only boot; see $WORK/submit3d-cc.log"
+fi
 
 # infinigpu.ko depends on out-of-kernel-module DRM helpers (drm_dma_helper etc.); the rest of DRM
 # is built into this kernel. Resolve infinigpu's module deps + their modules.dep closure, decompress
@@ -137,6 +147,11 @@ ${LOAD_LINES}
 echo "GUEST: loading infinigpu.ko (ring_drainer=$RING_DRAINER)"
 insmod /infinigpu.ko ring_drainer=$RING_DRAINER || echo "GUEST: insmod FAILED"
 sleep 1
+echo "GUEST: DRI nodes after probe:"; ls -l /dev/dri 2>/dev/null || echo "GUEST: no /dev/dri"
+if [ -x /submit3d ] && [ -e /dev/dri/card0 ]; then
+  echo "GUEST: submitting a 3D TRIANGLE workload via the render node"
+  /submit3d /dev/dri/card0 || echo "GUEST: submit3d returned non-zero"
+fi
 echo "GUEST: forcing framebuffer flips (exercises the present/RESOURCE_FLUSH path)"
 if [ -e /dev/fb0 ]; then
   # Interleave fb writes with waits so the drm_fbdev_dma deferred-IO worker flushes the dirty
@@ -172,4 +187,19 @@ if grep -qiE "INFINIGPU-KMS: registered|infinigpu magic=" "$WORK/guest.log"; the
 else
   echo "INCOMPLETE: no infinigpu probe line in the guest log. Server side:"; tail -5 "$SRV_LOG"
   echo "(check the kernel matches uname -r so the module loads; see $WORK/guest.log)"
+fi
+
+# 3D render-node result: the guest submitter read back GPU-rendered pixels AND the device server
+# logged replaying the Vulkan workload on the physical GPU.
+if [ -x "$IR/submit3d" ]; then
+  echo "---- 3D render node ----"
+  guest_ok=$(grep -c "SUBMIT3D: PASS" "$WORK/guest.log" || true)
+  host_ok=$(grep -c "replayed Vulkan workload" "$SRV_LOG" || true)
+  grep -E "SUBMIT3D:" "$WORK/guest.log" | head -1 || true
+  grep -E "replayed Vulkan workload" "$SRV_LOG" | head -1 || true
+  if [ "${guest_ok:-0}" -ge 1 ] && [ "${host_ok:-0}" -ge 1 ]; then
+    echo "PASS: guest userspace drove a 3D workload onto the physical GPU and read the pixels back."
+  else
+    echo "INCOMPLETE: 3D submit not fully observed (guest_pass=$guest_ok host_replay=$host_ok) — see $SRV_LOG"
+  fi
 fi

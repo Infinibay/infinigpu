@@ -404,24 +404,42 @@ static int igpu_submit_3d(struct igpu_device *idev, const struct igpu_vulkan_wor
 		.encoding = ENC_VULKAN_VENUSLIKE,
 		.payload_len = sizeof(*wl),
 	};
-	u64 want;
+	u64 want = 0;
 	int i;
 
 	memcpy(buf, &sc, sizeof(sc));
 	memcpy(buf + sizeof(sc), wl, sizeof(*wl));
 
-	mutex_lock(&idev->ring_lock);
-	if (!igpu_ring2_push(idev, MSG_SUBMIT_CMD, buf, sizeof(buf))) {
-		mutex_unlock(&idev->ring_lock);
-		return -EBUSY;   /* ring full — a real ICD would back-pressure/retry */
-	}
-	want = idev->ring2_idx->seqno_submit;   /* the seqno igpu_ring2_push just published */
-	mutex_unlock(&idev->ring_lock);
+	/* The command ring is shared with the display path and the host drains it asynchronously, so
+	 * a burst of fbcon flips can transiently fill the 16-slot ring. Detect a real push via the
+	 * seqno_submit delta (igpu_ring2_push returns the *retired* seqno, which can legitimately be 0
+	 * right after a valid push — so its return can't distinguish "pushed" from "full"). When full,
+	 * kick the doorbell to prompt the host to drain, wait, and retry. */
+	for (i = 0; i < 64; i++) {
+		u64 before, after;
 
-	for (i = 0; i < 1000; i++) {
+		mutex_lock(&idev->ring_lock);
+		before = idev->ring2_idx->seqno_submit;
+		igpu_ring2_push(idev, MSG_SUBMIT_CMD, buf, sizeof(buf));
+		after = idev->ring2_idx->seqno_submit;
+		mutex_unlock(&idev->ring_lock);
+
+		if (after != before) {
+			want = after;   /* the descriptor seqno this submit will retire at */
+			break;
+		}
+		iowrite32(1, idev->bar0 + REG_DOORBELL_CMD0);   /* nudge the drain, then wait for a slot */
+		udelay(50);
+	}
+	if (!want)
+		return -EBUSY;   /* ring stayed full — a real ICD would back-pressure further */
+
+	/* Wait for the host to retire our seqno. The first submit host-wide pays a one-time GPU
+	 * (Vulkan) init, so allow up to ~2s; steady-state completes in microseconds. */
+	for (i = 0; i < 20000; i++) {
 		if (smp_load_acquire(&idev->ring2_idx->seqno_retired) >= want)
 			return 0;
-		udelay(10);
+		udelay(100);
 	}
 	return -ETIMEDOUT;
 }

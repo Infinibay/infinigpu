@@ -57,12 +57,36 @@ device server log — and `CMD_RING_INDEX`, since probe completed), and brought 
 against the live device. The device's broker even sized itself from the real A5000 via NVML. So the
 **guest driver's probe + ring-drainer activation is runtime-validated end-to-end**.
 
-*Caveat:* driving a `RESOURCE_FLUSH` present round-trip needs a real page-flip source (a compositor,
-`modetest`, or fbcon damage) — a minimal busybox guest that only `dd`s to `/dev/fb0` doesn't reliably
-flip before power-down, and the single-connection device server exits on the guest's shutdown
-`Broken pipe`. The present path itself is validated separately by `tests/pr4_vfio_user.rs` (a real
-`RESOURCE_FLUSH` drained + presented over vfio-user). A fuller guest rootfs would close this last
-loop; it isn't a correctness gap.
+### Render node — guest userspace drives 3D onto the GPU (rung 1)
+
+With `DRIVER_RENDER` + `DRM_IOCTL_INFINIGPU_SUBMIT3D`, the boot harness also builds a static
+userspace submitter (`guest/linux/submit3d_test.c`) and runs it: it opens `/dev/dri/card0`,
+allocates a result buffer, and asks the host to replay a `TRIANGLE` workload on the physical GPU.
+**Confirmed so far:** the guest exposes **`/dev/dri/renderD128`** (the DRIVER_RENDER root-cause fix
+— its absence is what forced guest apps onto llvmpipe) and the ioctl is reachable and wired through
+to a `SUBMIT_CMD{VULKAN_VENUSLIKE}` on the command ring.
+
+### Known blocker: the guest-boot doorbell round-trip (transport desync)
+
+The one thing not yet working from a **live guest boot** is the doorbell → drain round-trip — for
+*any* ring message, 3D submit **and** the 2D `RESOURCE_FLUSH` present alike (this is the real cause
+of the flush-round-trip gap noted in earlier runs, not "busybox doesn't page-flip"). QEMU's own log
+shows a vfio-user **protocol desync during probe**:
+
+```
+qemu-system-x86_64: unexpected reply
+qemu-system-x86_64: bad header size
+qemu-system-x86_64: vfio_user_device_io_region_write: ... Broken pipe
+```
+
+The connection breaks around the `CMD_RING_BASE` register writes, so no later MMIO — `CMD_RING_SIZE`,
+`CMD_RING_INDEX`, and every **doorbell** — reaches the device. The ring therefore never drains
+(`submit3d` reports `EBUSY` when the guest's own ring fills, or `ETIMEDOUT` when it doesn't). This is
+a **server↔QEMU transport issue** in our `vfio_user` v0.1.3 frontend, **independent of the datapath**:
+the drain + 3D executor themselves are validated by `crates/infinigpu-device/tests/pr4_vfio_user.rs`
+(a real `RESOURCE_FLUSH` drained + presented over vfio-user via our own `Client`) and by
+`vulkan_workload_renders_a_triangle_to_scanout` (a TRIANGLE replayed on the A5000). Fixing the
+transport desync is the next rung and unblocks the live guest demo for both 2D flush and 3D.
 
 ### Getting a readable kernel
 
