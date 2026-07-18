@@ -35,9 +35,13 @@
 #include <drm/drm_drv.h>
 #include <drm/drm_device.h>
 #include <drm/drm_managed.h>
+#include <linux/version.h>
+
+#include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_damage_helper.h>
+#include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_rect.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_gem_dma_helper.h>
@@ -76,13 +80,22 @@
 
 /* wire enums (infinigpu-abi wire) */
 #define MSG_SUBMIT_CMD       0x0030u
+#define MSG_CURSOR_UPDATE    0x0042u
 #define ENC_DISPLAY_SCANOUT  0x0101u
 #define ENC_DISPLAY_SCANOUT_DAMAGE 0x0102u
 #define WIRE_FMT_XRGB8888    3u  /* = wire::format::B8G8R8X8; XRGB8888 LE = [B,G,R,X] */
+#define WIRE_FMT_B8G8R8A8    1u  /* = wire::format::B8G8R8A8; the DRM ARGB8888 cursor byte order */
 #define DESC_FLAG_FENCED     0x1u
+
+/* cursor_flags (infinigpu-abi wire::cursor_flags) */
+#define CUR_VISIBLE          (1u << 0)
+#define CUR_MOVE_ONLY        (1u << 1)
+#define CUR_PREMULTIPLIED    (1u << 3)
+#define CUR_WARP             (1u << 4)
 
 /* DEV_CAPS bits (infinigpu-abi regs::caps) */
 #define CAP_DISPLAY_ACCEL    (1u << 5)  /* device accepts DISPLAY_SCANOUT_DAMAGE */
+#define CAP_CURSOR_PLANE     (1u << 6)  /* cursor is off the primary: emit CURSOR_UPDATE */
 
 struct igpu_descriptor {
 	u32 msg_type, flags, len, data_offset;
@@ -104,11 +117,28 @@ struct igpu_scanout_present_damaged {
 	u64 scanout_addr;
 	u32 dx, dy, dw, dh;
 };
+/* Mirrors wire::CursorUpdate (48 bytes). The cursor plane emits this instead of baking the
+ * cursor into the primary framebuffer, so the host forwards it to a client-side overlay. */
+struct igpu_cursor_update {
+	u32 scanout_id;
+	u32 flags;
+	s32 pos_x, pos_y;
+	u16 hot_x, hot_y, width, height;
+	u32 pitch, format;
+	u64 shape_ref;
+	u64 reserved;
+};
 
 struct igpu_device {
 	struct drm_device drm;
-	struct drm_simple_display_pipe pipe;
+	struct drm_simple_display_pipe pipe;    /* used when !accel_cursor (single primary plane) */
 	struct drm_connector connector;
+
+	/* Explicit atomic pipeline, used when accel_cursor (primary + cursor plane). */
+	struct drm_plane primary;
+	struct drm_plane cursor;
+	struct drm_crtc crtc;
+	struct drm_encoder encoder;
 
 	void __iomem *bar0;
 	void *ring;            /* coherent: descriptor + submit_cmd + payload */
@@ -116,6 +146,12 @@ struct igpu_device {
 	struct mutex ring_lock; /* serialises submissions (selftest vs fbcon) */
 	u64 seqno;
 	bool accel_2d;         /* device advertised CAP_DISPLAY_ACCEL → send damage rects */
+	bool accel_cursor;     /* device advertised CAP_CURSOR_PLANE → cursor plane + CURSOR_UPDATE */
+
+	/* Cursor-plane tracking (accel_cursor path), to distinguish MOVE_ONLY from a shape
+	 * DEFINE and to flag a guest-initiated WARP (a jump with no matching pointer motion). */
+	bool cursor_had_fb;
+	int cursor_last_x, cursor_last_y;
 };
 
 #define to_igpu(d) container_of(d, struct igpu_device, drm)
@@ -190,6 +226,38 @@ static u32 igpu_submit_scanout_damaged(struct igpu_device *idev, dma_addr_t fb,
 		.scanout_addr = fb, .dx = dx, .dy = dy, .dw = dw, .dh = dh,
 	};
 	return igpu_ring_submit(idev, ENC_DISPLAY_SCANOUT_DAMAGE, &p, sizeof(p));
+}
+
+/* Emit a CURSOR_UPDATE (msg_type 0x0042, no SUBMIT_CMD wrapper): the body sits directly after
+ * the descriptor at data_offset = sizeof(descriptor). The host forwards it to a client-side
+ * cursor overlay, so the cursor leaves the primary framebuffer entirely. */
+static u32 igpu_submit_cursor(struct igpu_device *idev, const struct igpu_cursor_update *cu)
+{
+	struct igpu_descriptor *d = idev->ring;
+	void *p = idev->ring + sizeof(*d);
+	u32 retired;
+	u64 seq;
+
+	mutex_lock(&idev->ring_lock);
+	seq = ++idev->seqno;
+
+	d->msg_type = MSG_CURSOR_UPDATE;
+	d->flags = DESC_FLAG_FENCED;
+	d->len = sizeof(*cu);
+	d->data_offset = sizeof(*d);
+	d->seqno = seq;
+	d->reserved = 0;
+
+	memcpy(p, cu, sizeof(*cu));
+
+	wmb(); /* ring visible before the doorbell */
+	iowrite32(lower_32_bits(idev->ring_dma), idev->bar0 + REG_CMD_RING_BASE_LO);
+	iowrite32(upper_32_bits(idev->ring_dma), idev->bar0 + REG_CMD_RING_BASE_HI);
+	iowrite32(1, idev->bar0 + REG_DOORBELL_CMD0);
+
+	retired = ioread32(idev->bar0 + REG_RETIRED_LO);
+	mutex_unlock(&idev->ring_lock);
+	return retired;
 }
 
 static void igpu_flush(struct igpu_device *idev, struct drm_plane_state *state)
@@ -284,6 +352,199 @@ static const struct drm_simple_display_pipe_funcs igpu_pipe_funcs = {
 	.update = igpu_pipe_update,
 	/* prepare_fb left NULL: DRM calls drm_gem_plane_helper_prepare_fb() for us */
 };
+
+/* ---- explicit atomic pipeline (accel_cursor: primary + cursor plane + CRTC + encoder) ----
+ *
+ * When the device advertises CAP_CURSOR_PLANE we abandon the single-plane simple pipe for an
+ * explicit primary + DRM_PLANE_TYPE_CURSOR plane, so compositors offload the cursor to the plane
+ * (a cursor-only commit touches only the cursor plane and does NOT reflush the primary). The
+ * cursor plane emits CURSOR_UPDATE instead of baking the sprite into the primary framebuffer.
+ * Gated on kernel >= 6.6 (drm_plane_state.hotspot_x/y). Ships behind CAP_CURSOR_PLANE; the
+ * simple-pipe path stays the default and the fallback. See docs/adr/CLIENT-PLANE-COMPOSITOR.md. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+
+static const u32 igpu_cursor_formats[] = { DRM_FORMAT_ARGB8888 };
+
+static int igpu_check_plane(struct drm_plane *plane, struct drm_atomic_state *state,
+			    bool can_position)
+{
+	struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_crtc_state *crtc_state;
+
+	if (!new->crtc || !new->fb)
+		return 0;
+	crtc_state = drm_atomic_get_new_crtc_state(state, new->crtc);
+	return drm_atomic_helper_check_plane_state(new, crtc_state,
+						   DRM_PLANE_NO_SCALING,
+						   DRM_PLANE_NO_SCALING,
+						   can_position, true);
+}
+
+static int igpu_primary_check(struct drm_plane *plane, struct drm_atomic_state *state)
+{
+	return igpu_check_plane(plane, state, false);
+}
+
+static void igpu_primary_update(struct drm_plane *plane, struct drm_atomic_state *state)
+{
+	struct igpu_device *idev = container_of(plane, struct igpu_device, primary);
+	struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_plane_state *old = drm_atomic_get_old_plane_state(state, plane);
+
+	if (!new->fb)
+		return;
+	if (idev->accel_2d)
+		igpu_flush_damaged(idev, old, new);
+	else
+		igpu_flush(idev, new);
+}
+
+static const struct drm_plane_helper_funcs igpu_primary_helper_funcs = {
+	.prepare_fb = drm_gem_plane_helper_prepare_fb,
+	.atomic_check = igpu_primary_check,
+	.atomic_update = igpu_primary_update,
+};
+
+static int igpu_cursor_check(struct drm_plane *plane, struct drm_atomic_state *state)
+{
+	return igpu_check_plane(plane, state, true);
+}
+
+static void igpu_cursor_hide(struct igpu_device *idev)
+{
+	struct igpu_cursor_update cu = { 0 };
+
+	cu.pos_x = idev->cursor_last_x;
+	cu.pos_y = idev->cursor_last_y; /* flags=0 → VISIBLE clear */
+	idev->cursor_had_fb = false;
+	igpu_submit_cursor(idev, &cu);
+}
+
+static void igpu_cursor_update_plane(struct drm_plane *plane, struct drm_atomic_state *state)
+{
+	struct igpu_device *idev = container_of(plane, struct igpu_device, cursor);
+	struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_plane_state *old = drm_atomic_get_old_plane_state(state, plane);
+	struct drm_framebuffer *fb = new->fb;
+	struct igpu_cursor_update cu = { 0 };
+	int dx, dy;
+
+	if (!fb) {
+		igpu_cursor_hide(idev);
+		return;
+	}
+
+	cu.scanout_id = 0;
+	cu.flags = CUR_VISIBLE | CUR_PREMULTIPLIED;
+	cu.pos_x = new->crtc_x;
+	cu.pos_y = new->crtc_y;
+	cu.hot_x = new->hotspot_x;
+	cu.hot_y = new->hotspot_y;
+	cu.width = fb->width;
+	cu.height = fb->height;
+	cu.pitch = fb->pitches[0];
+	cu.format = WIRE_FMT_B8G8R8A8;
+	cu.shape_ref = drm_fb_dma_get_gem_addr(fb, new, 0);
+
+	/* Pure move (same fb pointer) vs a new shape DEFINE (fb changed). */
+	if (old && old->fb == fb)
+		cu.flags |= CUR_MOVE_ONLY;
+
+	/* Best-effort WARP: a jump with no incremental pointer motion (menu recenter, XWarpPointer).
+	 * At the KMS layer there is no input provenance, so we approximate with a jump threshold. */
+	dx = new->crtc_x - idev->cursor_last_x;
+	dy = new->crtc_y - idev->cursor_last_y;
+	if (idev->cursor_had_fb && (abs(dx) > 64 || abs(dy) > 64))
+		cu.flags |= CUR_WARP;
+	idev->cursor_last_x = new->crtc_x;
+	idev->cursor_last_y = new->crtc_y;
+	idev->cursor_had_fb = true;
+
+	igpu_submit_cursor(idev, &cu);
+}
+
+static void igpu_cursor_disable(struct drm_plane *plane, struct drm_atomic_state *state)
+{
+	igpu_cursor_hide(container_of(plane, struct igpu_device, cursor));
+}
+
+static const struct drm_plane_helper_funcs igpu_cursor_helper_funcs = {
+	.prepare_fb = drm_gem_plane_helper_prepare_fb,
+	.atomic_check = igpu_cursor_check,
+	.atomic_update = igpu_cursor_update_plane,
+	.atomic_disable = igpu_cursor_disable,
+};
+
+static const struct drm_plane_funcs igpu_plane_funcs = {
+	.update_plane = drm_atomic_helper_update_plane,
+	.disable_plane = drm_atomic_helper_disable_plane,
+	.destroy = drm_plane_cleanup,
+	.reset = drm_atomic_helper_plane_reset,
+	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
+};
+
+static void igpu_crtc_atomic_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
+{
+	/* No hardware vblank: complete any flip event immediately (mirrors the simple-pipe path). */
+	if (crtc->state->event) {
+		spin_lock_irq(&crtc->dev->event_lock);
+		drm_crtc_send_vblank_event(crtc, crtc->state->event);
+		crtc->state->event = NULL;
+		spin_unlock_irq(&crtc->dev->event_lock);
+	}
+}
+
+static const struct drm_crtc_helper_funcs igpu_crtc_helper_funcs = {
+	.atomic_flush = igpu_crtc_atomic_flush,
+};
+
+static const struct drm_crtc_funcs igpu_crtc_funcs = {
+	.set_config = drm_atomic_helper_set_config,
+	.page_flip = drm_atomic_helper_page_flip,
+	.destroy = drm_crtc_cleanup,
+	.reset = drm_atomic_helper_crtc_reset,
+	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+};
+
+/* Build the explicit primary + cursor + CRTC + encoder pipeline. Returns 0 or a negative errno. */
+static int igpu_init_cursor_pipeline(struct igpu_device *idev)
+{
+	struct drm_device *drm = &idev->drm;
+	int ret;
+
+	ret = drm_universal_plane_init(drm, &idev->primary, 0, &igpu_plane_funcs,
+				       igpu_formats, ARRAY_SIZE(igpu_formats), NULL,
+				       DRM_PLANE_TYPE_PRIMARY, NULL);
+	if (ret)
+		return ret;
+	drm_plane_helper_add(&idev->primary, &igpu_primary_helper_funcs);
+	if (idev->accel_2d)
+		drm_plane_enable_fb_damage_clips(&idev->primary);
+
+	ret = drm_universal_plane_init(drm, &idev->cursor, 0, &igpu_plane_funcs,
+				       igpu_cursor_formats, ARRAY_SIZE(igpu_cursor_formats),
+				       NULL, DRM_PLANE_TYPE_CURSOR, NULL);
+	if (ret)
+		return ret;
+	drm_plane_helper_add(&idev->cursor, &igpu_cursor_helper_funcs);
+
+	ret = drm_crtc_init_with_planes(drm, &idev->crtc, &idev->primary, &idev->cursor,
+					&igpu_crtc_funcs, NULL);
+	if (ret)
+		return ret;
+	drm_crtc_helper_add(&idev->crtc, &igpu_crtc_helper_funcs);
+
+	ret = drm_simple_encoder_init(drm, &idev->encoder, DRM_MODE_ENCODER_VIRTUAL);
+	if (ret)
+		return ret;
+	idev->encoder.possible_crtcs = drm_crtc_mask(&idev->crtc);
+
+	return drm_connector_attach_encoder(&idev->connector, &idev->encoder);
+}
+
+#endif /* LINUX_VERSION_CODE >= 6.6 */
 
 /* ---- connector: one virtual output with a fixed preferred mode ---- */
 
@@ -382,6 +643,9 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct igpu_scanout_present_damaged) != 40);
 	BUILD_BUG_ON(offsetof(struct igpu_scanout_present_damaged, scanout_addr) != 16);
 	BUILD_BUG_ON(offsetof(struct igpu_scanout_present_damaged, dx) != 24);
+	BUILD_BUG_ON(sizeof(struct igpu_cursor_update) != 48);
+	BUILD_BUG_ON(offsetof(struct igpu_cursor_update, pos_x) != 8);
+	BUILD_BUG_ON(offsetof(struct igpu_cursor_update, shape_ref) != 32);
 
 	ret = pcim_enable_device(pdev);
 	if (ret)
@@ -412,6 +676,11 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	drm = &idev->drm;
 	idev->bar0 = bar0;
 	idev->accel_2d = !!(caps & CAP_DISPLAY_ACCEL);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+	/* The explicit cursor-plane pipeline needs drm_plane_state.hotspot_x/y (6.6+). On older
+	 * kernels we always fall back to the simple pipe (software cursor). */
+	idev->accel_cursor = !!(caps & CAP_CURSOR_PLANE);
+#endif
 	mutex_init(&idev->ring_lock);
 	pci_set_drvdata(pdev, idev);
 
@@ -437,18 +706,30 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return ret;
 	drm_connector_helper_add(&idev->connector, &igpu_conn_helper_funcs);
 
-	ret = drm_simple_display_pipe_init(drm, &idev->pipe, &igpu_pipe_funcs,
-					   igpu_formats, ARRAY_SIZE(igpu_formats),
-					   NULL, &idev->connector);
-	if (ret)
-		return ret;
+	if (idev->accel_cursor) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+		/* Explicit primary + cursor plane so the compositor offloads the cursor to a plane
+		 * (advertised size) and the cursor leaves the primary framebuffer. */
+		drm->mode_config.cursor_width = 256;
+		drm->mode_config.cursor_height = 256;
+		ret = igpu_init_cursor_pipeline(idev);
+		if (ret)
+			return ret;
+#endif
+	} else {
+		ret = drm_simple_display_pipe_init(drm, &idev->pipe, &igpu_pipe_funcs,
+						   igpu_formats, ARRAY_SIZE(igpu_formats),
+						   NULL, &idev->connector);
+		if (ret)
+			return ret;
 
-	/* Expose FB_DAMAGE_CLIPS so an atomic compositor (weston/mutter) can attach damage
-	 * rects; the fbcon dirtyfb path sets damage directly on the plane state regardless.
-	 * Without this, compositors commit full-frame and the accel path degrades to full
-	 * presents — correct, just not accelerated. */
-	if (idev->accel_2d)
-		drm_plane_enable_fb_damage_clips(&idev->pipe.plane);
+		/* Expose FB_DAMAGE_CLIPS so an atomic compositor (weston/mutter) can attach damage
+		 * rects; the fbcon dirtyfb path sets damage directly on the plane state regardless.
+		 * Without this, compositors commit full-frame and the accel path degrades to full
+		 * presents — correct, just not accelerated. */
+		if (idev->accel_2d)
+			drm_plane_enable_fb_damage_clips(&idev->pipe.plane);
+	}
 
 	drm_mode_config_reset(drm);
 
@@ -462,8 +743,10 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	/* Bring up fbdev emulation → fbcon renders the console on our framebuffer. */
 	drm_client_setup(drm, NULL);
 
-	dev_info(&pdev->dev, "INFINIGPU-KMS: registered /dev/dri/card%d (2D accel %s)\n",
-		 drm->primary->index, idev->accel_2d ? "on" : "off");
+	dev_info(&pdev->dev,
+		 "INFINIGPU-KMS: registered /dev/dri/card%d (2D accel %s, cursor plane %s)\n",
+		 drm->primary->index, idev->accel_2d ? "on" : "off",
+		 idev->accel_cursor ? "on" : "off");
 	return 0;
 }
 
