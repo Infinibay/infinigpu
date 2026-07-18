@@ -26,6 +26,7 @@ use std::io::{self, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Estimated VRAM footprint (MB) a display VM reserves at GPU-attach (scanout +
 /// working set). A real encoder/3D VM would report more; Phase-0 uses a flat guess.
@@ -151,6 +152,50 @@ struct ScanoutBuffer {
     bgra: Vec<u8>,
 }
 
+/// Largest cursor sprite the device will DMA-read + forward (matches the guest's advertised
+/// `mode_config.cursor_width/height`). A `pitch*height` above this is rejected fail-closed.
+const CURSOR_MAX_DIM: usize = 256;
+const CURSOR_MAX_BYTES: usize = CURSOR_MAX_DIM * CURSOR_MAX_DIM * 4;
+/// Minimum spacing between cursor **shape** DMA-reads: coalesces a hostile DEFINE flood (the
+/// de-dup-alternation attack) to at most ~this rate so a guest can't peg the callback thread.
+const CURSOR_SHAPE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+/// Minimum spacing between forwarded cursor **MOVE**s (position coalescing) — WARP moves bypass it.
+const CURSOR_MOVE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Per-VM cursor-plane state for the accelerated cursor path. De-dups unchanged shapes/positions,
+/// rate-limits shape reads (DoS), and remembers whether the guest must be re-solicited after a
+/// device (re)admission (the guest only emits `CURSOR_UPDATE` on a cursor *change*, so a re-adopted
+/// device would otherwise have no shape to prime a viewer with).
+#[derive(Default)]
+struct CursorState {
+    /// Last forwarded shape key `(shape_ref, width, height, pitch)` — skip an identical re-DEFINE.
+    last_shape: Option<(u64, u16, u16, u32)>,
+    /// Last forwarded position — suppress redundant MOVEs.
+    last_pos: Option<(i32, i32)>,
+    /// Last forwarded VISIBLE state.
+    last_visible: bool,
+    /// Last shape DMA-read time (rate limit).
+    last_shape_read: Option<Instant>,
+    /// Last forwarded MOVE time (rate limit).
+    last_move_sent: Option<Instant>,
+}
+
+/// Whether a guest cursor-shape DEFINE is safe to DMA-read + forward: non-empty, within the
+/// 256×256 sprite bound, the only accepted pixel format ([`format::B8G8R8A8`]), and a `pitch` that
+/// covers a full row without overflowing the byte cap. Fail-closed — any hostile value (zero dims,
+/// oversized, wrong format, too-small or overflowing pitch) returns `false` and the cursor is
+/// dropped, never DMA-read.
+fn cursor_shape_ok(width: u16, height: u16, pitch: u32, format: u32) -> bool {
+    let (w, h, pitch) = (width as usize, height as usize, pitch as usize);
+    w != 0
+        && h != 0
+        && w <= CURSOR_MAX_DIM
+        && h <= CURSOR_MAX_DIM
+        && format == infinigpu_abi::wire::format::B8G8R8A8
+        && pitch >= w * 4
+        && pitch.checked_mul(h).map_or(false, |t| t <= CURSOR_MAX_BYTES)
+}
+
 /// Clamp a guest-supplied damage rect into the `[0,w]×[0,h]` frame. Saturating `min`
 /// math guarantees the result satisfies `dx+dw <= w` and `dy+dh <= h` for **any** `u32`
 /// input (including `u32::MAX`), so a hostile guest can never drive an out-of-bounds
@@ -209,6 +254,14 @@ pub struct InfinigpuBackend {
     /// `pitch*height` for a full-frame present, `~dw*dh*4` for a damage present. Surfaced
     /// in the periodic infiniPixel stats line so the damage-path win is observable.
     bytes_read_last: usize,
+    /// Per-VM cursor-plane state (client-side cursor overlay path). `None` until the first
+    /// `CURSOR_UPDATE`; reset on device reset.
+    cursor: CursorState,
+    /// Set on (re)admission: the guest must be re-solicited for its current cursor because the
+    /// device's `CursorState`/Hub cache was lost (the guest only emits on a cursor *change*).
+    cursor_needs_resolicit: bool,
+    /// Whether this device advertises `caps::CURSOR_PLANE` (env `INFINIGPU_CURSOR_PLANE`).
+    cursor_plane_enabled: bool,
 }
 
 impl Default for InfinigpuBackend {
@@ -301,6 +354,9 @@ impl InfinigpuBackend {
             pixel,
             last_scanout: None,
             bytes_read_last: 0,
+            cursor: CursorState::default(),
+            cursor_needs_resolicit: false,
+            cursor_plane_enabled: std::env::var_os("INFINIGPU_CURSOR_PLANE").is_some(),
         }
     }
 
@@ -350,6 +406,13 @@ impl InfinigpuBackend {
         // Drop the persistent damage surface: after a reset the guest re-negotiates and
         // sends a fresh full-frame present, so a retained buffer would only risk staleness.
         self.last_scanout = None;
+        // Cursor state is lost across a reset; the guest re-emits its cursor on the next change,
+        // and we flag a re-solicit so a viewer isn't left with a stale/empty overlay meanwhile.
+        self.cursor = CursorState::default();
+        self.cursor_needs_resolicit = true;
+        if let Some(p) = &self.pixel {
+            p.reset_planes();
+        }
         // DMA maps persist across device reset (the client re-sends DMA_UNMAP/MAP).
     }
 
@@ -381,6 +444,9 @@ impl InfinigpuBackend {
         match off {
             DEV_MAGIC => infinigpu_abi::DEV_MAGIC,
             ABI_VERSION => infinigpu_abi::abi_version(),
+            // Advertise the cursor plane only when explicitly enabled (rollout gate); otherwise
+            // the guest keeps its software cursor (today's path) and never emits CURSOR_UPDATE.
+            DEV_CAPS if self.cursor_plane_enabled => regs::PHASE2_DEV_CAPS,
             DEV_CAPS => regs::PHASE1_DEV_CAPS,
             NUM_CONTEXTS => crate::NUM_CONTEXTS as u32,
             MAX_RING_ENTRIES => 256,
@@ -495,8 +561,8 @@ impl InfinigpuBackend {
     /// `ctx`'s retired seqno and raises MSI-X vector `ctx+1`.
     fn process_ring(&mut self, ctx: usize) {
         use infinigpu_abi::wire::{
-            encoding, msg_type, ClearPresent, Descriptor, ScanoutPresent, ScanoutPresentDamaged,
-            SubmitCmd,
+            encoding, msg_type, ClearPresent, CursorUpdate, Descriptor, ScanoutPresent,
+            ScanoutPresentDamaged, SubmitCmd,
         };
         use zerocopy::FromBytes;
 
@@ -516,6 +582,24 @@ impl InfinigpuBackend {
             desc.msg_type,
             desc.data_offset
         );
+        // Cursor-plane sideband (a control message, not a command submission): the CursorUpdate
+        // body sits at `base + data_offset`. Decode + forward, then retire this ring's seqno — a
+        // malformed cursor is dropped but never stalls the ring.
+        if desc.msg_type == msg_type::CURSOR_UPDATE {
+            let payload_addr = base + desc.data_offset as u64;
+            let mut cb = [0u8; core::mem::size_of::<CursorUpdate>()];
+            let n = if desc.len == 0 {
+                cb.len()
+            } else {
+                (desc.len as usize).min(cb.len())
+            };
+            if self.dma.read(payload_addr, &mut cb[..n]) {
+                let cu = CursorUpdate::read_from_bytes(&cb).unwrap();
+                self.handle_cursor_update(&cu);
+            }
+            self.ring_retired[ctx] = desc.seqno;
+            return;
+        }
         if desc.msg_type != msg_type::SUBMIT_CMD {
             return;
         }
@@ -815,6 +899,164 @@ impl InfinigpuBackend {
                 }
             }
         }
+    }
+
+    /// Decode + forward one guest `CURSOR_UPDATE` to the client-side cursor overlay (the `XIPL`
+    /// plane sideband). Runs on the single vfio-user callback thread, so it is fully **fail-closed
+    /// and rate-limited**: a bad geometry / wrong format / oversized sprite is dropped (never
+    /// forwarded, never OOB), a shape-DEFINE flood is coalesced (defeats the de-dup-alternation
+    /// DoS), and pure MOVEs are suppressed for a single driving viewer (which draws the cursor at
+    /// its own local pointer) and coalesced otherwise. It **never** touches the encoder — the
+    /// sideband is a separate Hub lane — so it can never stall the guest scanout doorbell.
+    fn handle_cursor_update(&mut self, cu: &infinigpu_abi::wire::CursorUpdate) {
+        use infinigpu_abi::wire::{cursor_flags, format};
+        use infinigpu_pixel::{proto::plane, PlaneHeader};
+
+        if !self.ensure_admitted() || self.pixel.is_none() {
+            return;
+        }
+
+        let visible = cu.flags & cursor_flags::VISIBLE != 0;
+        let move_only = cu.flags & cursor_flags::MOVE_ONLY != 0;
+        let warp = cu.flags & cursor_flags::WARP != 0;
+
+        // Repack the ABI cursor_flags into the sideband subset the viewer reads.
+        let mut sflags = 0u8;
+        if visible {
+            sflags |= plane::flags::VISIBLE;
+        }
+        if cu.flags & cursor_flags::PREMULTIPLIED != 0 {
+            sflags |= plane::flags::PREMULTIPLIED;
+        }
+        if warp {
+            sflags |= plane::flags::WARP;
+        }
+        if cu.flags & cursor_flags::RELATIVE != 0 {
+            sflags |= plane::flags::RELATIVE;
+        }
+
+        // A header-only MOVE (position / visibility), for the hide + coalesced-move paths.
+        let move_hdr = PlaneHeader {
+            op: plane::op::MOVE,
+            plane_kind: plane::kind::CURSOR,
+            flags: sflags,
+            plane_id: 0,
+            codec_or_format: 0,
+            z_order: 0,
+            width: 0,
+            height: 0,
+            hot_x: cu.hot_x,
+            hot_y: cu.hot_y,
+            pos_x: cu.pos_x,
+            pos_y: cu.pos_y,
+            payload_len: 0,
+        };
+
+        // Hide (VISIBLE clear): always forward a header-only MOVE so the viewer drops its overlay
+        // and reverts to the baked stream cursor (the D4 compositor HW->SW handoff) — never a stale
+        // overlay, never a double cursor.
+        if !visible {
+            if let Some(p) = self.pixel.as_ref() {
+                p.send_plane(&move_hdr, &[]);
+            }
+            self.cursor.last_visible = false;
+            self.cursor.last_pos = Some((cu.pos_x, cu.pos_y));
+            return;
+        }
+
+        if move_only {
+            let pos = (cu.pos_x, cu.pos_y);
+            // A single driving viewer renders the cursor at its own local pointer → it needs no
+            // MOVE. Suppress unless there are extra (view-only) viewers or this is a warp teleport.
+            let extra_viewers = self.pixel.as_ref().map_or(false, |p| p.client_count() > 1);
+            if !warp && !extra_viewers {
+                self.cursor.last_pos = Some(pos);
+                self.cursor.last_visible = true;
+                return;
+            }
+            let now = Instant::now();
+            if !warp {
+                if self.cursor.last_pos == Some(pos) {
+                    return; // unchanged position
+                }
+                if let Some(t) = self.cursor.last_move_sent {
+                    if now.duration_since(t) < CURSOR_MOVE_MIN_INTERVAL {
+                        return; // coalesce routine moves
+                    }
+                }
+            }
+            if let Some(p) = self.pixel.as_ref() {
+                p.send_plane(&move_hdr, &[]);
+            }
+            self.cursor.last_pos = Some(pos);
+            self.cursor.last_move_sent = Some(now);
+            self.cursor.last_visible = true;
+            return;
+        }
+
+        // A shape DEFINE. Validate the guest-controlled geometry fail-closed (see `cursor_shape_ok`).
+        let (w, h, pitch) = (cu.width as usize, cu.height as usize, cu.pitch as usize);
+        if !cursor_shape_ok(cu.width, cu.height, cu.pitch, cu.format) {
+            log::warn!("cursor: bad shape {w}x{h} pitch {pitch} fmt {} — dropped", cu.format);
+            return;
+        }
+        if cu.flags & cursor_flags::SHAPE_BY_RESID != 0 {
+            // res_id shapes need PR4's ResourceTable; not resolvable yet — drop.
+            return;
+        }
+
+        let key = (cu.shape_ref, cu.width, cu.height, cu.pitch);
+        if self.cursor.last_shape == Some(key) {
+            // Same shape re-DEFINE (a move that re-sent the shape): treat as a move — don't re-read.
+            if let Some(p) = self.pixel.as_ref() {
+                p.send_plane(&move_hdr, &[]);
+            }
+            self.cursor.last_pos = Some((cu.pos_x, cu.pos_y));
+            self.cursor.last_visible = true;
+            return;
+        }
+
+        // Rate-limit the DMA-read + repack so a hostile alternating-shape flood can't peg us.
+        let now = Instant::now();
+        if let Some(t) = self.cursor.last_shape_read {
+            if now.duration_since(t) < CURSOR_SHAPE_MIN_INTERVAL {
+                return; // coalesce: drop this read; a later one within budget will forward
+            }
+        }
+
+        // DMA-read the ARGB sprite and de-pitch it into a tightly-packed body. The DRM cursor
+        // format ARGB8888 == our B8G8R8A8 byte order, so this strips pitch padding — no swap.
+        let mut src = vec![0u8; pitch * h];
+        if !self.dma.read(cu.shape_ref, &mut src) {
+            log::warn!("cursor: sprite {:#x} ({} bytes) not mapped", cu.shape_ref, pitch * h);
+            return;
+        }
+        let mut bgra = vec![0u8; w * h * 4];
+        for y in 0..h {
+            bgra[y * w * 4..(y + 1) * w * 4].copy_from_slice(&src[y * pitch..y * pitch + w * 4]);
+        }
+        let hdr = PlaneHeader {
+            op: plane::op::DEFINE,
+            plane_kind: plane::kind::CURSOR,
+            flags: sflags,
+            plane_id: 0,
+            codec_or_format: format::B8G8R8A8 as u8,
+            z_order: 0,
+            width: cu.width,
+            height: cu.height,
+            hot_x: cu.hot_x,
+            hot_y: cu.hot_y,
+            pos_x: cu.pos_x,
+            pos_y: cu.pos_y,
+            payload_len: (w * h * 4) as u32,
+        };
+        if let Some(p) = self.pixel.as_ref() {
+            p.send_plane(&hdr, &bgra);
+        }
+        self.cursor.last_shape = Some(key);
+        self.cursor.last_shape_read = Some(now);
+        self.cursor.last_pos = Some((cu.pos_x, cu.pos_y));
+        self.cursor.last_visible = true;
     }
 
     /// Feed one presented frame to the infiniPixel stream. The streamer (re)sizes its
@@ -1162,6 +1404,25 @@ mod tests {
         );
         // Still a Phase-0 superset — the base submission model is unchanged.
         assert!(caps & regs::caps::POLL_SUBMIT != 0);
+    }
+
+    #[test]
+    fn cursor_shape_ok_is_fail_closed() {
+        use infinigpu_abi::wire::format;
+        // A normal ARGB cursor (tight or padded pitch) is accepted.
+        assert!(cursor_shape_ok(32, 32, 32 * 4, format::B8G8R8A8));
+        assert!(cursor_shape_ok(24, 24, 128, format::B8G8R8A8));
+        // Exactly at the 256×256 byte cap is accepted; one row of padding past it is not.
+        assert!(cursor_shape_ok(256, 256, 256 * 4, format::B8G8R8A8));
+        assert!(!cursor_shape_ok(256, 256, 256 * 4 + 4, format::B8G8R8A8));
+        // Zero dims, oversized dims, wrong format, and a pitch too small for the row are rejected.
+        assert!(!cursor_shape_ok(0, 16, 64, format::B8G8R8A8));
+        assert!(!cursor_shape_ok(16, 0, 64, format::B8G8R8A8));
+        assert!(!cursor_shape_ok(257, 16, 257 * 4, format::B8G8R8A8));
+        assert!(!cursor_shape_ok(32, 32, 128, format::R8G8B8A8));
+        assert!(!cursor_shape_ok(32, 32, 32 * 4 - 1, format::B8G8R8A8));
+        // A hostile u32::MAX pitch must be rejected without overflowing (no panic).
+        assert!(!cursor_shape_ok(256, 256, u32::MAX, format::B8G8R8A8));
     }
 
     #[test]

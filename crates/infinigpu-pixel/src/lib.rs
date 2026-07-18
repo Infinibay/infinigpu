@@ -1567,6 +1567,12 @@ impl PixelStreamer {
         self.hub
             .broadcast_control(hdr.plane_id, hdr.op, hdr.message(body));
     }
+
+    /// Drop all cached plane state (e.g. on VM re-adoption) so a stale cursor shape isn't primed
+    /// into a new client before the device re-solicits a fresh `CURSOR_UPDATE`.
+    pub fn reset_planes(&self) {
+        self.hub.reset_planes();
+    }
 }
 
 // ------------------------------- Test frame source ----------------------------------
