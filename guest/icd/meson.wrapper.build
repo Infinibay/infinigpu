@@ -1,0 +1,7 @@
+# Copyright 2024 Infinibay
+# SPDX-License-Identifier: MIT
+# ---> install as src/infinigpu/meson.build
+
+if with_infinigpu_vk
+  subdir('vulkan')
+endif
