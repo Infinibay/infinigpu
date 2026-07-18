@@ -65,11 +65,17 @@ pub fn run_stream(
 ) -> Result<(), Box<dyn Error>> {
     let (mut ws, _resp) = tungstenite::connect(url)?;
     log::info!("infiniPixel: connected to {url}");
-    // Time-box reads so we can interleave outgoing input on the same socket. Without a
-    // pending-input channel we leave the socket blocking (headless decode path).
+    // TCP_NODELAY: disable Nagle so a small frame or an input event isn't held for
+    // delayed-ACK coalescing (up to ~40ms of avoidable tail latency). Applies both ways.
+    if let MaybeTlsStream::Plain(s) = ws.get_ref() {
+        let _ = s.set_nodelay(true);
+    }
+    // Time-box reads so we can interleave outgoing input on the same socket. A tighter box
+    // bounds input-send latency (input is flushed each loop turn); 4ms keeps the idle spin
+    // cheap. Without a pending-input channel we leave the socket blocking (headless path).
     if input_rx.is_some() {
         if let MaybeTlsStream::Plain(s) = ws.get_ref() {
-            let _ = s.set_read_timeout(Some(Duration::from_millis(16)));
+            let _ = s.set_read_timeout(Some(Duration::from_millis(4)));
         }
     }
     let mut decoder = openh264::decoder::Decoder::new()?;

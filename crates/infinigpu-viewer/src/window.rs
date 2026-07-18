@@ -149,10 +149,20 @@ impl ApplicationHandler for App {
                 self.send_input(input::wheel(dy));
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // DIAG: log exactly what winit delivers so a stuck-modifier report can be traced
+                // to whether the RELEASE event even arrives here (and as a mapped PhysicalKey::Code).
+                log::debug!(
+                    "KEY state={:?} repeat={} physical={:?} logical={:?}",
+                    event.state, event.repeat, event.physical_key, event.logical_key
+                );
                 // Skip auto-repeat: send one down + the release; the guest repeats a held key.
                 if !event.repeat {
                     if let PhysicalKey::Code(code) = event.physical_key {
-                        self.send_input(input::key(code, event.state == ElementState::Pressed));
+                        let msg = input::key(code, event.state == ElementState::Pressed);
+                        log::debug!("KEY -> send {msg:?}");
+                        self.send_input(msg);
+                    } else {
+                        log::debug!("KEY -> DROPPED (physical_key is not a mapped Code)");
                     }
                 }
             }
@@ -378,6 +388,21 @@ impl VkViewer {
             .copied()
             .unwrap_or(formats[0]);
 
+        // Present mode: prefer MAILBOX (low-latency triple-buffer, no tearing, uncaps from the
+        // display refresh) → IMMEDIATE (lowest latency, may tear) → FIFO (vsync, always present).
+        // FIFO alone adds up to a full refresh interval (~16.7ms) of display latency.
+        let present_modes = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_present_modes(self.physical, self.surface)?
+        };
+        let present_mode = if present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
+            vk::PresentModeKHR::MAILBOX
+        } else if present_modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+            vk::PresentModeKHR::IMMEDIATE
+        } else {
+            vk::PresentModeKHR::FIFO
+        };
+
         let mut image_count = caps.min_image_count + 1;
         if caps.max_image_count > 0 {
             image_count = image_count.min(caps.max_image_count);
@@ -395,7 +420,7 @@ impl VkViewer {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::FIFO) // vsync, always supported
+            .present_mode(present_mode) // MAILBOX/IMMEDIATE when available, else FIFO vsync
             .clipped(true)
             .old_swapchain(old);
         let swapchain = unsafe { self.swapchain_loader.create_swapchain(&ci, None)? };
