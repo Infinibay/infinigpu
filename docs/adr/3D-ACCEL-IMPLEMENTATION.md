@@ -15,9 +15,11 @@ Three concrete gaps stand between here and real A5000 hardware 3D:
 
 1. **Guest has no render node.** No `DRIVER_RENDER` ⇒ no `/dev/dri/renderD128` ⇒ Mesa can't bind
    a hardware ICD.
-2. **Device decodes only display.** `process_ring` (`crates/infinigpu-device/src/lib.rs`) handles
-   `DISPLAY_CLEAR`/`DISPLAY_SCANOUT`; `encoding::VULKAN_VENUSLIKE` hits the *unsupported encoding*
-   warn. `BAR2_APERTURE_MB` reads 0 and `caps::BLOB_APERTURE` is unset (no host-visible aperture).
+2. **Device executes only display.** `process_ring` (`crates/infinigpu-device/src/lib.rs`) renders
+   `DISPLAY_CLEAR`/`DISPLAY_SCANOUT`; `encoding::VULKAN_VENUSLIKE` now has a **recognition arm**
+   (`submit_vulkan`: admit + bound-check + retire the fence + count, no-op executor — Phase 1 PR1.4
+   partial) but **no real decoder** yet. `BAR2_APERTURE_MB` reads 0 and `caps::BLOB_APERTURE` is
+   unset (no host-visible aperture).
 3. **No host 3D decoder.** `infinigpu-abi` is declared in `crates/infinigpu-replay/Cargo.toml` but
    referenced nowhere in `replay/src` — the Venus command stream has no consumer.
 
@@ -129,6 +131,14 @@ only if the whole Venus approach NO-GOs.)
   `process_ring` as a bounded drain (`MAX_DRAIN=capacity`) over a `Ring::from_raw` on guest RAM; add
   the `encoding::VULKAN_VENUSLIKE` arm forwarding the payload to a **v0 in-process executor** on
   `SharedGpu`. (This is the same real ring drainer the 2D plan's PR4 builds — do it once.)
+  - *Status (partial, off-hardware):* the **recognition arm is landed** — `InfinigpuBackend::submit_vulkan`
+    (device `lib.rs`) admits fail-closed, bound-checks the opaque payload against the 64 MiB geometry
+    cap, retires the fence (no ring stall), and counts submits (`vulkan_submits`, unit-tested), so a
+    guest render node drives the datapath with a no-op executor instead of the old *unsupported
+    encoding* warn. The `infinigpu-ring` `#[repr(C,align(64))]` `Indices`/`from_ptr` (PR1.3) and
+    `DmaTable::host_ptr` are already in place (2D-ADR PR4). **Remaining (needs QEMU + guest KMD
+    PR1.1/1.2):** replace the single-descriptor read with the bounded `Ring::from_raw` two-phase drain,
+    and swap the no-op body for the v0 `SharedGpu` executor.
 
 **Accept:** `ls /dev/dri/renderD128` + `drm_info` shows `DRIVER_RENDER`; a minimal C test does
 `GET_PARAM/CONTEXT_INIT/RESOURCE_CREATE_BLOB/EXECBUFFER(FENCE_OUT)/WAIT` with `retired≥seqno`; the

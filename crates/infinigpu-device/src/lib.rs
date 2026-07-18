@@ -263,6 +263,12 @@ pub struct InfinigpuBackend {
     cursor_needs_resolicit: bool,
     /// Whether this device advertises `caps::CURSOR_PLANE` (env `INFINIGPU_CURSOR_PLANE`).
     cursor_plane_enabled: bool,
+    /// Monotonic count of 3D (`encoding::VULKAN_VENUSLIKE`) submissions seen on the ring. The
+    /// Venus command decoder (`crates/infinigpu-replay/src/venus/`) is gated on the Phase-0
+    /// go/no-go spike (`docs/spikes/venus-nvidia-a5000.md`); until it lands this counts submits so
+    /// a guest render node can prove the 3D datapath reaches the device (fence retires) without the
+    /// generic "unsupported encoding" warn. Reset on device reset.
+    vulkan_submits: u64,
 }
 
 impl Default for InfinigpuBackend {
@@ -358,6 +364,7 @@ impl InfinigpuBackend {
             cursor: CursorState::default(),
             cursor_needs_resolicit: false,
             cursor_plane_enabled: std::env::var_os("INFINIGPU_CURSOR_PLANE").is_some(),
+            vulkan_submits: 0,
         }
     }
 
@@ -411,6 +418,8 @@ impl InfinigpuBackend {
         // and we flag a re-solicit so a viewer isn't left with a stale/empty overlay meanwhile.
         self.cursor = CursorState::default();
         self.cursor_needs_resolicit = true;
+        // 3D submit counter is per-attach observability; a fresh generation starts from zero.
+        self.vulkan_submits = 0;
         if let Some(p) = &self.pixel {
             p.reset_planes();
         }
@@ -644,8 +653,51 @@ impl InfinigpuBackend {
                 let sp = ScanoutPresentDamaged::read_from_bytes(&pb).unwrap();
                 self.present_scanout_damaged(&sp, sc.seqno, ctx);
             }
+            encoding::VULKAN_VENUSLIKE => {
+                self.submit_vulkan(&sc, ctx);
+            }
             other => log::warn!("unsupported encoding {:#x}", other),
         }
+    }
+
+    /// 3D command submission (`encoding::VULKAN_VENUSLIKE`) — the Venus-remoting datapath
+    /// (`docs/adr/3D-ACCEL-IMPLEMENTATION.md`, Phase 1). The host-side command decoder
+    /// (`crates/infinigpu-replay/src/venus/`) is **gated on the Phase-0 go/no-go spike**
+    /// (`docs/spikes/venus-nvidia-a5000.md`); until that records a GO, this is the wiring point:
+    /// it admits fail-closed, bound-checks the opaque payload against the same 64 MiB geometry cap
+    /// the present/resource paths use, and **retires the fence** so a guest render node can drive
+    /// the ring end-to-end (its `out_fence` resolves) with a no-op executor — never a ring stall,
+    /// never the generic "unsupported encoding" warn. When the decoder lands it replaces the no-op
+    /// body here (resolve `payload_addr`/`payload_len` through `DmaTable`, replay onto `shared_gpu`).
+    fn submit_vulkan(&mut self, sc: &infinigpu_abi::wire::SubmitCmd, ctx: usize) {
+        // Admission gate (fail-closed): a VM the broker didn't admit cannot submit 3D work.
+        if !self.ensure_admitted() {
+            return;
+        }
+        // Fail-closed payload bound (mirrors resource::MAX_BLOB_BYTES). A hostile/oversized
+        // command stream is dropped, but the fence still retires so the ring never wedges.
+        const MAX_CMD_BYTES: u32 = 64 * 1024 * 1024;
+        if sc.payload_len > MAX_CMD_BYTES {
+            log::warn!(
+                "vulkan submit ctx={ctx}: payload {} B exceeds {} B cap — dropped",
+                sc.payload_len,
+                MAX_CMD_BYTES
+            );
+        } else {
+            self.vulkan_submits += 1;
+            // The real work (Venus decode + replay) is Phase-0-gated; log sparsely so a bring-up
+            // guest can confirm the datapath without flooding.
+            if self.vulkan_submits.is_multiple_of(120) || self.vulkan_submits == 1 {
+                info!(
+                    "3D: {} Venus submit(s) reached the device ({} B latest); decoder pending the \
+                     Phase-0 GO (docs/spikes/venus-nvidia-a5000.md)",
+                    self.vulkan_submits, sc.payload_len
+                );
+            }
+        }
+        // Retire the fence (no-op executor): the guest's `out_fence`/retired register resolves so
+        // its submit thread makes progress. Nothing is rendered until the decoder lands.
+        self.ring_retired[ctx] = sc.seqno;
     }
 
     /// Present a guest-supplied framebuffer (the DRM/KMS page-flip path): read
@@ -1441,5 +1493,33 @@ mod tests {
         assert!(dx + dw <= 1920 && dy + dh <= 1080);
         // Full-frame damage (the guest's "no damage known" / first-flip sentinel) is preserved.
         assert_eq!(clamp_damage(1920, 1080, 0, 0, 1920, 1080), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn vulkan_submit_retires_fence_and_is_bounded() {
+        use infinigpu_abi::wire::{encoding, SubmitCmd};
+        let mut b = InfinigpuBackend::new();
+        let mk = |seqno: u64, payload_len: u32| SubmitCmd {
+            ctx_id: 0,
+            encoding: encoding::VULKAN_VENUSLIKE,
+            payload_len,
+            flags: 0,
+            seqno,
+            in_fence: 0,
+            out_fence: seqno,
+        };
+        // A well-formed 3D submit: the fence retires (guest's submit thread progresses) and the
+        // datapath counter advances — proof a Venus stream reached the device.
+        b.submit_vulkan(&mk(7, 4096), 1);
+        assert_eq!(b.ring_retired[1], 7, "out_fence must retire so the guest progresses");
+        assert_eq!(b.vulkan_submits, 1);
+        // An oversized command stream is dropped fail-closed (not counted as executed) but must
+        // NOT stall the ring — the fence still retires to the new seqno.
+        b.submit_vulkan(&mk(9, 64 * 1024 * 1024 + 1), 1);
+        assert_eq!(b.vulkan_submits, 1, "oversized submit is not counted as executed");
+        assert_eq!(b.ring_retired[1], 9, "even a dropped submit retires its fence (no ring stall)");
+        // A device reset zeroes the per-attach counter.
+        b.reset_state();
+        assert_eq!(b.vulkan_submits, 0);
     }
 }
