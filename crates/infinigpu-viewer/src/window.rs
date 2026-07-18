@@ -12,13 +12,14 @@
 use crate::input;
 use crate::stream::{run_stream, DecodedFrame, FrameSlot};
 use ash::vk;
+use std::collections::HashSet;
 use std::error::Error;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::PhysicalKey;
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 type R<T> = Result<T, Box<dyn Error>>;
@@ -38,6 +39,8 @@ pub fn run(url: &str) -> R<()> {
         net_started: false,
         input_tx,
         input_rx: Some(input_rx),
+        pressed_keys: HashSet::new(),
+        pressed_buttons: HashSet::new(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -53,6 +56,11 @@ struct App {
     input_tx: Sender<String>,
     /// Moved into the stream thread on first `resumed()`.
     input_rx: Option<Receiver<String>>,
+    /// Keys/buttons we've told the guest are DOWN and not yet released. winit delivers no key
+    /// events to an unfocused window, so on focus loss we must synthesize releases for these —
+    /// otherwise a modifier held across an Alt-Tab sticks in the guest (see `release_all`).
+    pressed_keys: HashSet<KeyCode>,
+    pressed_buttons: HashSet<MouseButton>,
 }
 
 impl App {
@@ -61,6 +69,19 @@ impl App {
     fn send_input(&self, msg: Option<String>) {
         if let Some(m) = msg {
             let _ = self.input_tx.send(m);
+        }
+    }
+
+    /// Release every key and mouse button we believe is held, and forget them. Called on focus
+    /// loss: winit stops delivering input to an unfocused window, so a key/button still down
+    /// when focus leaves (e.g. Ctrl/Alt during an Alt-Tab out) would never get its release event
+    /// — the guest would see the modifier stuck. Synthesizing the ups keeps the guest in sync.
+    fn release_all(&mut self) {
+        for code in self.pressed_keys.drain().collect::<Vec<_>>() {
+            self.send_input(input::key(code, false));
+        }
+        for button in self.pressed_buttons.drain().collect::<Vec<_>>() {
+            self.send_input(input::mouse_button(button, false));
         }
     }
 }
@@ -125,9 +146,11 @@ impl ApplicationHandler for App {
                     win.request_redraw(); // keep presenting (frame or not)
                 }
             }
-            // ---- guest input: forwarded to the server only while the pointer is in the
-            // window (CursorMoved / MouseInput / MouseWheel fire only then) and the window
-            // has focus (KeyboardInput). No extra gating needed — winit already scopes them.
+            // ---- guest input: forwarded to the server only while the pointer is in the window
+            // (CursorMoved / MouseInput / MouseWheel fire only then) and the window has focus
+            // (KeyboardInput). winit scopes them — but that scoping is also the hazard: an
+            // unfocused window gets NO events, so a key/button held when focus leaves never gets
+            // its release. We track what's down and flush it all on `Focused(false)` below.
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(win) = self.window.as_ref() {
                     let size = win.inner_size();
@@ -139,7 +162,13 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                self.send_input(input::mouse_button(button, state == ElementState::Pressed));
+                let pressed = state == ElementState::Pressed;
+                if pressed {
+                    self.pressed_buttons.insert(button);
+                } else {
+                    self.pressed_buttons.remove(&button);
+                }
+                self.send_input(input::mouse_button(button, pressed));
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
@@ -149,23 +178,23 @@ impl ApplicationHandler for App {
                 self.send_input(input::wheel(dy));
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                // DIAG: log exactly what winit delivers so a stuck-modifier report can be traced
-                // to whether the RELEASE event even arrives here (and as a mapped PhysicalKey::Code).
-                log::debug!(
-                    "KEY state={:?} repeat={} physical={:?} logical={:?}",
-                    event.state, event.repeat, event.physical_key, event.logical_key
-                );
                 // Skip auto-repeat: send one down + the release; the guest repeats a held key.
                 if !event.repeat {
                     if let PhysicalKey::Code(code) = event.physical_key {
-                        let msg = input::key(code, event.state == ElementState::Pressed);
-                        log::debug!("KEY -> send {msg:?}");
-                        self.send_input(msg);
-                    } else {
-                        log::debug!("KEY -> DROPPED (physical_key is not a mapped Code)");
+                        let pressed = event.state == ElementState::Pressed;
+                        if pressed {
+                            self.pressed_keys.insert(code);
+                        } else {
+                            self.pressed_keys.remove(&code);
+                        }
+                        self.send_input(input::key(code, pressed));
                     }
                 }
             }
+            // Focus left the window (Alt-Tab out, click-away). winit will deliver no further
+            // releases until focus returns, so release everything now — otherwise a held
+            // modifier (Ctrl/Shift/Alt) or mouse button sticks in the guest.
+            WindowEvent::Focused(false) => self.release_all(),
             _ => {}
         }
     }
