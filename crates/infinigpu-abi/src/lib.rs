@@ -61,6 +61,13 @@ mod layout_asserts {
     const _: () = assert!(offset_of!(ClearPresent, scanout_addr) == 24);
     const _: () = assert!(size_of::<ScanoutPresent>() == 24);
     const _: () = assert!(offset_of!(ScanoutPresent, scanout_addr) == 16);
+    // ScanoutPresentDamaged is a ScanoutPresent superset (same prefix + scanout_addr@16)
+    // with a trailing damage rect. Its prefix MUST stay byte-identical so a decoder can read
+    // the common fields from either.
+    const _: () = assert!(size_of::<ScanoutPresentDamaged>() == 40);
+    const _: () = assert!(offset_of!(ScanoutPresentDamaged, scanout_addr) == 16);
+    const _: () = assert!(offset_of!(ScanoutPresentDamaged, dx) == 24);
+    const _: () = assert!(offset_of!(ScanoutPresentDamaged, dh) == 36);
 }
 
 #[cfg(test)]
@@ -81,7 +88,7 @@ mod tests {
             abi_version(),
             (u32::from(ABI_MAJOR) << 16) | u32::from(ABI_MINOR)
         );
-        assert_eq!(abi_version(), 0x0000_0001);
+        assert_eq!(abi_version(), 0x0000_0002);
     }
 
     #[test]

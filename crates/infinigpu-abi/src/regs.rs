@@ -103,6 +103,12 @@ pub mod caps {
     /// the (trapped) doorbell to wake an idle poller, not on every submit. This is
     /// the default submission model given the crate's lack of ioeventfd.
     pub const POLL_SUBMIT: u32 = 1 << 4;
+    /// Accelerated 2D present path: the device accepts the damage-carrying
+    /// `DISPLAY_SCANOUT_DAMAGE` present (and, in later rungs, host-GPU convert/composite +
+    /// a hardware cursor). The guest gates its accelerated path on this bit and falls back
+    /// to full-frame `DISPLAY_SCANOUT` when it is clear — so an old device, or this device
+    /// on a host without GPU acceleration, keeps working.
+    pub const DISPLAY_ACCEL: u32 = 1 << 5;
 }
 
 /// `GLOBAL_CTRL` (`0x0020`) bits.
@@ -127,3 +133,7 @@ pub mod ring_ctrl {
 /// The `DEV_CAPS` value the Phase-0 device advertises on the stock crate:
 /// polled submission, 64-bit seqno, multi-ring-capable ABI. No ioeventfd, no BAR2.
 pub const PHASE0_DEV_CAPS: u32 = caps::POLL_SUBMIT | caps::SEQNO64 | caps::MULTI_RING;
+
+/// The `DEV_CAPS` a Phase-1 (2D-accelerated) device advertises: Phase-0 plus the
+/// damage-carrying present path ([`caps::DISPLAY_ACCEL`]).
+pub const PHASE1_DEV_CAPS: u32 = PHASE0_DEV_CAPS | caps::DISPLAY_ACCEL;

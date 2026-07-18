@@ -228,3 +228,46 @@ struct ScanoutPresent {
    */
   uint64_t scanout_addr;
 };
+
+/**
+ * `DISPLAY_SCANOUT_DAMAGE` payload (see [`encoding::DISPLAY_SCANOUT_DAMAGE`]): a
+ * [`ScanoutPresent`] **superset** that appends a damage rect. The first four fields plus
+ * `scanout_addr` are byte-identical to [`ScanoutPresent`] (same offsets), so a decoder can
+ * read the common prefix from either. `dx,dy,dw,dh` describe the only region that changed
+ * since the previous present, in the same pixel space as `width`/`height`. The guest fills
+ * it from the merged clip `drm_atomic_helper_damage_merged` already computes; a full-frame
+ * present sets `dx=dy=0, dw=width, dh=height` (e.g. the first flip after a modeset, or when
+ * no damage is known).
+ */
+struct ScanoutPresentDamaged {
+  uint32_t width;
+  uint32_t height;
+  /**
+   * Bytes per row (may exceed `width * 4` for alignment).
+   */
+  uint32_t pitch;
+  /**
+   * [`format`] tag; fbcon's default 32-bpp buffer is `XRGB8888` = [`format::B8G8R8X8`].
+   */
+  uint32_t format;
+  /**
+   * Guest-physical base address of the framebuffer.
+   */
+  uint64_t scanout_addr;
+  /**
+   * Damage rect origin x.
+   */
+  uint32_t dx;
+  /**
+   * Damage rect origin y.
+   */
+  uint32_t dy;
+  /**
+   * Damage rect width (`dw==width && dh==height` is a full-frame present).
+   */
+  uint32_t dw;
+  /**
+   * Damage rect height.
+   */
+  uint32_t dh;
+};

@@ -45,6 +45,9 @@ pub mod capset {
     pub const CAP_VULKAN: u32 = 1 << 0;
     pub const CAP_D3D12: u32 = 1 << 1;
     pub const CAP_DISPLAY_ONLY: u32 = 1 << 2;
+    /// Accelerated 2D present: damage-rect scan-out + (later rungs) host-GPU
+    /// convert/composite and a hardware cursor. Paired with the `DISPLAY_ACCEL` DEV_CAPS bit.
+    pub const CAP_DISPLAY_2D: u32 = 1 << 3;
 }
 
 /// `CtxCreate::api_type`.
@@ -70,6 +73,12 @@ pub mod encoding {
     /// (opposite direction to [`DISPLAY_CLEAR`], which writes) and presents it. This
     /// is what the real Linux DRM/KMS guest driver submits on every page-flip.
     pub const DISPLAY_SCANOUT: u32 = 0x0101;
+    /// Like [`DISPLAY_SCANOUT`] but the payload is a [`super::ScanoutPresentDamaged`],
+    /// which appends a damage rect (`dx,dy,dw,dh`): only that sub-region changed since the
+    /// last present, so the host reads/converts/encodes just those rows into a persistent
+    /// per-VM scanout surface. Additive — a device advertising `DISPLAY_ACCEL`
+    /// (`regs::caps`) accepts it; a legacy guest keeps sending full-frame `DISPLAY_SCANOUT`.
+    pub const DISPLAY_SCANOUT_DAMAGE: u32 = 0x0102;
 }
 
 /// `ResourceCreateBlob::blob_mem` (virtio-gpu blob semantics).
@@ -296,4 +305,33 @@ pub struct ScanoutPresent {
     pub format: u32,
     /// Guest-physical base address of the framebuffer.
     pub scanout_addr: u64,
+}
+
+/// `DISPLAY_SCANOUT_DAMAGE` payload (see [`encoding::DISPLAY_SCANOUT_DAMAGE`]): a
+/// [`ScanoutPresent`] **superset** that appends a damage rect. The first four fields plus
+/// `scanout_addr` are byte-identical to [`ScanoutPresent`] (same offsets), so a decoder can
+/// read the common prefix from either. `dx,dy,dw,dh` describe the only region that changed
+/// since the previous present, in the same pixel space as `width`/`height`. The guest fills
+/// it from the merged clip `drm_atomic_helper_damage_merged` already computes; a full-frame
+/// present sets `dx=dy=0, dw=width, dh=height` (e.g. the first flip after a modeset, or when
+/// no damage is known).
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct ScanoutPresentDamaged {
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per row (may exceed `width * 4` for alignment).
+    pub pitch: u32,
+    /// [`format`] tag; fbcon's default 32-bpp buffer is `XRGB8888` = [`format::B8G8R8X8`].
+    pub format: u32,
+    /// Guest-physical base address of the framebuffer.
+    pub scanout_addr: u64,
+    /// Damage rect origin x.
+    pub dx: u32,
+    /// Damage rect origin y.
+    pub dy: u32,
+    /// Damage rect width (`dw==width && dh==height` is a full-frame present).
+    pub dw: u32,
+    /// Damage rect height.
+    pub dh: u32,
 }

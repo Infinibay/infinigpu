@@ -27,7 +27,10 @@ pub const PCI_CLASS_DISPLAY_VGA: u32 = 0x0003_0000; // 0x030000
 pub const DEV_MAGIC: u32 = 0x4947_5055;
 
 pub const ABI_MAJOR: u16 = 0;
-pub const ABI_MINOR: u16 = 1;
+/// Bumped 1→2 for the additive 2D-accel wire (encoding `DISPLAY_SCANOUT_DAMAGE` +
+/// `ScanoutPresentDamaged` + `DISPLAY_ACCEL`/`CAP_DISPLAY_2D`). Purely additive: a v0.1
+/// peer keeps working (it never sends/accepts the new encoding).
+pub const ABI_MINOR: u16 = 2;
 
 /// Packed `ABI_VERSION` register value (`major << 16 | minor`).
 pub const fn abi_version() -> u32 {
