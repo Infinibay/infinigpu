@@ -7,7 +7,7 @@
 //! primed by the server with the last keyframe (SPS/PPS + IDR), so the decoder
 //! initialises on the first message.
 
-use infinigpu_pixel::{proto, FrameHeader};
+use infinigpu_pixel::{proto, FrameHeader, PlaneHeader};
 use openh264::formats::YUVSource; // brings `dimensions()` into scope for DecodedYUV
 use std::error::Error;
 use std::sync::mpsc::Receiver;
@@ -135,6 +135,24 @@ pub fn run_stream(
                 continue;
             }
         };
+        // Demux by magic: a plane-sideband message (`XIPL`) is not a video frame — route it
+        // away from the decoder so its bytes never reach openh264. The distinct magic means
+        // even an un-updated build safe-drops it in `FrameHeader::parse` below; recognizing it
+        // here keeps it out of the "bad header" warning and readies the PR-C4 overlay handler.
+        if data.len() >= 4
+            && u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == proto::plane::MAGIC
+        {
+            if let Some(ph) = PlaneHeader::parse(&data) {
+                log::debug!(
+                    "recv plane sideband: op={} kind={} id={} ({} body bytes) [overlay handled in PR-C4]",
+                    ph.op,
+                    ph.plane_kind,
+                    ph.plane_id,
+                    data.len().saturating_sub(proto::plane::HEADER_LEN)
+                );
+            }
+            continue;
+        }
         let Some(hdr) = FrameHeader::parse(&data) else {
             log::warn!("dropped a message with a bad/short infiniPixel header");
             continue;

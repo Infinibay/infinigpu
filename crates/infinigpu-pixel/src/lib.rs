@@ -24,7 +24,7 @@
 //! /foveation layer, HEVC/AV1 negotiation, adaptive control, and the local cursor
 //! sprite. None of those change the datapath proven here.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -769,6 +769,19 @@ impl ClientQueue {
         false
     }
 
+    /// Enqueue a **control** (plane-sideband) message. Independent of the video keyframe chain:
+    /// it bypasses the overflow-shed gate (a shed video backlog must never drop the cursor) and is
+    /// not counted against the video `cap`. Plane control is low-rate and coalesced upstream (the
+    /// device caps MOVE forwarding), so it cannot bloat the queue in practice.
+    fn push_control(&self, msg: Vec<u8>) {
+        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if q.closed {
+            return;
+        }
+        q.items.push_back(msg);
+        self.cv.notify_one();
+    }
+
     /// Consumer (send thread): block for the next message; `None` once closed and drained.
     fn pop(&self) -> Option<Vec<u8>> {
         let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -800,12 +813,26 @@ struct Client {
     alive: Arc<AtomicBool>,
 }
 
-/// Client list + the last keyframe, under **one** lock so that priming a joining client
-/// and broadcasting a keyframe are mutually atomic (below).
+/// Cached last state of one plane (cursor / future media), so a late-joining or reconnecting
+/// client is primed with the current cursor shape + position immediately — video self-heals via
+/// `last_keyframe`+IDR, but a static cursor otherwise shows no bitmap until its next change, which
+/// may never come.
+#[derive(Default, Clone)]
+struct PlaneCache {
+    /// Last `DEFINE` (shape + dims + body) for this plane.
+    last_define: Option<Vec<u8>>,
+    /// Last `MOVE` (server position / visibility), latest-wins.
+    last_move: Option<Vec<u8>>,
+}
+
+/// Client list + the last keyframe + per-plane sideband cache, under **one** lock so that priming
+/// a joining client and broadcasting a keyframe/plane are mutually atomic (below).
 #[derive(Default)]
 struct HubState {
     clients: Vec<Client>,
     last_keyframe: Option<Vec<u8>>,
+    /// Per-plane sideband cache keyed by `plane_id` (0 = cursor).
+    planes: HashMap<u32, PlaneCache>,
 }
 
 /// Fan-out of encoded frames to all connected WebSocket clients. A newly-connected
@@ -883,10 +910,53 @@ impl Hub {
         }
     }
 
+    /// Broadcast one already-framed **plane-sideband** message (`XIPL`) to every client, and
+    /// update the per-plane cache so a future joiner is primed with the current cursor state.
+    /// `op`/`plane_id` come from the message's `PlaneHeader`.
+    ///
+    /// Control messages ride a separate lane from video: they **never** touch the encoder, never
+    /// force an IDR, and bypass the video shed gate — so this is safe to call on the single
+    /// vfio-user callback thread (it only enqueues into each client's non-blocking queue). Dead
+    /// clients are evicted here too, so a static screen (plane traffic only, no video) still reaps.
+    pub fn broadcast_control(&self, plane_id: u32, op: u8, msg: Vec<u8>) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Update the priming cache. DEFINE replaces the shape (and clears the stale move so a
+        // reconnecting client doesn't get a position from a previous shape); MOVE is latest-wins;
+        // DESTROY drops the plane. DATA (media) isn't primed in v1.
+        match op {
+            o if o == proto::plane::op::DEFINE => {
+                let e = st.planes.entry(plane_id).or_default();
+                e.last_define = Some(msg.clone());
+                e.last_move = None;
+            }
+            o if o == proto::plane::op::MOVE => {
+                st.planes.entry(plane_id).or_default().last_move = Some(msg.clone());
+            }
+            o if o == proto::plane::op::DESTROY => {
+                st.planes.remove(&plane_id);
+            }
+            _ => {}
+        }
+        st.clients.retain(|c| {
+            if !c.alive.load(Ordering::Acquire) {
+                c.q.close();
+                return false;
+            }
+            c.q.push_control(msg.clone());
+            true
+        });
+    }
+
     /// Forget the cached keyframe (call when the encoder is re-created for a new
     /// resolution, so a newly-connecting client isn't primed with a stale-size frame).
     pub fn reset_keyframe(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).last_keyframe = None;
+    }
+
+    /// Forget all cached plane state (e.g. on VM re-adoption, so a stale cursor shape isn't
+    /// primed into a new client before the device re-solicits a fresh `CURSOR_UPDATE`).
+    pub fn reset_planes(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).planes.clear();
     }
 
     pub fn client_count(&self) -> usize {
@@ -917,6 +987,16 @@ impl Hub {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(k) = st.last_keyframe.clone() {
                 let _ = q.push(k, true);
+            }
+            // Prime current plane state (cursor shape, then its last position) so a late/reconnecting
+            // client shows the cursor immediately instead of waiting for the next shape change.
+            for cache in st.planes.values() {
+                if let Some(def) = &cache.last_define {
+                    q.push_control(def.clone());
+                }
+                if let Some(mv) = &cache.last_move {
+                    q.push_control(mv.clone());
+                }
             }
             st.clients.push(Client { q: Arc::clone(&q), alive: Arc::clone(&alive) });
         }
@@ -1475,6 +1555,18 @@ impl PixelStreamer {
     pub fn client_count(&self) -> usize {
         self.hub.client_count()
     }
+
+    /// Forward one plane-sideband op (cursor / future media) to every connected client on the
+    /// **control lane**. Builds the `XIPL` wire message from `hdr` + `body` and hands it to the
+    /// Hub, which caches it for late-joiner priming and enqueues it non-blocking per client.
+    ///
+    /// This **never** touches the encoder (no `ensure_encoder`, no ffmpeg spawn, no IDR) — the
+    /// whole point of the sideband is that it is safe to call from the single vfio-user callback
+    /// thread without risking the guest-scanout/BQL stall a re-encode would cause.
+    pub fn send_plane(&self, hdr: &PlaneHeader, body: &[u8]) {
+        self.hub
+            .broadcast_control(hdr.plane_id, hdr.op, hdr.message(body));
+    }
 }
 
 // ------------------------------- Test frame source ----------------------------------
@@ -1645,6 +1737,99 @@ mod tests {
         assert!(FrameHeader::parse(&plane).is_none());
         // …and a video frame is dropped by the plane parser.
         assert!(PlaneHeader::parse(&video).is_none());
+    }
+
+    fn cursor_hdr(op: u8, payload_len: u32) -> PlaneHeader {
+        PlaneHeader {
+            op,
+            plane_kind: proto::plane::kind::CURSOR,
+            flags: proto::plane::flags::VISIBLE,
+            plane_id: 0,
+            codec_or_format: 1,
+            z_order: 0,
+            width: 16,
+            height: 16,
+            hot_x: 0,
+            hot_y: 0,
+            pos_x: 5,
+            pos_y: 6,
+            payload_len,
+        }
+    }
+
+    #[test]
+    fn control_lane_bypasses_video_shed() {
+        let q = ClientQueue::new();
+        // Overflow the bounded video queue → it sheds (drops the backlog, enters `dropping`).
+        let mut shed = false;
+        for _ in 0..(max_client_queue() + 1) {
+            shed |= q.push(vec![0xAA], false); // P-frames, never keyframes
+        }
+        assert!(shed, "video queue must shed once it exceeds cap");
+        // A cursor control message must still be delivered while the video backlog is shed.
+        q.push_control(vec![0xC0, 0xC1]);
+        assert_eq!(q.pop(), Some(vec![0xC0, 0xC1]));
+    }
+
+    #[test]
+    fn broadcast_control_caches_and_delivers() {
+        let hub = Hub::new();
+        let q = ClientQueue::new();
+        hub.state.lock().unwrap().clients.push(Client {
+            q: Arc::clone(&q),
+            alive: Arc::new(AtomicBool::new(true)),
+        });
+
+        let def = cursor_hdr(proto::plane::op::DEFINE, 4);
+        hub.broadcast_control(def.plane_id, def.op, def.message(&[1, 2, 3, 4]));
+        let got = q.pop().expect("client received the DEFINE");
+        assert_eq!(&got[0..4], &proto::plane::MAGIC.to_le_bytes());
+        {
+            let st = hub.state.lock().unwrap();
+            let c = st.planes.get(&0).unwrap();
+            assert!(c.last_define.is_some());
+            assert!(c.last_move.is_none(), "DEFINE clears any stale move");
+        }
+
+        let mv = cursor_hdr(proto::plane::op::MOVE, 0);
+        hub.broadcast_control(mv.plane_id, mv.op, mv.message(&[]));
+        let _ = q.pop().unwrap();
+        assert!(hub.state.lock().unwrap().planes.get(&0).unwrap().last_move.is_some());
+
+        let de = cursor_hdr(proto::plane::op::DESTROY, 0);
+        hub.broadcast_control(de.plane_id, de.op, de.message(&[]));
+        let _ = q.pop().unwrap();
+        assert!(hub.state.lock().unwrap().planes.get(&0).is_none(), "DESTROY drops the plane");
+    }
+
+    #[test]
+    fn late_joiner_is_primed_with_cursor_state() {
+        let hub = Hub::new();
+        // Cache a shape then a position with no clients connected.
+        let def = cursor_hdr(proto::plane::op::DEFINE, 4);
+        hub.broadcast_control(def.plane_id, def.op, def.message(&[9, 9, 9, 9]));
+        let mv = cursor_hdr(proto::plane::op::MOVE, 0);
+        hub.broadcast_control(mv.plane_id, mv.op, mv.message(&[]));
+
+        // Replay register()'s prime step into a fresh queue.
+        let q = ClientQueue::new();
+        {
+            let st = hub.state.lock().unwrap();
+            for cache in st.planes.values() {
+                if let Some(d) = &cache.last_define {
+                    q.push_control(d.clone());
+                }
+                if let Some(m) = &cache.last_move {
+                    q.push_control(m.clone());
+                }
+            }
+        }
+        let first = q.pop().unwrap();
+        let second = q.pop().unwrap();
+        assert_eq!(first.len(), proto::plane::HEADER_LEN + 4, "DEFINE carries the shape body");
+        assert_eq!(second.len(), proto::plane::HEADER_LEN, "MOVE is header-only");
+        assert_eq!(PlaneHeader::parse(&first).unwrap().op, proto::plane::op::DEFINE);
+        assert_eq!(PlaneHeader::parse(&second).unwrap().op, proto::plane::op::MOVE);
     }
 
     #[test]

@@ -46,6 +46,9 @@
 // infiniPixel v0 browser client: parse the owned frame protocol off a WebSocket and
 // decode H.264 access units with WebCodecs (low-latency) onto a canvas.
 const MAGIC = 0x49504958, HDR = 32;
+// Plane-sideband magic ("XIPL"): cursor / future media on the same socket. Not a video frame —
+// dropped here so its bytes never reach WebCodecs (the client-side overlay lands in PR-C4).
+const PLANE_MAGIC = 0x4c504958;
 const q = new URLSearchParams(location.search);
 const port = q.get('port') || '8090';
 const host = q.get('host') || location.hostname || '127.0.0.1';
@@ -103,7 +106,10 @@ ws.onerror = () => { dot.className = 'dot err'; show('Cannot reach <code>ws://' 
 
 ws.onmessage = (ev) => {
   const dv = new DataView(ev.data), u8 = new Uint8Array(ev.data);
-  if (dv.getUint32(0, true) !== MAGIC) return;
+  const magic = dv.getUint32(0, true);
+  if (magic === PLANE_MAGIC) return;   // plane sideband — handled by the PR-C4 overlay, never decoded
+  if (magic !== MAGIC) return;         // defense in depth: never offset-parse a non-XIPI message
+
   const flags = u8[5];
   const w = dv.getUint16(12, true), h = dv.getUint16(14, true);
   const pts = Number(dv.getBigUint64(16, true));
