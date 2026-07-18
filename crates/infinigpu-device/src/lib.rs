@@ -827,8 +827,21 @@ impl InfinigpuBackend {
             log::error!("drain ctx={ctx}: payload {payload_addr:#x} ({len} B) not mapped");
             return;
         }
-        // Dispatch against the resource table first (needs &mut self.resources), then act on the
-        // outcome (the present needs &mut self) — no overlapping borrow.
+        // A SUBMIT_CMD over the real ring carries a `SubmitCmd` header followed by the
+        // encoding-specific body: route it by encoding (display present or 3D Venus submit), the
+        // same command set the Phase-0 single-descriptor path serves. This is how 3D
+        // (`VULKAN_VENUSLIKE`) reaches the device over the unified ring drainer.
+        if desc.msg_type == infinigpu_abi::wire::msg_type::SUBMIT_CMD {
+            use infinigpu_abi::wire::SubmitCmd;
+            use zerocopy::FromBytes;
+            match SubmitCmd::read_from_prefix(&payload) {
+                Ok((sc, enc_payload)) => self.dispatch_submit(&sc, enc_payload, ctx),
+                Err(_) => log::warn!("drain ctx={ctx}: short SUBMIT_CMD dropped"),
+            }
+            return;
+        }
+        // Otherwise dispatch against the resource table first (needs &mut self.resources), then act
+        // on the outcome (the present needs &mut self) — no overlapping borrow.
         match execute_resource(desc, &payload, &mut self.resources) {
             Executed::Flush { res_id, rect } => {
                 self.present_resource_flush(res_id, rect, desc.seqno, ctx)
@@ -839,6 +852,43 @@ impl InfinigpuBackend {
                 log::debug!("drain ctx={ctx}: non-resource msg_type {:#x} ignored", desc.msg_type)
             }
             ok => log::debug!("drain ctx={ctx}: {ok:?}"),
+        }
+    }
+
+    /// Dispatch a `SUBMIT_CMD` drained from the real ring by its encoding — the ring-path twin of
+    /// the Phase-0 `process_ring` match, so the unified drainer serves the same command set.
+    /// Display encodings present; `VULKAN_VENUSLIKE` routes 3D work to the (Phase-0-spike-gated)
+    /// executor. `enc_payload` is the encoding-specific body following the `SubmitCmd` header.
+    fn dispatch_submit(&mut self, sc: &infinigpu_abi::wire::SubmitCmd, enc_payload: &[u8], ctx: usize) {
+        use infinigpu_abi::wire::{encoding, ClearPresent, ScanoutPresent, ScanoutPresentDamaged};
+        use zerocopy::FromBytes;
+        match sc.encoding {
+            encoding::DISPLAY_CLEAR => {
+                if let Ok((cp, _)) = ClearPresent::read_from_prefix(enc_payload) {
+                    self.render_clear_present(&cp, sc.seqno, ctx);
+                }
+            }
+            encoding::DISPLAY_SCANOUT => {
+                if let Ok((sp, _)) = ScanoutPresent::read_from_prefix(enc_payload) {
+                    self.present_scanout(&sp, sc.seqno, ctx);
+                }
+            }
+            encoding::DISPLAY_SCANOUT_DAMAGE => {
+                // Bounded, zero-filled read (ADR-0004 forward-compat), same as the Phase-0 path.
+                let mut pb = [0u8; core::mem::size_of::<ScanoutPresentDamaged>()];
+                let want = if sc.payload_len == 0 {
+                    pb.len()
+                } else {
+                    (sc.payload_len as usize).min(pb.len())
+                };
+                let n = want.min(enc_payload.len());
+                pb[..n].copy_from_slice(&enc_payload[..n]);
+                if let Ok(sp) = ScanoutPresentDamaged::read_from_bytes(&pb) {
+                    self.present_scanout_damaged(&sp, sc.seqno, ctx);
+                }
+            }
+            encoding::VULKAN_VENUSLIKE => self.submit_vulkan(sc, ctx),
+            other => log::warn!("drain ctx={ctx}: unsupported submit encoding {:#x}", other),
         }
     }
 
@@ -1901,6 +1951,75 @@ mod tests {
 
         // Fail-closed: a flush on an unknown resource is a no-op (no panic, no present change).
         b.present_resource_flush(999, (0, 0, 1, 1), 5, CTX);
+
+        unsafe { libc::munmap(ram as *mut libc::c_void, SIZE) };
+    }
+
+    /// 3D over the unified ring drainer: a `SUBMIT_CMD{VULKAN_VENUSLIKE}` published on the real ring
+    /// must reach `submit_vulkan` (counted + fence-retired), not be dropped as "non-resource". This
+    /// is the datapath a guest render node (3D Phase 1) will drive.
+    #[test]
+    fn vulkan_submit_flows_through_the_ring_drainer() {
+        use infinigpu_abi::wire::{encoding, Descriptor, SubmitCmd};
+        use zerocopy::IntoBytes;
+
+        const GUEST_BASE: u64 = 0x9000_0000;
+        const SIZE: usize = 0x1000;
+        const IDX_OFF: usize = 0x0;
+        const DESC_OFF: usize = 0x40;
+        const PAY_OFF: usize = 0x200;
+        const CAP: usize = 4;
+        const CTX: usize = 0;
+
+        let fd = unsafe { libc::memfd_create(c"vk3dram".as_ptr(), 0) };
+        assert!(fd >= 0);
+        assert_eq!(unsafe { libc::ftruncate(fd, SIZE as libc::off_t) }, 0);
+        let ram = unsafe {
+            libc::mmap(std::ptr::null_mut(), SIZE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
+        } as *mut u8;
+        assert_ne!(ram as *mut libc::c_void, libc::MAP_FAILED);
+
+        // A VULKAN_VENUSLIKE submit (no encoding payload — the no-op executor uses only the header).
+        let sc = SubmitCmd {
+            ctx_id: 0,
+            encoding: encoding::VULKAN_VENUSLIKE,
+            payload_len: 0,
+            flags: 0,
+            seqno: 1,
+            in_fence: 0,
+            out_fence: 1,
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(sc.as_bytes().as_ptr(), ram.add(PAY_OFF), sc.as_bytes().len())
+        };
+
+        let mut b = InfinigpuBackend::new();
+        let file = unsafe { <std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(fd) };
+        b.dma.map(GUEST_BASE, 0, SIZE as u64, file).unwrap();
+        b.ring_base[CTX] = GUEST_BASE + DESC_OFF as u64;
+        b.ring_cap[CTX] = CAP as u32;
+        b.ring_index[CTX] = GUEST_BASE + IDX_OFF as u64;
+
+        {
+            let ring = unsafe {
+                drain::ring_over_shared(ram.add(IDX_OFF), ram.add(DESC_OFF), CAP)
+            }
+            .unwrap();
+            ring.push(Descriptor {
+                msg_type: infinigpu_abi::wire::msg_type::SUBMIT_CMD,
+                flags: 0,
+                len: sc.as_bytes().len() as u32,
+                data_offset: (PAY_OFF - DESC_OFF) as u32,
+                seqno: 1,
+                _reserved: 0,
+            })
+            .unwrap();
+        }
+
+        b.process_ring(CTX);
+
+        assert_eq!(b.vulkan_submits, 1, "3D submit reached submit_vulkan via the ring drainer");
+        assert_eq!(b.ring_retired[CTX], 1, "the 3D fence retired");
 
         unsafe { libc::munmap(ram as *mut libc::c_void, SIZE) };
     }
