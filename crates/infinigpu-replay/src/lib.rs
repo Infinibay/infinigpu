@@ -456,8 +456,9 @@ impl HostGpu {
     /// bytes/row) to the GPU, convert it to tightly-packed **`B8G8R8A8`** via a format-converting
     /// `vkCmdBlitImage` on the A5000, and read it back. This is the host-GPU half of the accelerated
     /// 2D convert path — the layer the device's CPU repack (`present_scanout_damaged`) moves onto the
-    /// GPU, and the source of the dma-buf the NVENC ingest (PR7) will consume. Proven on real silicon
-    /// by `convert_present_bgra_on_gpu`. Fail-closed on a geometry that overruns `src_bytes`.
+    /// GPU. Proven on real silicon by `convert_present_bgra_on_gpu`. Fail-closed on a geometry that
+    /// overruns `src_bytes`. For the zero-copy dma-buf variant (PR7 NVENC ingest) see
+    /// [`convert_present_export`](Self::convert_present_export).
     pub fn convert_present(
         &self,
         width: u32,
@@ -466,6 +467,40 @@ impl HostGpu {
         src_format: vk::Format,
         src_bytes: &[u8],
     ) -> R<Frame> {
+        Ok(self
+            .convert_present_inner(width, height, pitch, src_format, src_bytes, false)?
+            .0)
+    }
+
+    /// PR7 enabler: like [`convert_present`](Self::convert_present) but the converted `B8G8R8A8`
+    /// result is *also* copied into a device-local buffer whose memory is **exported as a dma-buf
+    /// fd** — a zero-copy hand-off to the NVENC ingest (no host round-trip needed for the encoder).
+    /// The returned [`Frame`] is the host-readback copy (for verification/tests); the encoder path
+    /// consumes the [`DmaBufExport`]. Errors if the device can't export memory
+    /// ([`can_export`](Self::can_export)). Proven on real silicon by `convert_present_export_dmabuf`.
+    pub fn convert_present_export(
+        &self,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        src_format: vk::Format,
+        src_bytes: &[u8],
+    ) -> R<(Frame, DmaBufExport)> {
+        let (frame, export) =
+            self.convert_present_inner(width, height, pitch, src_format, src_bytes, true)?;
+        let export = export.ok_or("device does not support external-memory fd export")?;
+        Ok((frame, export))
+    }
+
+    fn convert_present_inner(
+        &self,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        src_format: vk::Format,
+        src_bytes: &[u8],
+        export: bool,
+    ) -> R<(Frame, Option<DmaBufExport>)> {
         const DST: vk::Format = vk::Format::B8G8R8A8_UNORM;
         let dev = &self.device;
         if width == 0 || height == 0 || pitch < width.saturating_mul(4) {
@@ -473,6 +508,9 @@ impl HostGpu {
         }
         if (pitch as u64).saturating_mul(height as u64) > src_bytes.len() as u64 {
             return Err("convert_present: src_bytes too small for geometry".into());
+        }
+        if export && self.external_fd.is_none() {
+            return Err("device does not support external-memory fd export".into());
         }
 
         // ---- staging buffer (host-visible) holding the guest bytes ----
@@ -563,6 +601,43 @@ impl HostGpu {
             )?
         };
         unsafe { dev.bind_buffer_memory(rb, rb_mem, 0)? };
+
+        // ---- optional device-local, exportable buffer (dma-buf → NVENC, PR7) ----
+        let (export_buffer, export_mem, export_size, handle_flag, handle_str) = if export {
+            let (flag, s) = if self.dma_buf_supported {
+                (vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT, "dma-buf")
+            } else {
+                (vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD, "opaque-fd")
+            };
+            let mut ext_buf = vk::ExternalMemoryBufferCreateInfo::default().handle_types(flag);
+            let ebuf = unsafe {
+                dev.create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(rb_size)
+                        .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                        .push_next(&mut ext_buf),
+                    None,
+                )?
+            };
+            let ereq = unsafe { dev.get_buffer_memory_requirements(ebuf) };
+            let mut export_alloc = vk::ExportMemoryAllocateInfo::default().handle_types(flag);
+            let emem = unsafe {
+                dev.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(ereq.size)
+                        .memory_type_index(
+                            self.find_mem(ereq.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?,
+                        )
+                        .push_next(&mut export_alloc),
+                    None,
+                )?
+            };
+            unsafe { dev.bind_buffer_memory(ebuf, emem, 0)? };
+            (Some(ebuf), Some(emem), ereq.size, flag, s)
+        } else {
+            (None, None, 0, vk::ExternalMemoryHandleTypeFlags::empty(), "")
+        };
 
         // ---- record: staging→src, blit src→dst (format convert), dst→readback ----
         let pool = unsafe {
@@ -694,6 +769,15 @@ impl HostGpu {
                 rb,
                 &[region],
             );
+            if let Some(ebuf) = export_buffer {
+                dev.cmd_copy_image_to_buffer(
+                    cmd,
+                    dst_img,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    ebuf,
+                    &[region],
+                );
+            }
             dev.end_command_buffer(cmd)?;
         }
 
@@ -710,9 +794,27 @@ impl HostGpu {
             dev.unmap_memory(rb_mem);
             out
         };
+        // Export the device-local copy's memory as an fd (after the GPU wrote it).
+        let export = if let Some(emem) = export_mem {
+            let raw = unsafe {
+                self.external_fd.as_ref().unwrap().get_memory_fd(
+                    &vk::MemoryGetFdInfoKHR::default().memory(emem).handle_type(handle_flag),
+                )?
+            };
+            // SAFETY: fresh fd owned by us; OwnedFd closes it. The exported fd keeps its own
+            // reference to the allocation, so freeing the VkDeviceMemory below is safe.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            Some(DmaBufExport { fd, size: export_size, handle_type: handle_str })
+        } else {
+            None
+        };
         unsafe {
             dev.destroy_fence(fence, None);
             dev.destroy_command_pool(pool, None);
+            if let (Some(ebuf), Some(emem)) = (export_buffer, export_mem) {
+                dev.destroy_buffer(ebuf, None);
+                dev.free_memory(emem, None);
+            }
             dev.destroy_buffer(rb, None);
             dev.free_memory(rb_mem, None);
             dev.destroy_buffer(staging, None);
@@ -722,7 +824,7 @@ impl HostGpu {
             dev.destroy_image(src_img, None);
             dev.free_memory(src_mem, None);
         }
-        Ok(Frame { width, height, rgba })
+        Ok((Frame { width, height, rgba }, export))
     }
 
     /// Render a **shader-executed** triangle: a graphics pipeline built from our
@@ -1229,5 +1331,44 @@ mod tests {
             assert_eq!(frame.rgba[di + 2], p[0]); // R
             assert_eq!(frame.rgba[di + 3], p[3]); // A
         }
+    }
+
+    // PR7 enabler: the converted BGRA is exported as a zero-copy dma-buf fd for NVENC ingest.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn convert_present_export_dmabuf() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        if !gpu.can_export() {
+            eprintln!("skipping: device can't export memory fds");
+            return;
+        }
+        let (w, h): (u32, u32) = (8, 8);
+        let pitch = w * 4;
+        let mut src = vec![0u8; (pitch * h) as usize];
+        for (i, px) in src.chunks_exact_mut(4).enumerate() {
+            px.copy_from_slice(&[(i * 3) as u8, (i * 5) as u8, (i * 7) as u8, 0xFF]);
+        }
+        let (frame, export) = gpu
+            .convert_present_export(w, h, pitch, vk::Format::R8G8B8A8_UNORM, &src)
+            .expect("convert_present_export");
+        // readback still correct (channel swap)
+        for i in 0..(w * h) as usize {
+            assert_eq!(frame.rgba[i * 4], src[i * 4 + 2]); // B
+            assert_eq!(frame.rgba[i * 4 + 2], src[i * 4]); // R
+        }
+        // exported fd is real and big enough to hold the tight BGRA frame.
+        assert!(export.raw_fd() >= 0);
+        assert!(export.size() >= (w * h * 4) as u64, "export too small: {}", export.size());
+        assert!(matches!(export.handle_type(), "dma-buf" | "opaque-fd"));
+        // fd is a live, dup-able handle (proves it's a genuine OS resource, not a stale int).
+        let dup = unsafe { libc::dup(export.raw_fd()) };
+        assert!(dup >= 0, "exported fd not dup-able");
+        unsafe { libc::close(dup) };
     }
 }
