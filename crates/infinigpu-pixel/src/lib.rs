@@ -24,6 +24,7 @@
 //! /foveation layer, HEVC/AV1 negotiation, adaptive control, and the local cursor
 //! sprite. None of those change the datapath proven here.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -31,7 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The infiniPixel wire protocol constants (kept byte-identical with the JS client).
 pub mod proto {
@@ -548,8 +549,113 @@ impl FrameSink {
 
 // ------------------------------------- Hub ------------------------------------------
 
+/// Max frames buffered per client before we shed. At 30fps this caps the standing fan-out
+/// latency at ~`MAX_CLIENT_QUEUE / fps` seconds; overflow collapses to the next keyframe.
+/// Override with `INFINIPIXEL_CLIENT_QUEUE`.
+fn max_client_queue() -> usize {
+    std::env::var("INFINIPIXEL_CLIENT_QUEUE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(8)
+}
+
+/// A **bounded, drop-to-keyframe** per-client send queue. Unlike a plain unbounded mpsc
+/// (the previous design), a slow viewer cannot accumulate unbounded standing latency: when
+/// the backlog exceeds `max_client_queue()` the whole queue is dropped and the client is
+/// re-admitted only at the **next keyframe** — because delivering a subset of the queued
+/// P-frames would desync openh264 until the next IDR anyway. The producer is simultaneously
+/// asked to emit a fresh IDR so the shed client resyncs in ~one frame. This mirrors the
+/// latest-wins [`Mailbox`] coalescing on the encoder-feed side, but with the P-frame-correct
+/// shed (collapse to a keyframe boundary, never drop an arbitrary mid-GOP P-frame).
+struct ClientQueue {
+    inner: Mutex<ClientQueueInner>,
+    cv: Condvar,
+}
+
+struct ClientQueueInner {
+    items: VecDeque<Vec<u8>>,
+    closed: bool,
+    /// After an overflow shed: skip every frame until the next keyframe re-establishes a
+    /// contiguous, decodable run (mirrors the viewer's own keyframe-gated resync).
+    dropping: bool,
+    cap: usize,
+}
+
+impl ClientQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(ClientQueue {
+            inner: Mutex::new(ClientQueueInner {
+                items: VecDeque::new(),
+                closed: false,
+                dropping: false,
+                cap: max_client_queue(),
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// Producer (broadcast side): enqueue one framed message. Returns `true` if the caller
+    /// must force a fresh IDR — i.e. we just shed a backlog and need a keyframe to resync
+    /// this client.
+    fn push(&self, msg: Vec<u8>, keyframe: bool) -> bool {
+        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if q.closed {
+            return false;
+        }
+        if q.dropping {
+            // Shedding a backlog: drop P-frames, re-admit the stream only at a keyframe so
+            // the decoder starts from a self-contained reference.
+            if keyframe {
+                q.dropping = false;
+                q.items.push_back(msg);
+                self.cv.notify_one();
+            }
+            return false;
+        }
+        q.items.push_back(msg);
+        if q.items.len() > q.cap {
+            // The viewer is draining slower than the encoder produces. Delivering only some
+            // of the queued P-frames would desync openh264 until the next IDR anyway, so
+            // collapse to the latest state: drop the whole backlog and wait for a fresh
+            // keyframe. Bounds standing latency at `cap` frames.
+            q.items.clear();
+            q.dropping = true;
+            return true; // ask the producer to emit a fresh IDR now
+        }
+        self.cv.notify_one();
+        false
+    }
+
+    /// Consumer (send thread): block for the next message; `None` once closed and drained.
+    fn pop(&self) -> Option<Vec<u8>> {
+        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(m) = q.items.pop_front() {
+                return Some(m);
+            }
+            if q.closed {
+                return None;
+            }
+            q = self.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Wake the send thread and make it exit (it drains nothing further).
+    fn close(&self) {
+        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        q.closed = true;
+        q.items.clear();
+        self.cv.notify_all();
+    }
+}
+
 struct Client {
-    tx: Sender<Vec<u8>>,
+    q: Arc<ClientQueue>,
+    /// Cleared by the send thread when its blocking `ws.send` fails (viewer gone), so the
+    /// next broadcast evicts this client — the liveness signal the old mpsc got for free
+    /// from a dropped `Receiver`.
+    alive: Arc<AtomicBool>,
 }
 
 /// Client list + the last keyframe, under **one** lock so that priming a joining client
@@ -605,9 +711,27 @@ impl Hub {
         if keyframe {
             st.last_keyframe = Some(msg.clone());
         }
-        // Sends are non-blocking (unbounded std mpsc), so holding the lock across them
-        // adds no stall while keeping prime+insert vs. store+send serialized.
-        st.clients.retain(|c| c.tx.send(msg.clone()).is_ok());
+        // Enqueue into each client's BOUNDED queue (non-blocking). A client whose send thread
+        // has died (blocking `ws.send` failed) is evicted. If any client's queue overflowed —
+        // the viewer is under-draining — it shed its backlog to the next keyframe, so ask the
+        // producer to emit a fresh IDR: the shed client then resyncs in ~one frame instead of
+        // waiting for the next periodic IDR. Holding the lock across the pushes is fine — each
+        // push only touches that client's own mutex briefly and never blocks.
+        let mut need_idr = false;
+        st.clients.retain(|c| {
+            if !c.alive.load(Ordering::Acquire) {
+                c.q.close();
+                return false;
+            }
+            if c.q.push(msg.clone(), keyframe) {
+                need_idr = true;
+            }
+            true
+        });
+        drop(st);
+        if need_idr {
+            self.request_keyframe();
+        }
     }
 
     /// Forget the cached keyframe (call when the encoder is re-created for a new
@@ -634,27 +758,32 @@ impl Hub {
                 return;
             }
         };
-        let (tx, rx) = channel::<Vec<u8>>();
+        let q = ClientQueue::new();
+        let alive = Arc::new(AtomicBool::new(true));
         // Prime + insert under the one lock, so this client is atomic w.r.t. broadcast:
         // it is primed with whatever keyframe is current AND joins the client list before
-        // the next lock release — never primed with K1 but inserted after K2 was sent.
+        // the next lock release — never primed with K1 but inserted after K2 was sent. The
+        // primed frame is a keyframe, so a later overflow shed can resync against it.
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(k) = st.last_keyframe.clone() {
-                let _ = tx.send(k);
+                let _ = q.push(k, true);
             }
-            st.clients.push(Client { tx });
+            st.clients.push(Client { q: Arc::clone(&q), alive: Arc::clone(&alive) });
         }
         // The cached keyframe primed above is stale relative to the live P-frame stream;
         // ask the producer to emit a fresh IDR so this client can decode forward from it.
         self.request_keyframe();
         log::info!("infiniPixel client connected: {peer}");
         thread::spawn(move || {
-            for msg in rx {
+            while let Some(msg) = q.pop() {
                 if ws.send(tungstenite::Message::Binary(msg)).is_err() {
                     break;
                 }
             }
+            // Signal the broadcast side to evict us, and stop draining.
+            alive.store(false, Ordering::Release);
+            q.close();
             let _ = ws.close(None);
             log::info!("infiniPixel client disconnected: {peer}");
         });
@@ -896,9 +1025,16 @@ pub struct PixelStreamer {
     /// cached keyframe (see `ensure_encoder`), so a client that joins while the guest is idle
     /// is still primed with the last valid frame instead of a black screen.
     force_respawn: bool,
+    /// Last time a keyframe-request was serviced by respawning ffmpeg. Rate-limits forced
+    /// IDRs so a persistently-too-slow viewer (which sheds and re-requests every few frames)
+    /// cannot thrash the encoder — it resyncs at most once per [`MIN_FORCED_IDR_INTERVAL`].
+    last_forced_idr: Option<Instant>,
     sent: u64,
     skipped: u64,
 }
+
+/// Minimum spacing between forced-IDR encoder respawns (see [`PixelStreamer::last_forced_idr`]).
+const MIN_FORCED_IDR_INTERVAL: Duration = Duration::from_millis(500);
 
 impl PixelStreamer {
     /// Bind the WebSocket server on `0.0.0.0:port` (synchronously — a port conflict is
@@ -925,6 +1061,7 @@ impl PixelStreamer {
             dedup: Deduper::default(),
             pending_flush: false,
             force_respawn: false,
+            last_forced_idr: None,
             sent: 0,
             skipped: 0,
         })
@@ -1138,12 +1275,23 @@ impl PixelStreamer {
         // un-flushed inside ffmpeg's AU splitter forever — is still primed with the last valid
         // frame rather than a black screen. Serviced even for an unchanged frame.
         if self.hub.take_keyframe_request() {
-            self.force_respawn = true;
-            self.ensure_encoder(w, h)?;
-            self.dedup.changed(bgra); // seed the dedup baseline with this frame
-            self.pending_flush = true;
-            self.push(bgra);
-            return Ok(());
+            let now = Instant::now();
+            let due = self
+                .last_forced_idr
+                .map_or(true, |t| now.duration_since(t) >= MIN_FORCED_IDR_INTERVAL);
+            if due {
+                self.last_forced_idr = Some(now);
+                self.force_respawn = true;
+                self.ensure_encoder(w, h)?;
+                self.dedup.changed(bgra); // seed the dedup baseline with this frame
+                self.pending_flush = true;
+                self.push(bgra);
+                return Ok(());
+            }
+            // Rate-limited: keep the request pending (re-arm) and service it once the interval
+            // clears — an overflow-shed client stays in `dropping` until then or a periodic
+            // IDR. Fall through to normal idle-skip / encode handling for this frame.
+            self.hub.request_keyframe();
         }
         if !self.dedup.changed(bgra) {
             self.skipped += 1;
