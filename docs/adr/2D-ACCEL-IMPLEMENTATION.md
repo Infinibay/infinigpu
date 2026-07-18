@@ -135,12 +135,21 @@ the pivot that makes everything after it reusable for 3D.
 > through it when the param is set (full-ring drops the frame rather than corrupting the ring base;
 > the legacy selftest is skipped on this path).
 >
-> **Remaining (genuinely runtime/hardware-gated):** **runtime validation of the guest `.ko` under
-> QEMU** (does the guest↔device actually exchange frames over the real ring on a running system —
-> the FB lifecycle, DMA coherency, retire timing); the `build_regions(index_fd)` **sparse-mmap BAR2
-> transport** (a zero-copy optimization over the DMA-resident ring — only needed/exercisable under
-> QEMU); and multi-segment scatter-gather backing (phase-1 takes the single-segment shortcut). The
-> PR3 CPU-patch path stays the live fallback.
+> **And the device path is validated over the real vfio-user wire protocol** (the same one QEMU
+> speaks). `tests/pr4_vfio_user.rs` drives the device through a `vfio_user::Client` over a socket —
+> not an in-process shortcut: it DMA-maps guest RAM holding a live SPSC ring + a `RESOURCE_*` stream,
+> programs `CMD_RING_INDEX/BASE/SIZE` over BAR0, rings the doorbell, and asserts the device drained
+> the ring (`head==tail`, `seqno_retired==4` on the shared page), retired the fence register, raised
+> the ring-0 MSI-X, **and actually presented the blob** (verified via the diagnostic PPM) — the
+> off-hardware proxy for QEMU device validation.
+>
+> **Remaining (genuinely runtime/hardware-gated):** **runtime validation of the guest `.ko` inside a
+> booted VM under QEMU** — the one piece no off-hardware harness covers, since it exercises the guest
+> *kernel*'s DMA-coherent ring against a live device (the device seam, the guest producer protocol,
+> and the guest source compile are each already verified separately); the `build_regions(index_fd)`
+> **sparse-mmap BAR2 transport** (a zero-copy optimization over the DMA-resident ring — only
+> needed/exercisable under QEMU); and multi-segment scatter-gather backing (phase-1 takes the
+> single-segment shortcut). The PR3 CPU-patch path stays the live fallback.
 
 - `infinigpu-ring` becomes a device dep; `#[repr(C)]` on `Indices` + `Indices::from_ptr` so the
   loom-verified SPSC pop/retire/len runs over the shared page. New `index.rs`
