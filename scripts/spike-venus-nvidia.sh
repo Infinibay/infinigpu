@@ -22,6 +22,12 @@ MEM_GB="${SPIKE_MEM_GB:-8}"
 HOSTMEM_GB="${SPIKE_HOSTMEM_GB:-4}"
 NVIDIA_ICD="${VK_ICD:-/usr/share/vulkan/icd.d/nvidia_icd.json}"
 QEMU="${QEMU_BIN:-qemu-system-x86_64}"   # the DISTRO qemu, NOT /opt/qemu-vfio-user
+# virtio-gpu-gl needs a GL-capable display backend. On NVIDIA hosts the default `egl-headless` FAILS
+# ("egl: no drm render node available") because the proprietary driver exposes no GBM render node —
+# override, e.g. SPIKE_DISPLAY='egl-headless,rendernode=/dev/dri/renderD128' once NVIDIA GBM works,
+# or run virgl_render_server via RENDER_SERVER_EXEC_PATH (set it to an extracted virgl_render_server
+# if `/usr/libexec/virgl_render_server` is not installed). `-display none` is rejected by -gl devices.
+SPIKE_DISPLAY="${SPIKE_DISPLAY:-egl-headless}"
 
 die() { echo "!! $*" >&2; exit 1; }
 
@@ -70,7 +76,7 @@ exec env VK_DRIVER_FILES="$NVIDIA_ICD" "$QEMU" \
   -object "memory-backend-memfd,id=mem1,size=${MEM_GB}G,share=on" \
   -machine "q35,memory-backend=mem1" \
   -device "virtio-gpu-gl,blob=true,venus=true,hostmem=${HOSTMEM_GB}G,max_hostmem=${HOSTMEM_GB}G" \
-  -display egl-headless \
+  -display "$SPIKE_DISPLAY" \
   -drive "file=${GUEST_IMG},if=virtio,format=qcow2" \
   -device virtio-net-pci,netdev=n0 -netdev user,id=n0 \
   "${@:2}"
