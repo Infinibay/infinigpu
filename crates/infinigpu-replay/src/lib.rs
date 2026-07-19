@@ -251,6 +251,92 @@ impl Drop for RenderScratch<'_> {
     }
 }
 
+/// RAII cleanup for the per-call Vulkan objects of [`HostGpu::convert_present_inner`] — the 2D
+/// format-converting present path. Same rationale as [`RenderScratch`]: register every handle as
+/// it is created so any early `?` frees it instead of leaking on the long-lived, tenant-shared
+/// `VkDevice`. The old success-only teardown block leaked all of these on any error path
+/// (Phase-1 audit, HIGH). `Drop` skips null handles, in dependency-safe order (objects before
+/// the memory they bind).
+struct ConvertScratch<'a> {
+    dev: &'a ash::Device,
+    fence: vk::Fence,
+    pool: vk::CommandPool,
+    export_buffer: vk::Buffer,
+    export_mem: vk::DeviceMemory,
+    rb: vk::Buffer,
+    rb_mem: vk::DeviceMemory,
+    staging: vk::Buffer,
+    st_mem: vk::DeviceMemory,
+    dst_img: vk::Image,
+    dst_mem: vk::DeviceMemory,
+    src_img: vk::Image,
+    src_mem: vk::DeviceMemory,
+}
+
+impl<'a> ConvertScratch<'a> {
+    fn new(dev: &'a ash::Device) -> Self {
+        ConvertScratch {
+            dev,
+            fence: vk::Fence::null(),
+            pool: vk::CommandPool::null(),
+            export_buffer: vk::Buffer::null(),
+            export_mem: vk::DeviceMemory::null(),
+            rb: vk::Buffer::null(),
+            rb_mem: vk::DeviceMemory::null(),
+            staging: vk::Buffer::null(),
+            st_mem: vk::DeviceMemory::null(),
+            dst_img: vk::Image::null(),
+            dst_mem: vk::DeviceMemory::null(),
+            src_img: vk::Image::null(),
+            src_mem: vk::DeviceMemory::null(),
+        }
+    }
+}
+
+impl Drop for ConvertScratch<'_> {
+    fn drop(&mut self) {
+        let d = self.dev;
+        unsafe {
+            if self.fence != vk::Fence::null() {
+                d.destroy_fence(self.fence, None);
+            }
+            if self.pool != vk::CommandPool::null() {
+                d.destroy_command_pool(self.pool, None);
+            }
+            if self.export_buffer != vk::Buffer::null() {
+                d.destroy_buffer(self.export_buffer, None);
+            }
+            if self.export_mem != vk::DeviceMemory::null() {
+                d.free_memory(self.export_mem, None);
+            }
+            if self.rb != vk::Buffer::null() {
+                d.destroy_buffer(self.rb, None);
+            }
+            if self.rb_mem != vk::DeviceMemory::null() {
+                d.free_memory(self.rb_mem, None);
+            }
+            if self.staging != vk::Buffer::null() {
+                d.destroy_buffer(self.staging, None);
+            }
+            if self.st_mem != vk::DeviceMemory::null() {
+                d.free_memory(self.st_mem, None);
+            }
+            if self.dst_img != vk::Image::null() {
+                d.destroy_image(self.dst_img, None);
+            }
+            if self.dst_mem != vk::DeviceMemory::null() {
+                d.free_memory(self.dst_mem, None);
+            }
+            if self.src_img != vk::Image::null() {
+                d.destroy_image(self.src_img, None);
+            }
+            if self.src_mem != vk::DeviceMemory::null() {
+                d.free_memory(self.src_mem, None);
+            }
+        }
+    }
+}
+
 impl HostGpu {
     pub fn device_name(&self) -> &str {
         &self.device_name
@@ -384,6 +470,11 @@ impl HostGpu {
     pub fn render_clear(&self, width: u32, height: u32, clear: [f32; 4]) -> R<Frame> {
         const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
         let dev = &self.device;
+        // RAII cleanup: register each handle into `sc` as it is created so ANY early `?`
+        // frees everything instead of leaking it on the long-lived, tenant-shared VkDevice.
+        // (Same guard render_triangle_inner uses; the old success-only teardown block below
+        // leaked every object on every error path — Phase-1 audit finding, HIGH.)
+        let mut sc = RenderScratch::new(dev);
 
         // ---- color image (device-local) ----
         let image = unsafe {
@@ -407,6 +498,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.image = image;
         let img_req = unsafe { dev.get_image_memory_requirements(image) };
         let img_mem = unsafe {
             dev.allocate_memory(
@@ -419,6 +511,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.img_mem = img_mem;
         unsafe { dev.bind_image_memory(image, img_mem, 0)? };
 
         let view = unsafe {
@@ -431,6 +524,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.view = view;
 
         // ---- render pass: clear -> store, end in TRANSFER_SRC ----
         let attach = vk::AttachmentDescription::default()
@@ -457,6 +551,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.render_pass = render_pass;
 
         let views = [view];
         let framebuffer = unsafe {
@@ -470,6 +565,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.framebuffer = framebuffer;
 
         // ---- host-visible readback buffer ----
         // u64 arithmetic: width*height*4 overflows u32 for large geometries (a debug
@@ -484,6 +580,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.readback = buffer;
         let buf_req = unsafe { dev.get_buffer_memory_requirements(buffer) };
         let buf_mem = unsafe {
             dev.allocate_memory(
@@ -497,6 +594,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.rb_mem = buf_mem;
         unsafe { dev.bind_buffer_memory(buffer, buf_mem, 0)? };
 
         // ---- record ----
@@ -514,6 +612,7 @@ impl HostGpu {
                     .command_buffer_count(1),
             )?[0]
         };
+        sc.pool = pool;
 
         unsafe {
             dev.begin_command_buffer(
@@ -565,6 +664,7 @@ impl HostGpu {
 
         // ---- submit + fence ----
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None)? };
+        sc.fence = fence;
         let cmds = [cmd];
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
         unsafe {
@@ -581,19 +681,8 @@ impl HostGpu {
             out
         };
 
-        // ---- teardown of the per-render objects ----
-        unsafe {
-            dev.destroy_fence(fence, None);
-            dev.destroy_command_pool(pool, None);
-            dev.destroy_buffer(buffer, None);
-            dev.free_memory(buf_mem, None);
-            dev.destroy_framebuffer(framebuffer, None);
-            dev.destroy_render_pass(render_pass, None);
-            dev.destroy_image_view(view, None);
-            dev.destroy_image(image, None);
-            dev.free_memory(img_mem, None);
-        }
-
+        // Per-render objects are freed by `sc` on drop — including on every early-`?` path
+        // above (the previous success-only teardown block leaked them on any error).
         Ok(Frame {
             width,
             height,
@@ -661,6 +750,8 @@ impl HostGpu {
         if export && self.external_fd.is_none() {
             return Err("device does not support external-memory fd export".into());
         }
+        // RAII cleanup for every per-call object (leak fix — see ConvertScratch).
+        let mut sc = ConvertScratch::new(dev);
 
         // ---- staging buffer (host-visible) holding the guest bytes ----
         let staging_size = pitch as u64 * height as u64;
@@ -673,6 +764,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.staging = staging;
         let st_req = unsafe { dev.get_buffer_memory_requirements(staging) };
         let st_mem = unsafe {
             dev.allocate_memory(
@@ -685,6 +777,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.st_mem = st_mem;
         unsafe {
             dev.bind_buffer_memory(staging, st_mem, 0)?;
             let ptr = dev.map_memory(st_mem, 0, staging_size, vk::MemoryMapFlags::empty())? as *mut u8;
@@ -693,7 +786,9 @@ impl HostGpu {
         }
 
         // ---- src image (guest format) + dst image (BGRA), both device-local ----
-        let mk_image = |format: vk::Format| -> R<(vk::Image, vk::DeviceMemory)> {
+        // Register into `sc` as created so an alloc/bind failure on the second image (or any
+        // later `?`) frees the first instead of leaking it (Phase-1 audit leak fix).
+        let mk_image = |sc: &mut ConvertScratch, format: vk::Format, dst: bool| -> R<()> {
             let img = unsafe {
                 dev.create_image(
                     &vk::ImageCreateInfo::default()
@@ -709,6 +804,7 @@ impl HostGpu {
                     None,
                 )?
             };
+            if dst { sc.dst_img = img } else { sc.src_img = img }
             let req = unsafe { dev.get_image_memory_requirements(img) };
             let mem = unsafe {
                 dev.allocate_memory(
@@ -720,11 +816,13 @@ impl HostGpu {
                     None,
                 )?
             };
+            if dst { sc.dst_mem = mem } else { sc.src_mem = mem }
             unsafe { dev.bind_image_memory(img, mem, 0)? };
-            Ok((img, mem))
+            Ok(())
         };
-        let (src_img, src_mem) = mk_image(src_format)?;
-        let (dst_img, dst_mem) = mk_image(DST)?;
+        mk_image(&mut sc, src_format, false)?;
+        mk_image(&mut sc, DST, true)?;
+        let (src_img, dst_img) = (sc.src_img, sc.dst_img);
 
         // ---- tight readback buffer (host-visible) ----
         let rb_size = width as u64 * height as u64 * 4;
@@ -737,6 +835,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.rb = rb;
         let rb_req = unsafe { dev.get_buffer_memory_requirements(rb) };
         let rb_mem = unsafe {
             dev.allocate_memory(
@@ -749,6 +848,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.rb_mem = rb_mem;
         unsafe { dev.bind_buffer_memory(rb, rb_mem, 0)? };
 
         // ---- optional device-local, exportable buffer (dma-buf → NVENC, PR7) ----
@@ -783,6 +883,8 @@ impl HostGpu {
                 )?
             };
             unsafe { dev.bind_buffer_memory(ebuf, emem, 0)? };
+            sc.export_buffer = ebuf;
+            sc.export_mem = emem;
             (Some(ebuf), Some(emem), ereq.size, flag, s)
         } else {
             (None, None, 0, vk::ExternalMemoryHandleTypeFlags::empty(), "")
@@ -795,6 +897,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.pool = pool;
         let cmd = unsafe {
             dev.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -931,6 +1034,7 @@ impl HostGpu {
         }
 
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None)? };
+        sc.fence = fence;
         let cmds = [cmd];
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
         unsafe {
@@ -957,22 +1061,9 @@ impl HostGpu {
         } else {
             None
         };
-        unsafe {
-            dev.destroy_fence(fence, None);
-            dev.destroy_command_pool(pool, None);
-            if let (Some(ebuf), Some(emem)) = (export_buffer, export_mem) {
-                dev.destroy_buffer(ebuf, None);
-                dev.free_memory(emem, None);
-            }
-            dev.destroy_buffer(rb, None);
-            dev.free_memory(rb_mem, None);
-            dev.destroy_buffer(staging, None);
-            dev.free_memory(st_mem, None);
-            dev.destroy_image(dst_img, None);
-            dev.free_memory(dst_mem, None);
-            dev.destroy_image(src_img, None);
-            dev.free_memory(src_mem, None);
-        }
+        // Per-call objects are freed by `sc` on drop — on every early-`?` path too. The exported
+        // fd (if any) holds its own reference to the allocation, so freeing export_mem on drop
+        // after the export is safe (Vulkan spec).
         Ok((Frame { width, height, rgba }, export))
     }
 
