@@ -3,6 +3,9 @@
 Audit of the own-remoting 3D hot path
 (`guest ICD → DRM_IOCTL_INFINIGPU_SUBMIT_FORWARDED → device server (vfio-user) → NVIDIA Vulkan → DMA writeback`).
 
+> For the **reusable method** behind this audit — how to measure, the traps, the hardware truths, the
+> technique menu — see [`MICRO-OPT-PLAYBOOK.md`](./MICRO-OPT-PLAYBOOK.md).
+
 **Metric that matters:** the *queue tail* (p99/p999) under **multi-VM** load, as a share of the frame
 budget — not a single-VM µs mean. **Golden rule:** the data plane is already zero-copy (guest RAM is a
 `memory-backend-memfd,share=on` mapped once; the vfio-user socket carries only control; completion is an
