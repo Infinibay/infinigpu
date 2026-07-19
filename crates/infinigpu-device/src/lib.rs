@@ -23,7 +23,7 @@ pub mod resource;
 
 use dma::DmaTable;
 use infinigpu_abi::regs;
-use infinigpu_replay::{ForwardedDraw, Frame, HostGpu};
+use infinigpu_replay::{ForwardedDraw, Frame, HostGpu, PresentStats};
 use infinigpu_sched::{BrokerConfig, GpuBroker, VmConfig, VmTicket};
 use log::info;
 use std::fs::File;
@@ -135,6 +135,44 @@ impl SharedGpu {
         }
         match g.as_ref().unwrap().render_forwarded(width, height, bg, draw) {
             Ok(f) => Some(f),
+            Err(e) => {
+                log::error!("forwarded render failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Like [`Self::render_forwarded`] but hands the finished pixels to `present` (the guest-scanout
+    /// dma-write) **directly from the readback mapping** — one CPU copy instead of two, and no
+    /// per-frame `Frame` heap allocation (perf finding #5). Falls back to render-then-present when
+    /// the scratch cache is off (identical to the old path). `None` on GPU-open/render failure.
+    pub fn render_forwarded_present<F: FnOnce(&[u8]) -> bool>(
+        &self,
+        width: u32,
+        height: u32,
+        bg: [f32; 4],
+        draw: &ForwardedDraw,
+        present: F,
+    ) -> Option<PresentStats> {
+        let mut g = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            match HostGpu::open() {
+                Ok(x) => {
+                    info!("replay GPU: {} ({:?})", x.device_name(), x.driver_id());
+                    *g = Some(x);
+                }
+                Err(e) => {
+                    log::error!("cannot open replay GPU: {e}");
+                    return None;
+                }
+            }
+        }
+        match g
+            .as_ref()
+            .unwrap()
+            .render_forwarded_present(width, height, bg, draw, present)
+        {
+            Ok(st) => Some(st),
             Err(e) => {
                 log::error!("forwarded render failed: {e}");
                 None
@@ -1220,7 +1258,8 @@ impl InfinigpuBackend {
         // them in when the profiler is enabled.
         let t_start = std::time::Instant::now();
         let mut decode_us = 0u64;
-        let outcome = if op == vk_op::FORWARDED {
+        let scanout_addr = wl.scanout_addr; // 0 → render-only (no scanout present)
+        let (wait_us, render_us, dma_us, presented) = if op == vk_op::FORWARDED {
             // Phase-1 own-ICD path: the guest ICD forwarded a real app's shaders + draw. Decode
             // the tail + SPIR-V (fail-closed on hostile input), then replay it on the GPU.
             let Some(fwd) = decode_forwarded(payload, MAX_CMD_BYTES as usize) else {
@@ -1229,37 +1268,59 @@ impl InfinigpuBackend {
                 return;
             };
             decode_us = t_start.elapsed().as_micros() as u64;
-            self.ticket
-                .as_ref()
-                .unwrap()
-                .run_timed(move || gpu.render_forwarded(w, h, bg, &fwd.as_draw()))
+            // One-copy path: dma-write the frame straight from the GPU readback mapping into the
+            // guest scanout (no intermediate Frame Vec, no per-frame heap alloc — perf finding #5).
+            // The present closure runs inside the timed region, so subtract it back out below.
+            let dma = &self.dma;
+            match self.ticket.as_ref().unwrap().run_timed(move || {
+                gpu.render_forwarded_present(w, h, bg, &fwd.as_draw(), |px| {
+                    scanout_addr == 0 || dma.write(scanout_addr, px)
+                })
+            }) {
+                Ok((Some(ps), st)) => (
+                    st.wait_us,
+                    st.gpu_us.saturating_sub(ps.present_us),
+                    ps.present_us,
+                    ps.presented,
+                ),
+                _ => {
+                    // GPU-open/render failure (already logged) — retire so the ring never wedges.
+                    self.ring_retired[ctx] = sc.seqno;
+                    return;
+                }
+            }
         } else {
-            self.ticket.as_ref().unwrap().run_timed(move || match op {
+            // Triangle/clear (debug + 2D): keep the Frame path, dma-write outside the timed region.
+            let outcome = self.ticket.as_ref().unwrap().run_timed(move || match op {
                 vk_op::TRIANGLE => gpu.render_triangle(w, h, bg),
                 _ => gpu.render_clear(w, h, bg), // vk_op::CLEAR + forward-compat default
-            })
+            });
+            let (frame, st) = match outcome {
+                Ok((Some(f), st)) => (f, st),
+                _ => {
+                    self.ring_retired[ctx] = sc.seqno;
+                    return;
+                }
+            };
+            let t_dma = std::time::Instant::now();
+            let ok = scanout_addr == 0 || self.dma.write(scanout_addr, &frame.rgba);
+            (
+                st.wait_us,
+                st.gpu_us,
+                t_dma.elapsed().as_micros() as u64,
+                ok,
+            )
         };
-        let (frame, stats) = match outcome {
-            Ok((Some(f), st)) => (f, st),
-            _ => {
-                // GPU-open/render failure (already logged) — retire so the ring never wedges.
-                self.ring_retired[ctx] = sc.seqno;
-                return;
-            }
-        };
-        let t_after_render = std::time::Instant::now();
-        // DMA-write the GPU-produced R8G8B8A8 result to the guest scanout (like
-        // render_clear_present) so the guest's page-flip shows it. scanout_addr == 0 → render-only.
-        if wl.scanout_addr != 0 && !self.dma.write(wl.scanout_addr, &frame.rgba) {
-            log::error!("vulkan submit ctx={ctx}: scanout {:#x} not fully mapped", wl.scanout_addr);
+        if !presented {
+            log::error!("vulkan submit ctx={ctx}: scanout {scanout_addr:#x} not fully mapped");
         }
         if let Some(p) = self.profiler.as_mut() {
             let now = std::time::Instant::now();
             p.record(profile::HopSample {
                 decode_us,
-                wait_us: stats.wait_us,
-                render_us: stats.gpu_us,
-                dma_us: now.saturating_duration_since(t_after_render).as_micros() as u64,
+                wait_us,
+                render_us,
+                dma_us,
                 total_us: now.saturating_duration_since(t_start).as_micros() as u64,
             });
         }

@@ -49,21 +49,52 @@ fn main() {
     let draw = ForwardedDraw::builtin_triangle();
     let bg = [0.02f32, 0.02, 0.03, 1.0];
 
+    // Simulated guest scanout: the device dma.writes the frame here. BENCH_PRESENT=1 uses the
+    // one-copy present callback (readback→guest directly); default is the production two-copy path
+    // (render_forwarded allocs+copies a Vec, then we copy that Vec into the scanout like dma.write).
+    let present = env_usize("BENCH_PRESENT", 0) != 0;
+    let mut scanout = vec![0u8; (w * h * 4) as usize];
+    eprintln!("bench{tag}: present(one-copy)={present}");
+
     for _ in 0..warmup {
-        let _ = gpu.render_forwarded(w, h, bg, &draw);
+        if present {
+            let _ = gpu.render_forwarded_present(w, h, bg, &draw, |px| {
+                scanout[..px.len()].copy_from_slice(px);
+                true
+            });
+        } else {
+            if let Ok(f) = gpu.render_forwarded(w, h, bg, &draw) {
+                scanout[..f.rgba.len()].copy_from_slice(&f.rgba);
+            }
+        }
     }
 
     let mut samples: Vec<u64> = Vec::with_capacity(iters);
     let t_all = Instant::now();
     for _ in 0..iters {
         let t = Instant::now();
-        let r = gpu.render_forwarded(w, h, bg, &draw);
+        let ok = if present {
+            gpu.render_forwarded_present(w, h, bg, &draw, |px| {
+                scanout[..px.len()].copy_from_slice(px);
+                true
+            })
+            .is_ok()
+        } else {
+            match gpu.render_forwarded(w, h, bg, &draw) {
+                Ok(f) => {
+                    scanout[..f.rgba.len()].copy_from_slice(&f.rgba);
+                    true
+                }
+                Err(_) => false,
+            }
+        };
         let us = t.elapsed().as_micros() as u64;
-        if r.is_ok() {
+        if ok {
             samples.push(us);
         }
     }
     let wall = t_all.elapsed();
+    std::hint::black_box(&scanout);
 
     samples.sort_unstable();
     let (hits, misses, cached) = gpu.cache_stats();

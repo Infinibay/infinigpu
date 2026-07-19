@@ -36,7 +36,7 @@ Consequences:
 | 8 | NUMA (memfd bind + prealloc, device-server membind) | `QemuCommandBuilder.ts`, `InfinigpuDeviceServer.ts` | **E** | ✅ done (`INFINIGPU_NUMA_NODE`, off) |
 | 3 | `dma_alloc_coherent(total_len, GFP_KERNEL)` per submit (fragmentation) | `igpu_ioctl_submit_forwarded` (`guest/linux/infinigpu.c`) | **B** (KMD pool) | 📐 designed — needs a guest build/test env (KMD DMA/concurrency) |
 | 4 | ICD re-serializes full SPIR-V + malloc/free per submit | `guest/icd/infinigpu_sync.c`, `infinigpu_forwarded.c` | **B** (ICD payload cache) | 📐 designed — guest build/test env |
-| 5 | Two CPU copies of the frame (`map`+`to_vec`, then `dma.write`); dma-buf export unused | `render_triangle_inner`; `submit_vulkan` | **D** | ½ done (Fix B host removes the per-frame re-map); full zero-copy (import guest memfd) is larger |
+| 5 | Two CPU copies of the frame (`map`+`to_vec`, then `dma.write`) + a per-frame heap alloc of the whole frame; dma-buf export unused | `render_forwarded_present`; `submit_vulkan` | **D** | ✅ host one-copy — the device dma-writes straight from the readback mapping (no intermediate `Frame` Vec, no per-frame alloc); rides `INFINIGPU_SCRATCH_CACHE`. Full zero-copy (import guest memfd) still larger |
 | 6 | run_lock over the whole compile+render, inline on the trap thread | `GpuBroker::run` (`infinigpu-sched:590`) | **C** | latent (per-process lock) |
 | 9 | Token-bucket `thread::sleep` up to 50ms on the inline thread (before the lock) | `GpuBroker::run` (`infinigpu-sched:583`) | yield/async | latent |
 
@@ -107,6 +107,30 @@ shared GPU is genuinely busy so the spin usually times out and blocks; at 12 VMs
 it still helps slightly (2145→1979µs) with no regression. **Caveat:** the spin busy-waits, so on a
 CPU-oversubscribed host (VMs > cores) it steals cycles a vCPU could use — hence **default 0 (off)**; enable a
 small value (50–100µs) on well-provisioned hosts. Render validated identical with spin on.
+
+### One-copy present (Fix D, host half)
+
+The frame used to be copied **twice** on the CPU: `render_forwarded` `map`+`to_vec`'d the GPU readback into
+an owned `Frame` Vec (copy 1 + a per-frame heap alloc of the whole frame), then the device `dma.write`'d that
+Vec into the guest scanout (copy 2). `HostGpu::render_forwarded_present` takes a `present: FnOnce(&[u8])`
+closure and calls it **once, on the persistent readback mapping, while the cache mutex is held**, so the
+device copies straight readback→guest — **one copy, zero per-frame allocation**. It rides the Fix-B scratch
+cache (which owns the persistent mapping); with the cache off it falls back to the old render-then-present
+(unchanged 2 copies). The win scales with frame size — negligible at 256×256 (fixed overheads dominate,
+both copies are cache-hot), decisive at desktop resolutions:
+
+| Res | Path | p50 | p99 | p999 | submit/s |
+|-----|------|----:|----:|-----:|---------:|
+| 1080p (8 MB) | 2-copy | 3041µs | 3453µs | 9147µs | 324 |
+| 1080p | **1-copy** | **2077µs (−32%)** | **2489µs (−28%)** | **3528µs (−61%)** | **471 (+45%)** |
+| 720p (3.5 MB) | 2-copy | 1365µs | 1655µs | 3427µs | 725 |
+| 720p | **1-copy** | **1110µs (−19%)** | **1180µs (−29%)** | 3124µs | **943 (+30%)** |
+
+**4 VkDevices @1080p (the multi-VM tail):** worst-VM **p99 11816→7658µs (−35%)**, worst **p999 14475→11439µs
+(−21%)**, and the per-VM latency distribution **collapses from a wild 5.4–11.8 ms spread to a tight, fair
+~7.35 ms** across all VMs. The 2-copy path `mmap`/`munmap`s an 8 MB Vec every frame → page-fault tail spikes
+**and** unfairness (one VM raced ahead while the others starved); removing the alloc makes the tail both lower
+and predictable. Render validated identical (`render_forwarded_matches_builtin`).
 
 ## Fix A (done)
 

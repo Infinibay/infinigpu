@@ -35,6 +35,14 @@ pub struct Frame {
     pub rgba: Vec<u8>,
 }
 
+/// Timing/result of a present-callback render (see [`HostGpu::render_forwarded_present`]).
+pub struct PresentStats {
+    /// How long the `present` closure ran — the single readback→guest copy, in µs.
+    pub present_us: u64,
+    /// What `present` returned (e.g. whether the guest scanout was fully mapped).
+    pub presented: bool,
+}
+
 impl Frame {
     /// Serialize as a binary PPM (P6, RGB — alpha dropped). Openable by any image
     /// viewer; keeps this crate dependency-free.
@@ -1584,17 +1592,44 @@ impl HostGpu {
         Ok(frame)
     }
 
-    /// Fix B: allocation-free forwarded render — reuses the persistent [`SizedScratch`] for
-    /// `(width,height)` (built once, then only the command buffer is re-recorded). Requires the
-    /// pipeline cache (guaranteed: `scratch_enabled` implies `cache_enabled`), so `pipeline_for`
-    /// takes the cached path and never registers into the throwaway guard.
-    fn render_forwarded_cached(
+    /// Like [`Self::render_forwarded`] but hands the finished RGBA straight to `present` (called
+    /// once, while the readback memory is mapped) instead of returning an owned [`Frame`]. Lets the
+    /// device copy the pixels **directly into the guest scanout** — one CPU copy instead of two,
+    /// and no per-frame heap allocation (finding #5). On the Fix-B cached path this is the fast
+    /// route; with the scratch cache off it falls back to a render-then-present (unchanged 2 copies).
+    /// `present` returns success (e.g. whether the guest scanout was fully mapped).
+    pub fn render_forwarded_present<F: FnOnce(&[u8]) -> bool>(
         &self,
         width: u32,
         height: u32,
         bg: [f32; 4],
         draw: &ForwardedDraw,
-    ) -> R<Frame> {
+        present: F,
+    ) -> R<PresentStats> {
+        if self.scratch_enabled {
+            return self.render_forwarded_cached_present(width, height, bg, draw, present);
+        }
+        let (frame, _) = self.render_triangle_inner(width, height, bg, draw, false)?;
+        let tp = Instant::now();
+        let presented = present(&frame.rgba);
+        Ok(PresentStats {
+            present_us: tp.elapsed().as_micros() as u64,
+            presented,
+        })
+    }
+
+    /// Fix B: allocation-free forwarded render — reuses the persistent [`SizedScratch`] for
+    /// `(width,height)` (built once, then only the command buffer is re-recorded). Requires the
+    /// pipeline cache (guaranteed: `scratch_enabled` implies `cache_enabled`), so `pipeline_for`
+    /// takes the cached path and never registers into the throwaway guard.
+    fn render_forwarded_cached_present<F: FnOnce(&[u8]) -> bool>(
+        &self,
+        width: u32,
+        height: u32,
+        bg: [f32; 4],
+        draw: &ForwardedDraw,
+        present: F,
+    ) -> R<PresentStats> {
         const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
         let dev = &self.device;
         let bd = self.breakdown.as_ref();
@@ -1698,9 +1733,15 @@ impl HostGpu {
                     .size(vk::WHOLE_SIZE)])?;
             }
         }
-        let rgba = unsafe {
-            std::slice::from_raw_parts(ss.rb_ptr as *const u8, ss.size as usize).to_vec()
-        };
+        // One copy, straight from the persistent readback mapping into the caller's target (the
+        // guest scanout) — no intermediate Vec (finding #5: kill the second CPU copy + the
+        // per-frame 256 KB heap alloc). Sound because the mapping lives as long as `ss`, and the
+        // cache mutex is still held here.
+        let slice =
+            unsafe { std::slice::from_raw_parts(ss.rb_ptr as *const u8, ss.size as usize) };
+        let tp = Instant::now();
+        let presented = present(slice);
+        let present_us = tp.elapsed().as_micros() as u64;
         if let Some(bd) = bd {
             let t_copy = Instant::now();
             let d = |a: Option<Instant>, b: Option<Instant>| {
@@ -1721,6 +1762,23 @@ impl HostGpu {
                 );
             }
         }
+        Ok(PresentStats { present_us, presented })
+    }
+
+    /// Vec-returning wrapper over [`Self::render_forwarded_cached_present`] — adds the copy back
+    /// into an owned [`Frame`] for callers/tests that want the pixels (the bench, PPM dumps).
+    fn render_forwarded_cached(
+        &self,
+        width: u32,
+        height: u32,
+        bg: [f32; 4],
+        draw: &ForwardedDraw,
+    ) -> R<Frame> {
+        let mut rgba = Vec::new();
+        self.render_forwarded_cached_present(width, height, bg, draw, |px| {
+            rgba = px.to_vec();
+            true
+        })?;
         Ok(Frame { width, height, rgba })
     }
 
