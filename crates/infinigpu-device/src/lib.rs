@@ -1440,21 +1440,26 @@ impl InfinigpuBackend {
             self.last_scanout = Some(ScanoutBuffer { w, h, bgra });
             self.bytes_read_last = fb_bytes;
         } else if dw > 0 && dh > 0 {
-            // Incremental: DMA-read only the `dh` damaged rows (each `dw*4` bytes) straight
-            // from the sub-rectangle and repack them into the persistent surface. `unwrap`
-            // is sound — `need_full` was false, so `last_scanout` is `Some`.
-            let b = self.last_scanout.as_mut().unwrap();
-            let mut row_buf = vec![0u8; dw * 4];
+            // Incremental: DMA-read ALL `dh` damaged rows (each `dw*4` bytes) into a scratch first;
+            // only once every read has succeeded do we repack them into the persistent surface — so
+            // a mid-rect DMA failure leaves the surface untouched (no partial/torn update) and we
+            // don't retire, letting the guest re-present. (Previously the writes were interleaved
+            // with the reads, so a failure left the already-processed rows applied — audit finding.)
+            let mut rows = vec![0u8; dw * dh * 4];
             for r in 0..dh {
                 let y = dy + r;
                 let src = sp.scanout_addr + (y as u64) * (pitch as u64) + (dx as u64) * 4;
-                if !self.dma.read(src, &mut row_buf) {
-                    // Fail-closed: leave the surface untouched and do NOT retire, so the
-                    // guest re-presents instead of the viewer seeing a torn row.
+                if !self.dma.read(src, &mut rows[r * dw * 4..(r + 1) * dw * 4]) {
                     log::error!("present(dmg): damaged row {y} @ {src:#x} not mapped");
                     return;
                 }
+            }
+            // `unwrap` is sound — `need_full` was false, so `last_scanout` is `Some`.
+            let b = self.last_scanout.as_mut().unwrap();
+            for r in 0..dh {
+                let y = dy + r;
                 let dst_row = (y * w + dx) * 4;
+                let row_buf = &rows[r * dw * 4..(r + 1) * dw * 4];
                 for x in 0..dw {
                     let px = &row_buf[x * 4..x * 4 + 4];
                     let o4 = dst_row + x * 4;
