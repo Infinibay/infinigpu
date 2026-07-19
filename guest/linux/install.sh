@@ -40,13 +40,29 @@ fi
 # 3. register the module source with DKMS (build happens on first boot).
 if command -v dkms >/dev/null 2>&1; then
   rm -rf "$DEST"; mkdir -p "$DEST"
+  # infinigpu.c does #include "infinigpu_drm.h"; the Makefile's -I../include does NOT resolve
+  # in the flat DKMS build dir, so ship the header FLAT next to the .c — the quote-include then
+  # finds it locally. Omitting it is the classic `fatal error: infinigpu_drm.h` build failure.
   cp -f "$SRC_DIR/infinigpu.c" "$SRC_DIR/Makefile" "$SRC_DIR/dkms.conf" "$DEST/" 2>&1 | tee -a "$LOG"
+  if [ -f "$SRC_DIR/infinigpu_drm.h" ]; then
+    cp -f "$SRC_DIR/infinigpu_drm.h" "$DEST/" 2>&1 | tee -a "$LOG"
+  else
+    log "[WARN] infinigpu_drm.h missing from bundle — the DKMS build will fail; re-stage with a fixed build-into.sh"
+  fi
   dkms remove -m infinigpu -v "$VERSION" --all 2>/dev/null || true
   if dkms add -m infinigpu -v "$VERSION" 2>&1 | tee -a "$LOG"; then
     # Best-effort build now (only succeeds if headers for the running kernel exist);
     # AUTOINSTALL=yes + the dkms service guarantees a build on first boot regardless.
     dkms autoinstall 2>&1 | tee -a "$LOG" || log "[INFO] deferred DKMS build to first boot"
     systemctl enable dkms.service 2>/dev/null || true
+    # Verify the build actually produced a loadable module — DKMS 'added' but a failed compile
+    # (e.g. a missing header) leaves NO .ko and the guest silently boots with no /dev/dri.
+    if dkms status -m infinigpu -v "$VERSION" 2>/dev/null | grep -qiE "installed|built"; then
+      log "[OK] DKMS built + installed infinigpu.ko"
+    else
+      log "[WARN] DKMS registered but NOT yet built (deferred to first boot, or the build failed)."
+      log "       Check: dkms status; and /var/lib/dkms/infinigpu/$VERSION/build/make.log"
+    fi
     log "[OK] registered with DKMS (builds against the installed kernel on first boot)"
   else
     log "[WARN] dkms add failed — see $LOG"
@@ -60,6 +76,14 @@ mkdir -p /etc/modules-load.d
 printf 'drm_dma_helper\ninfinigpu\n' > /etc/modules-load.d/infinigpu.conf
 log "[OK] /etc/modules-load.d/infinigpu.conf written"
 
+# 4b. Load with ring_drainer=1. The 3D forwarded-submit ioctl (the Vulkan render path) is
+# gated behind this module param — without it every vkQueueSubmit returns DEVICE_LOST
+# (KMD ioctl -ENODEV). The display/2D path also uses the real ring (RESOURCE_* blob scanout)
+# when it's on. Default-off in the module is a dev safeguard; a GPU VM always wants it on.
+mkdir -p /etc/modprobe.d
+printf 'options infinigpu ring_drainer=1\n' > /etc/modprobe.d/infinigpu.conf
+log "[OK] /etc/modprobe.d/infinigpu.conf written (ring_drainer=1 → 3D submit enabled)"
+
 # 5. Vulkan ICD (userspace driver): unlike the DKMS kernel module, the ICD is a
 #    compiled Mesa-tree artifact shipped PREBUILT in this bundle. Install the .so where
 #    the manifest's library_path points and drop the manifest in the loader search path.
@@ -71,8 +95,12 @@ if [ -f "$SRC_DIR/libvulkan_infinigpu.so" ] && [ -f "$SRC_DIR/infinigpu_icd.json
   install -m0644 "$SRC_DIR/infinigpu_icd.json" "$ICDDIR/infinigpu_icd.x86_64.json"
   ldconfig 2>/dev/null || true
   # Vulkan loader + libdrm at runtime; headers/tools for the validation app (best-effort).
+  # NOTE: deliberately NOT installing mesa-vulkan-drivers — its lavapipe/llvmpipe ICD is a
+  # competing software fallback that an app would silently pick when the infinigpu ICD isn't
+  # enumerating, masking a real failure as a (CPU-rendered) pass. The infinigpu ICD is the
+  # only Vulkan driver a GPU VM should have.
   if [ "$PM" = apt ]; then
-    apt-get install -y libvulkan1 libdrm2 mesa-vulkan-drivers vulkan-tools libvulkan-dev 2>&1 | tee -a "$LOG" || true
+    apt-get install -y libvulkan1 libdrm2 vulkan-tools libvulkan-dev 2>&1 | tee -a "$LOG" || true
   else
     dnf install -y vulkan-loader libdrm vulkan-tools vulkan-headers 2>&1 | tee -a "$LOG" || true
   fi

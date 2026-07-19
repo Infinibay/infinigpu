@@ -77,6 +77,11 @@ if [ -d "${INFINIBAY_BASE_DIR:-/opt/infinibay}" ]; then
   STAGE="$(mktemp -d)"
   cp "${SRC}/guest/linux/infinigpu.c" "${SRC}/guest/linux/Makefile" \
      "${SRC}/guest/linux/dkms.conf" "${SRC}/guest/linux/install.sh" "${STAGE}/"
+  # The render-node uAPI header infinigpu.c includes ("infinigpu_drm.h") lives in
+  # guest/include; DKMS builds from a FLAT source dir, so ship the header alongside the
+  # .c (the quote-include then resolves it locally). Without it the in-guest DKMS build
+  # fails `fatal error: infinigpu_drm.h: No such file or directory` and the .ko never loads.
+  cp "${SRC}/guest/include/infinigpu_drm.h" "${STAGE}/"
   if [ -f "${SRC}/target/icd/libvulkan_infinigpu.so" ] && [ -f "${SRC}/target/icd/infinigpu_icd.json" ]; then
     cp "${SRC}/target/icd/libvulkan_infinigpu.so" "${SRC}/target/icd/infinigpu_icd.json" "${STAGE}/"
     cp "${SRC}/guest/icd/infinigpu_tri_test.c" "${SRC}/guest/icd/infinigpu_tri_spv.h" "${STAGE}/" 2>/dev/null || true
