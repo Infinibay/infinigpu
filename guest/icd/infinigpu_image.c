@@ -68,8 +68,16 @@ infinigpu_GetImageMemoryRequirements2(VkDevice _device,
    vk_foreach_struct(ext, pMemoryRequirements->pNext) {
       if (ext->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
          VkMemoryDedicatedRequirements *ded = (void *)ext;
-         ded->prefersDedicatedAllocation = false;
-         ded->requiresDedicatedAllocation = false;
+         /* Require a dedicated allocation so every image is bound at offset 0 of its own BO.
+          * Interim fix: the host writeback (DMA to the scanout / render target) uses the BO base
+          * address and ignores VkBindImageMemoryInfo::memoryOffset, while the read paths add it —
+          * so a sub-allocated image (VMA binds many images into one VkDeviceMemory at nonzero
+          * offsets by default) would get the GPU result written at offset 0, clobbering a neighbour
+          * and reading black. Forcing dedicated allocation makes the offset-0 invariant hold. The
+          * real fix threads memoryOffset through the SUBMIT_FORWARDED ioctl (ABI bump); until then
+          * this trades a little VRAM for correctness. */
+         ded->prefersDedicatedAllocation = true;
+         ded->requiresDedicatedAllocation = true;
       }
    }
 }
