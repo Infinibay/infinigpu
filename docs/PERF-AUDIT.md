@@ -135,6 +135,34 @@ both copies are cache-hot), decisive at desktop resolutions:
 **and** unfairness (one VM raced ahead while the others starved); removing the alloc makes the tail both lower
 and predictable. Render validated identical (`render_forwarded_matches_builtin`).
 
+### Where the time is now (phase attribution — the micro-opt surface is exhausted)
+
+After Fix A + Fix B + one-copy present + fence-spin, a per-phase breakdown at **1080p** (`INFINIGPU_BREAKDOWN=1`)
+shows only two phases matter; the rest are noise:
+
+| Phase | Solo | 4-VM | Notes |
+|-------|-----:|-----:|-------|
+| setup | ~8µs | ~8µs | mutex + SPIR-V hash + lookups — **0.4%**, flat under load |
+| record | ~22µs | ~23µs | ~11 command-buffer calls — **~0.5%**, flat under load |
+| **gpu(submit+wait)** | **~1.29ms** | **~3.92ms (3×)** | dominated by the **8 MB device→host readback DMA over PCIe** + GPU exec; the 3× growth is shared-GPU contention |
+| **copy (present)** | **~1.0–1.15ms** | **~0.88ms** | **99.98% CPU memcpy** (8 MB, cache-cold ≈ 7 GB/s); the per-frame `vkInvalidateMappedMemoryRanges` is **216 ns** (a noop on NVIDIA); per-process, does not grow under contention |
+
+So every cheap lever is spent — allocation churn (Fix B), the second CPU copy (one-copy present), the
+fence-wait context switch (fence-spin), and the compile (Fix A) are all gone; `setup`+`record`+`invalidate`
+are together **<1.5%** and not worth touching. The two remaining costs are **structural**, and each maps to
+one of the already-designed architectural fixes:
+
+- **`gpu` (1.3–3.9 ms)** → **Fix F (async submit)**: overlap frame N+1's GPU work with N's readback+copy so the
+  PCIe DMA and the copy are hidden behind the next submit. Under multi-VM it is ultimately GPU-contention-bound
+  (a shared broker + real serialization is the QoS lever, not a micro-opt).
+- **`copy` (~1 ms pure memcpy)** → **Fix D-full (zero-copy)**: import the guest scanout memfd as Vulkan external
+  memory and `cmd_copy_image_to_buffer` **straight into guest RAM**, removing both the CPU memcpy *and* the
+  intermediate host readback buffer (the DMA lands in guest memory directly). This is the single biggest
+  remaining win (~1 ms/frame) but needs the memfd-import plumbing and a real guest/QEMU env to validate.
+
+Both require the owner's host + a decision; neither is safe to write blind. This is the honest stop line for
+the shell-measurable micro-opt phase.
+
 ## Fix A (done)
 
 `HostGpu` owns a real `VkPipelineCache` + a SPIR-V-hash-keyed memo (`GpuObjCache`) of shader modules, render

@@ -511,6 +511,9 @@ struct Breakdown {
     record_ns: AtomicU64,
     gpu_ns: AtomicU64,
     copy_ns: AtomicU64,
+    /// The `present` closure alone (the readback→dst memcpy); `copy_ns - present_ns` ≈ the
+    /// per-frame `vkInvalidateMappedMemoryRanges`.
+    present_ns: AtomicU64,
     count: AtomicU64,
 }
 
@@ -1741,7 +1744,8 @@ impl HostGpu {
             unsafe { std::slice::from_raw_parts(ss.rb_ptr as *const u8, ss.size as usize) };
         let tp = Instant::now();
         let presented = present(slice);
-        let present_us = tp.elapsed().as_micros() as u64;
+        let present_dur = tp.elapsed();
+        let present_us = present_dur.as_micros() as u64;
         if let Some(bd) = bd {
             let t_copy = Instant::now();
             let d = |a: Option<Instant>, b: Option<Instant>| {
@@ -1751,14 +1755,18 @@ impl HostGpu {
             bd.record_ns.fetch_add(d(t_setup, t_record), Ordering::Relaxed);
             bd.gpu_ns.fetch_add(d(t_record, t_gpu), Ordering::Relaxed);
             bd.copy_ns.fetch_add(d(t_gpu, Some(t_copy)), Ordering::Relaxed);
+            bd.present_ns
+                .fetch_add(present_dur.as_nanos() as u64, Ordering::Relaxed);
             let n = bd.count.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_multiple_of(1000) {
                 eprintln!(
-                    "breakdown (avg/{n}): setup={}ns record={}ns gpu(submit+wait)={}ns copy={}ns",
+                    "breakdown (avg/{n}): setup={}ns record={}ns gpu(submit+wait)={}ns copy={}ns (memcpy={}ns invalidate={}ns)",
                     bd.setup_ns.load(Ordering::Relaxed) / n,
                     bd.record_ns.load(Ordering::Relaxed) / n,
                     bd.gpu_ns.load(Ordering::Relaxed) / n,
                     bd.copy_ns.load(Ordering::Relaxed) / n,
+                    bd.present_ns.load(Ordering::Relaxed) / n,
+                    (bd.copy_ns.load(Ordering::Relaxed).saturating_sub(bd.present_ns.load(Ordering::Relaxed))) / n,
                 );
             }
         }
