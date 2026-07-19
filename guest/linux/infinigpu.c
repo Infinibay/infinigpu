@@ -664,7 +664,8 @@ static u32 igpu_resource_register(struct igpu_device *idev, dma_addr_t addr,
 
 	for (i = 0; i < IGPU_FBCACHE; i++)
 		if (idev->fbcache[i].valid && idev->fbcache[i].addr == addr &&
-		    idev->fbcache[i].pitch == pitch && idev->fbcache[i].h == h)
+		    idev->fbcache[i].pitch == pitch && idev->fbcache[i].h == h &&
+		    idev->fbcache[i].w == w)
 			return idev->fbcache[i].res_id;
 
 	res_id = ++idev->next_res_id;

@@ -173,7 +173,9 @@ infinigpu_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount,
 
       buffer->mem = mem;
       buffer->offset = pBindInfos[i].memoryOffset;
-      buffer->map = mem->map ? (char *)mem->map + pBindInfos[i].memoryOffset : NULL;
+      /* `mem` may be VK_NULL_HANDLE (→ NULL here); guard the deref so a null-memory bind
+       * can't segfault the ICD (Phase-1 audit). */
+      buffer->map = (mem && mem->map) ? (char *)mem->map + pBindInfos[i].memoryOffset : NULL;
 
       const VkBindMemoryStatusKHR *status =
          vk_find_struct_const(pBindInfos[i].pNext, BIND_MEMORY_STATUS_KHR);
