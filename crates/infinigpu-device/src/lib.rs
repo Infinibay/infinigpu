@@ -18,6 +18,7 @@ pub mod dispatch;
 pub mod dma;
 pub mod drain;
 pub mod mailbox;
+pub mod profile;
 pub mod resource;
 
 use dma::DmaTable;
@@ -450,6 +451,9 @@ pub struct InfinigpuBackend {
     /// size revises the reservation to cover the real per-VM scanout footprint. `None` until the
     /// first present; reset on device reset.
     scanout_vram_dims: Option<(u32, u32)>,
+    /// Opt-in per-submit latency profiler (env `INFINIGPU_PROFILE`); `None` in production so the
+    /// hot path is unaffected. See [`profile`].
+    profiler: Option<profile::SubmitProfiler>,
 }
 
 impl Default for InfinigpuBackend {
@@ -529,6 +533,7 @@ impl InfinigpuBackend {
                 None
             }
         });
+        let profiler = profile::SubmitProfiler::from_env(&vm_config.vm_id);
         InfinigpuBackend {
             config: config::build(),
             dma: DmaTable::new(),
@@ -557,6 +562,7 @@ impl InfinigpuBackend {
             cursor_plane_enabled: std::env::var_os("INFINIGPU_CURSOR_PLANE").is_some(),
             vulkan_submits: 0,
             scanout_vram_dims: None,
+            profiler,
         }
     }
 
@@ -1192,7 +1198,13 @@ impl InfinigpuBackend {
         // never billed to this tenant), then replay the named workload under the fair-share run-lock.
         let _ = self.shared_gpu.device_name();
         let gpu = Arc::clone(&self.shared_gpu);
-        let frame = if op == vk_op::FORWARDED {
+        // Per-submit latency profiling (opt-in, env INFINIGPU_PROFILE): time the decode, the
+        // broker wait vs. render (from RunStats), and the DMA writeback. `Instant` reads are a few
+        // ns — negligible next to a multi-ms submit — so take them unconditionally and only fold
+        // them in when the profiler is enabled.
+        let t_start = std::time::Instant::now();
+        let mut decode_us = 0u64;
+        let outcome = if op == vk_op::FORWARDED {
             // Phase-1 own-ICD path: the guest ICD forwarded a real app's shaders + draw. Decode
             // the tail + SPIR-V (fail-closed on hostile input), then replay it on the GPU.
             let Some(fwd) = decode_forwarded(payload, MAX_CMD_BYTES as usize) else {
@@ -1200,35 +1212,40 @@ impl InfinigpuBackend {
                 self.ring_retired[ctx] = sc.seqno;
                 return;
             };
-            match self
-                .ticket
+            decode_us = t_start.elapsed().as_micros() as u64;
+            self.ticket
                 .as_ref()
                 .unwrap()
-                .run(move || gpu.render_forwarded(w, h, bg, &fwd.as_draw()))
-            {
-                Ok(Some(f)) => f,
-                _ => {
-                    self.ring_retired[ctx] = sc.seqno;
-                    return;
-                }
-            }
+                .run_timed(move || gpu.render_forwarded(w, h, bg, &fwd.as_draw()))
         } else {
-            match self.ticket.as_ref().unwrap().run(move || match op {
+            self.ticket.as_ref().unwrap().run_timed(move || match op {
                 vk_op::TRIANGLE => gpu.render_triangle(w, h, bg),
                 _ => gpu.render_clear(w, h, bg), // vk_op::CLEAR + forward-compat default
-            }) {
-                Ok(Some(f)) => f,
-                _ => {
-                    // GPU-open/render failure (already logged) — retire so the ring never wedges.
-                    self.ring_retired[ctx] = sc.seqno;
-                    return;
-                }
+            })
+        };
+        let (frame, stats) = match outcome {
+            Ok((Some(f), st)) => (f, st),
+            _ => {
+                // GPU-open/render failure (already logged) — retire so the ring never wedges.
+                self.ring_retired[ctx] = sc.seqno;
+                return;
             }
         };
+        let t_after_render = std::time::Instant::now();
         // DMA-write the GPU-produced R8G8B8A8 result to the guest scanout (like
         // render_clear_present) so the guest's page-flip shows it. scanout_addr == 0 → render-only.
         if wl.scanout_addr != 0 && !self.dma.write(wl.scanout_addr, &frame.rgba) {
             log::error!("vulkan submit ctx={ctx}: scanout {:#x} not fully mapped", wl.scanout_addr);
+        }
+        if let Some(p) = self.profiler.as_mut() {
+            let now = std::time::Instant::now();
+            p.record(profile::HopSample {
+                decode_us,
+                wait_us: stats.wait_us,
+                render_us: stats.gpu_us,
+                dma_us: now.saturating_duration_since(t_after_render).as_micros() as u64,
+                total_us: now.saturating_duration_since(t_start).as_micros() as u64,
+            });
         }
         self.ring_retired[ctx] = sc.seqno;
     }

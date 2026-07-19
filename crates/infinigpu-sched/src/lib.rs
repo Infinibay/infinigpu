@@ -293,6 +293,16 @@ pub enum RunError {
     Panicked,
 }
 
+/// Timing breakdown returned by [`GpuBroker::run_timed`]. `wait_us` is time spent waiting for
+/// admission + the fleet run-lock (throttle sleep + lock contention); `gpu_us` is time the
+/// render actually held the lock. Their split is the multi-VM queue-tail signal the perf audit
+/// targets — a large `wait_us` means a co-tenant is monopolising the shared GPU run-lock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunStats {
+    pub wait_us: Micros,
+    pub gpu_us: Micros,
+}
+
 /// Result of asking whether a VM may run right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Begin {
@@ -576,6 +586,18 @@ impl GpuBroker {
     /// run-lock (cooperative serialization) and debits the measured GPU-time. This is
     /// the call the per-VM device backend wraps every render in.
     pub fn run<R>(&self, vm_id: &str, f: impl FnOnce() -> R) -> Result<R, RunError> {
+        self.run_timed(vm_id, f).map(|(r, _)| r)
+    }
+
+    /// Like [`run`](Self::run) but also returns a [`RunStats`] breakdown of the caller's
+    /// admission/run-lock wait vs. the render's held-lock time — the signal the device uses to
+    /// profile the multi-VM queue tail without threading a second clock through the hot path.
+    pub fn run_timed<R>(
+        &self,
+        vm_id: &str,
+        f: impl FnOnce() -> R,
+    ) -> Result<(R, RunStats), RunError> {
+        let t_enter = self.clock.now_us();
         loop {
             match self.begin(vm_id).map_err(|_| RunError::NotAdmitted)? {
                 Begin::Ready => break,
@@ -589,6 +611,8 @@ impl GpuBroker {
         // never `.unwrap()` a shared lock (verify-scheduler finding #1).
         let guard = self.run_lock.lock().unwrap_or_else(|e| e.into_inner());
         let t0 = self.clock.now_us();
+        // wait_us = admission throttle sleep + time blocked acquiring the fleet run-lock.
+        let wait_us = t0.saturating_sub(t_enter);
         // Contain a panicking render to THIS VM: catch_unwind means the run-lock guard
         // drops *normally* (no poison), the hog is still charged the GPU-time it burned,
         // and every other VM keeps running. Real per-VM isolation lands with the
@@ -598,7 +622,7 @@ impl GpuBroker {
         drop(guard);
         self.record(vm_id, gpu_us);
         match result {
-            Ok(r) => Ok(r),
+            Ok(r) => Ok((r, RunStats { wait_us, gpu_us })),
             Err(_) => {
                 log::error!("render panicked for vm={vm_id}; contained — fleet unaffected");
                 Err(RunError::Panicked)
@@ -680,6 +704,12 @@ impl VmTicket {
     /// Run one GPU submission for this VM under the scheduler (see [`GpuBroker::run`]).
     pub fn run<R>(&self, f: impl FnOnce() -> R) -> Result<R, RunError> {
         self.broker.run(&self.vm_id, f)
+    }
+
+    /// Like [`run`](Self::run) but returns the [`RunStats`] timing breakdown (see
+    /// [`GpuBroker::run_timed`]).
+    pub fn run_timed<R>(&self, f: impl FnOnce() -> R) -> Result<(R, RunStats), RunError> {
+        self.broker.run_timed(&self.vm_id, f)
     }
 
     /// Revise this VM's VRAM reservation (see [`GpuBroker::adjust_vram`]) — called once the real
