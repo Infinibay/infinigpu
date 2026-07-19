@@ -3,22 +3,15 @@
  * SPDX-License-Identifier: MIT
  *
  * VkDevice + VkQueue.  Cribbed from lavapipe (lvp_CreateDevice /
- * lvp_queue_init / lvp_queue_submit).  Phase 0: immediate submit mode, the
- * driver_submit hook is a no-op that reports success.
+ * lvp_queue_init).  IMMEDIATE submit mode: the driver_submit hook
+ * (infinigpu_queue_submit, infinigpu_sync.c) runs synchronously on the calling
+ * thread and blocks on the forwarded-draw ioctl.
  */
 
 #include "infinigpu_private.h"
 
 #include "vk_alloc.h"
 #include "vk_log.h"
-
-VkResult
-infinigpu_queue_submit(struct vk_queue *vk_queue,
-                       struct vk_queue_submit *submit)
-{
-   /* Phase 0: nothing is executed on the (remote) GPU yet. */
-   return VK_SUCCESS;
-}
 
 static VkResult
 infinigpu_queue_init(struct infinigpu_device *device,
@@ -71,7 +64,10 @@ infinigpu_CreateDevice(VkPhysicalDevice physicalDevice,
 
    device->physical_device = physical_device;
 
-   /* Phase 0 expects a single queue in family 0 (as vulkaninfo requests). */
+   /* Direct-record command buffers (infinigpu_cmd_buffer.c). */
+   device->vk.command_buffer_ops = &infinigpu_cmd_buffer_ops;
+
+   /* A single queue in family 0. */
    assert(pCreateInfo->queueCreateInfoCount >= 1);
    result = infinigpu_queue_init(device, &device->queue,
                                  &pCreateInfo->pQueueCreateInfos[0], 0);

@@ -2,8 +2,13 @@
  * Copyright 2024 Infinibay
  * SPDX-License-Identifier: MIT
  *
- * Phase-0 skeleton Vulkan ICD for the "infinigpu" remote GPU.
+ * Phase-1 own-remoting Vulkan ICD for the "infinigpu" remote GPU.
  * Based in part on Mesa's lavapipe and venus drivers.
+ *
+ * The driver never compiles shaders. It captures the app's SPIR-V + draw state
+ * and forwards it, over the DRM render node (DRM_IOCTL_INFINIGPU_SUBMIT_FORWARDED),
+ * to the host, which replays it on a real GPU and DMA-writes the result into a
+ * DRM dumb buffer that backs the color image's VkDeviceMemory.
  */
 
 #ifndef INFINIGPU_PRIVATE_H
@@ -12,10 +17,21 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "c11/threads.h"
+
+#include "vk_buffer.h"
+#include "vk_command_buffer.h"
+#include "vk_command_pool.h"
 #include "vk_device.h"
+#include "vk_device_memory.h"
+#include "vk_image.h"
 #include "vk_instance.h"
 #include "vk_physical_device.h"
+#include "vk_pipeline_layout.h"
 #include "vk_queue.h"
+#include "vk_shader_module.h"
+#include "vk_sync.h"
+#include "vk_sync_timeline.h"
 
 /* Generated (vk_entrypoints_gen.py --prefix infinigpu --proto --weak):
  * declares infinigpu_{instance,physical_device,device}_entrypoints tables and
@@ -29,6 +45,9 @@ extern "C" {
 /* Advertised device apiVersion (physical device). */
 #define INFINIGPU_API_VERSION VK_API_VERSION_1_3
 
+/* A graphics pipeline forwards at most a vertex + fragment stage for now. */
+#define INFINIGPU_MAX_STAGES 2
+
 struct infinigpu_instance {
    struct vk_instance vk;
 };
@@ -38,6 +57,11 @@ struct infinigpu_physical_device {
 
    /* Open fd of /dev/dri/renderD128 whose drm name == "infinigpu". */
    int drm_fd;
+
+   /* CPU binary sync (+ an emulated timeline built on it) registered as the
+    * device's supported sync types — see infinigpu_sync.c. */
+   const struct vk_sync_type *sync_types[3];
+   struct vk_sync_timeline_type sync_timeline_type;
 };
 
 struct infinigpu_queue {
@@ -51,6 +75,96 @@ struct infinigpu_device {
    struct infinigpu_queue queue;
 };
 
+/* ---- VkDeviceMemory: a DRM dumb buffer + its persistent host mmap ---- */
+struct infinigpu_device_memory {
+   struct vk_device_memory vk;   /* runtime base; auto-parses the alloc pNext */
+   uint32_t gem_handle;          /* DRM_IOCTL_MODE_CREATE_DUMB result */
+   void *map;                    /* mmap of the dumb buffer, kept for its lifetime */
+   uint64_t map_size;            /* actual (page/stride-rounded) mapped bytes */
+};
+
+/* ---- VkImage: a single-plane LINEAR R8G8B8A8-style image ---- */
+struct infinigpu_image {
+   struct vk_image vk;           /* base, filled by vk_image_init */
+   uint64_t size;                /* total linear allocation in bytes */
+   uint32_t row_pitch;           /* linear row stride = width * blocksize (packed) */
+   uint32_t alignment;           /* memory-requirements alignment */
+   struct infinigpu_device_memory *mem;  /* bound backing (NULL until BindImageMemory2) */
+   uint64_t mem_offset;          /* VkBindImageMemoryInfo::memoryOffset */
+};
+
+struct infinigpu_image_view {
+   struct vk_image_view vk;      /* base, filled by vk_image_view_init */
+   struct infinigpu_image *image;/* the image this view targets (path to bound memory) */
+};
+
+struct infinigpu_buffer {
+   struct vk_buffer vk;          /* base, filled by vk_buffer_init */
+   struct infinigpu_device_memory *mem;
+   uint64_t offset;
+   void *map;                    /* mem->map + offset, set in BindBufferMemory2 */
+   uint64_t total_size;
+};
+
+/* ---- VkPipeline: captured forwarding state (never compiled) ---- */
+struct infinigpu_pipeline_stage {
+   VkShaderStageFlagBits stage;
+   char *entrypoint;             /* strdup of VkPipelineShaderStageCreateInfo::pName */
+   uint32_t *spirv;              /* memdup of the SPIR-V words */
+   uint32_t spirv_size;          /* bytes */
+};
+
+struct infinigpu_pipeline {
+   struct vk_object_base base;
+   VkPipelineBindPoint bind_point;
+   VkPrimitiveTopology topology;
+   uint32_t stage_count;
+   struct infinigpu_pipeline_stage stages[INFINIGPU_MAX_STAGES];
+};
+
+/* A dummy pipeline cache (we never cache — SPIR-V is forwarded, not compiled). */
+struct infinigpu_pipeline_cache {
+   struct vk_object_base base;
+};
+
+/* A deferred image->buffer copy, executed at submit AFTER the draw so the host
+ * writeback is already in the image's memory. Supports the common readback case. */
+#define INFINIGPU_MAX_COPIES 4
+struct infinigpu_pending_copy {
+   struct infinigpu_image *src;
+   struct infinigpu_buffer *dst;
+   uint64_t buffer_offset;
+   uint32_t buffer_row_length;  /* in texels; 0 => tightly packed (== image width) */
+   VkOffset3D image_offset;
+   VkExtent3D image_extent;
+};
+
+/* ---- VkCommandBuffer: direct-record model (no enqueue/replay) ---- */
+struct infinigpu_cmd_buffer {
+   struct vk_command_buffer vk;  /* MUST be first */
+   struct infinigpu_device *device;
+
+   /* accumulated recording state */
+   struct infinigpu_pipeline *bound_pipeline;   /* CmdBindPipeline */
+   struct infinigpu_image_view *color_att;      /* CmdBeginRendering color attachment 0 */
+   VkRect2D render_area;
+   VkClearColorValue clear_value;               /* pColorAttachments[0].clearValue (LOAD_OP_CLEAR) */
+   bool has_clear;
+   uint32_t draw_vertex_count;                  /* last CmdDraw vertexCount (0 = no draw yet) */
+   uint32_t draw_count;                         /* number of draws recorded */
+
+   struct infinigpu_pending_copy copies[INFINIGPU_MAX_COPIES];
+   uint32_t copy_count;
+};
+
+/* ---- The driver's CPU binary sync (infinigpu_sync.c) ---- */
+struct infinigpu_sync {
+   struct vk_sync base;
+   mtx_t lock;
+   cnd_t changed;
+   bool signaled;
+};
+
 /* struct vk_*::base is the vk_object_base used by the casts. */
 VK_DEFINE_HANDLE_CASTS(infinigpu_instance, vk.base, VkInstance,
                        VK_OBJECT_TYPE_INSTANCE)
@@ -60,19 +174,43 @@ VK_DEFINE_HANDLE_CASTS(infinigpu_device, vk.base, VkDevice,
                        VK_OBJECT_TYPE_DEVICE)
 VK_DEFINE_HANDLE_CASTS(infinigpu_queue, vk.base, VkQueue,
                        VK_OBJECT_TYPE_QUEUE)
+VK_DEFINE_HANDLE_CASTS(infinigpu_cmd_buffer, vk.base, VkCommandBuffer,
+                       VK_OBJECT_TYPE_COMMAND_BUFFER)
 
-/* Minimal supported-extension tables.  Phase 0 advertises none: an empty
- * instance table means vkCreateInstance never fails on an unsupported enabled
- * extension, and an empty device table lets vkCreateDevice succeed with zero
- * enabled extensions (which is what vulkaninfo does). */
+VK_DEFINE_NONDISP_HANDLE_CASTS(infinigpu_device_memory, vk.base, VkDeviceMemory,
+                               VK_OBJECT_TYPE_DEVICE_MEMORY)
+VK_DEFINE_NONDISP_HANDLE_CASTS(infinigpu_image, vk.base, VkImage,
+                               VK_OBJECT_TYPE_IMAGE)
+VK_DEFINE_NONDISP_HANDLE_CASTS(infinigpu_image_view, vk.base, VkImageView,
+                               VK_OBJECT_TYPE_IMAGE_VIEW)
+VK_DEFINE_NONDISP_HANDLE_CASTS(infinigpu_buffer, vk.base, VkBuffer,
+                               VK_OBJECT_TYPE_BUFFER)
+VK_DEFINE_NONDISP_HANDLE_CASTS(infinigpu_pipeline, base, VkPipeline,
+                               VK_OBJECT_TYPE_PIPELINE)
+VK_DEFINE_NONDISP_HANDLE_CASTS(infinigpu_pipeline_cache, base, VkPipelineCache,
+                               VK_OBJECT_TYPE_PIPELINE_CACHE)
+
+static inline struct infinigpu_sync *
+infinigpu_sync_as(struct vk_sync *sync)
+{
+   return (struct infinigpu_sync *)sync;
+}
+
+/* Minimal supported-extension tables. */
 extern const struct vk_instance_extension_table infinigpu_instance_extensions;
 extern const struct vk_device_extension_table infinigpu_device_extensions;
+
+/* The device's command-buffer vtable (infinigpu_cmd_buffer.c). */
+extern const struct vk_command_buffer_ops infinigpu_cmd_buffer_ops;
+
+/* The driver's CPU binary sync type (infinigpu_sync.c). */
+extern const struct vk_sync_type infinigpu_sync_type;
 
 /* infinigpu_physical_device.c */
 VkResult infinigpu_enumerate_physical_devices(struct vk_instance *vk_instance);
 void infinigpu_physical_device_destroy(struct vk_physical_device *vk_pdev);
 
-/* infinigpu_device.c */
+/* infinigpu_sync.c — the vk_queue.driver_submit hook. */
 VkResult infinigpu_queue_submit(struct vk_queue *vk_queue,
                                 struct vk_queue_submit *submit);
 

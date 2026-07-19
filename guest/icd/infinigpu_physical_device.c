@@ -103,6 +103,19 @@ infinigpu_get_properties(const struct infinigpu_physical_device *pdev,
    /* pipelineCacheUUID / deviceUUID / driverUUID left all-zero. */
 }
 
+/* Phase 1 advertises exactly the features the forwarded-triangle path uses: a
+ * 1.3 device with dynamic rendering (CmdBeginRendering) and synchronization2
+ * (CmdPipelineBarrier2). We do NOT advertise timelineSemaphore — the driver runs
+ * a binary CPU sync in IMMEDIATE submit mode (see infinigpu_sync.c). */
+static void
+infinigpu_get_features(struct vk_features *f)
+{
+   *f = (struct vk_features){
+      .dynamicRendering = true,
+      .synchronization2 = true,
+   };
+}
+
 static VkResult
 infinigpu_physical_device_init(struct infinigpu_physical_device *pdev,
                                struct infinigpu_instance *instance,
@@ -114,20 +127,28 @@ infinigpu_physical_device_init(struct infinigpu_physical_device *pdev,
 
    struct vk_properties properties;
    infinigpu_get_properties(pdev, &properties);
+   struct vk_features features;
+   infinigpu_get_features(&features);
 
    /* vk_physical_device_init: src/vulkan/runtime/vk_physical_device.h
     *   (pdev, instance, supported_extensions, supported_features,
-    *    properties, dispatch_table) -- the 25.0.7 arity includes `properties`
-    *    as the 5th arg (added vs older trees). NULL features => all false. */
+    *    properties, dispatch_table). */
    IGPU_TRACE("pdev_init: calling vk_physical_device_init");
    VkResult result = vk_physical_device_init(&pdev->vk, &instance->vk,
                                              &infinigpu_device_extensions,
-                                             NULL,
+                                             &features,
                                              &properties,
                                              &dispatch_table);
    IGPU_TRACE("pdev_init: vk_physical_device_init -> %d", result);
    if (result != VK_SUCCESS)
       return result;
+
+   /* Register the driver's binary CPU sync. Binary-only (no timeline) keeps the
+    * device in IMMEDIATE submit mode, where driver_submit runs synchronously on
+    * the caller's thread and blocks on the forwarded-draw ioctl. */
+   pdev->sync_types[0] = &infinigpu_sync_type;
+   pdev->sync_types[1] = NULL;
+   pdev->vk.supported_sync_types = pdev->sync_types;
 
    pdev->drm_fd = drm_fd;
    return VK_SUCCESS;
@@ -249,8 +270,23 @@ infinigpu_GetPhysicalDeviceMemoryProperties2(
 /* The Vulkan-1.0 vk_common_GetPhysicalDevice{Format,ImageFormat,SparseImageFormat}Properties
  * wrappers (vk_physical_device.c) dispatch straight to these *2 entrypoints, and — unlike
  * Features2/Properties2 — there is NO generated vk_common *2 fallback, so a NULL here is a
- * hard crash under vulkaninfo. Phase 0 advertises no format support yet (real format
- * capabilities arrive with the render path in Phase 1). */
+ * hard crash under vulkaninfo. Phase 1 advertises the R8G8B8A8/B8G8R8A8 color formats the
+ * forwarded-triangle path renders into (LINEAR, dumb-buffer-backed). */
+
+/* The formats a forwarded draw can target: 32-bit RGBA/BGRA, LINEAR tiling. */
+static bool
+infinigpu_format_supported(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      return true;
+   default:
+      return false;
+   }
+}
 
 VKAPI_ATTR void VKAPI_CALL
 infinigpu_GetPhysicalDeviceFormatProperties2(
@@ -258,7 +294,22 @@ infinigpu_GetPhysicalDeviceFormatProperties2(
    VkFormat format,
    VkFormatProperties2 *pFormatProperties)
 {
-   pFormatProperties->formatProperties = (VkFormatProperties){ 0 };
+   VkFormatProperties *p = &pFormatProperties->formatProperties;
+   *p = (VkFormatProperties){ 0 };
+
+   if (infinigpu_format_supported(format)) {
+      /* A linear image is both the render target (host DMA-writes it) and the
+       * copy/readback source. */
+      const VkFormatFeatureFlags feats =
+         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+         VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+         VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+         VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+         VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+      p->linearTilingFeatures = feats;
+      p->optimalTilingFeatures = feats;
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -267,7 +318,18 @@ infinigpu_GetPhysicalDeviceImageFormatProperties2(
    const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
    VkImageFormatProperties2 *pImageFormatProperties)
 {
-   return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (!infinigpu_format_supported(pImageFormatInfo->format) ||
+       pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
+      .maxExtent = { 16384, 16384, 1 },
+      .maxMipLevels = 1,
+      .maxArrayLayers = 2048,
+      .sampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .maxResourceSize = 1ULL << 31,
+   };
+   return VK_SUCCESS;
 }
 
 VKAPI_ATTR void VKAPI_CALL

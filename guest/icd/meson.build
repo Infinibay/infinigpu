@@ -50,10 +50,17 @@ devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
 devenv.append('VK_ICD_FILENAMES', _dev_icd.full_path())
 
 libinfinigpu_files = files(
+  'infinigpu_cmd_buffer.c',
   'infinigpu_device.c',
+  'infinigpu_forwarded.c',
   'infinigpu_icd.c',
+  'infinigpu_image.c',
   'infinigpu_instance.c',
+  'infinigpu_kmd.c',
+  'infinigpu_memory.c',
   'infinigpu_physical_device.c',
+  'infinigpu_pipeline.c',
+  'infinigpu_sync.c',
 )
 
 infinigpu_deps = [

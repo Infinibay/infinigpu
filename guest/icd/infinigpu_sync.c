@@ -1,0 +1,256 @@
+/*
+ * Copyright 2024 Infinibay
+ * SPDX-License-Identifier: MIT
+ *
+ * Synchronization + queue submit. The device runs in IMMEDIATE submit mode: a
+ * binary CPU sync (infinigpu_sync, adapted from lavapipe's lvp_pipe_sync but
+ * WITHOUT any async fence — DRM_IOCTL_INFINIGPU_SUBMIT_FORWARDED blocks until the
+ * host GPU DMA-write completes, so a submit is fully done the instant the ioctl
+ * returns). driver_submit honors waits, forwards each command buffer's recorded
+ * draw + deferred copies, then signals every signal sync so WaitForFences returns.
+ */
+
+#include "infinigpu_private.h"
+#include "infinigpu_forwarded.h"
+#include "infinigpu_kmd.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "util/os_time.h"
+#include "util/timespec.h"
+#include "vk_format.h"
+#include "vk_log.h"
+
+/* ------------------------------------------------------------------ sync type */
+
+static VkResult
+infinigpu_sync_init(UNUSED struct vk_device *vk_device, struct vk_sync *vk_sync,
+                    uint64_t initial_value)
+{
+   struct infinigpu_sync *sync = infinigpu_sync_as(vk_sync);
+   mtx_init(&sync->lock, mtx_plain);
+   cnd_init(&sync->changed);
+   sync->signaled = (initial_value != 0);
+   return VK_SUCCESS;
+}
+
+static void
+infinigpu_sync_finish(UNUSED struct vk_device *vk_device, struct vk_sync *vk_sync)
+{
+   struct infinigpu_sync *sync = infinigpu_sync_as(vk_sync);
+   cnd_destroy(&sync->changed);
+   mtx_destroy(&sync->lock);
+}
+
+static VkResult
+infinigpu_sync_signal(UNUSED struct vk_device *vk_device, struct vk_sync *vk_sync,
+                      UNUSED uint64_t value)
+{
+   struct infinigpu_sync *sync = infinigpu_sync_as(vk_sync);
+   mtx_lock(&sync->lock);
+   sync->signaled = true;
+   cnd_broadcast(&sync->changed);
+   mtx_unlock(&sync->lock);
+   return VK_SUCCESS;
+}
+
+static VkResult
+infinigpu_sync_reset(UNUSED struct vk_device *vk_device, struct vk_sync *vk_sync)
+{
+   struct infinigpu_sync *sync = infinigpu_sync_as(vk_sync);
+   mtx_lock(&sync->lock);
+   sync->signaled = false;
+   cnd_broadcast(&sync->changed);
+   mtx_unlock(&sync->lock);
+   return VK_SUCCESS;
+}
+
+static VkResult
+infinigpu_sync_wait(struct vk_device *vk_device, struct vk_sync *vk_sync,
+                    UNUSED uint64_t wait_value, enum vk_sync_wait_flags wait_flags,
+                    uint64_t abs_timeout_ns)
+{
+   struct infinigpu_sync *sync = infinigpu_sync_as(vk_sync);
+
+   /* WAIT_ANY is a multi-wait concept; the runtime never passes it to a single
+    * sync's wait. */
+   assert(!(wait_flags & VK_SYNC_WAIT_ANY));
+
+   mtx_lock(&sync->lock);
+
+   uint64_t now_ns = os_time_get_nano();
+   while (!sync->signaled) {
+      if (now_ns >= abs_timeout_ns) {
+         mtx_unlock(&sync->lock);
+         return VK_TIMEOUT;
+      }
+
+      int ret;
+      if (abs_timeout_ns >= INT64_MAX) {
+         ret = cnd_wait(&sync->changed, &sync->lock);
+      } else {
+         /* C11 threads use CLOCK_REALTIME while our timeouts are CLOCK_MONOTONIC;
+          * convert to a relative deadline and re-check now_ns after each wake. */
+         uint64_t rel_ns = abs_timeout_ns - now_ns;
+         struct timespec now_ts, abs_ts;
+         timespec_get(&now_ts, TIME_UTC);
+         if (timespec_add_nsec(&abs_ts, &now_ts, rel_ns))
+            ret = cnd_wait(&sync->changed, &sync->lock);
+         else
+            ret = cnd_timedwait(&sync->changed, &sync->lock, &abs_ts);
+      }
+      if (ret == thrd_error) {
+         mtx_unlock(&sync->lock);
+         return vk_errorf(vk_device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
+      }
+      now_ns = os_time_get_nano();
+   }
+
+   mtx_unlock(&sync->lock);
+   return VK_SUCCESS;
+}
+
+const struct vk_sync_type infinigpu_sync_type = {
+   .size = sizeof(struct infinigpu_sync),
+   .features = VK_SYNC_FEATURE_BINARY |
+               VK_SYNC_FEATURE_GPU_WAIT |
+               VK_SYNC_FEATURE_CPU_WAIT |
+               VK_SYNC_FEATURE_CPU_RESET |
+               VK_SYNC_FEATURE_CPU_SIGNAL |
+               VK_SYNC_FEATURE_WAIT_PENDING,
+   .init = infinigpu_sync_init,
+   .finish = infinigpu_sync_finish,
+   .signal = infinigpu_sync_signal,
+   .reset = infinigpu_sync_reset,
+   .wait = infinigpu_sync_wait,
+};
+
+/* ------------------------------------------------------------ queue submit */
+
+/* Execute one deferred image->buffer copy now that the host has DMA-written the
+ * image's dumb buffer. Both memories are host-mapped, so this is a CPU blit. */
+static void
+infinigpu_run_copy(const struct infinigpu_pending_copy *pc)
+{
+   struct infinigpu_image *img = pc->src;
+   struct infinigpu_buffer *buf = pc->dst;
+
+   if (!img || !img->mem || !img->mem->map || !buf || !buf->mem || !buf->mem->map)
+      return;
+
+   const uint32_t bpp = vk_format_get_blocksize(img->vk.format);
+   const uint32_t rows = pc->image_extent.height;
+   const uint32_t w = pc->image_extent.width;
+   const uint32_t dst_row_texels = pc->buffer_row_length ? pc->buffer_row_length : w;
+
+   const char *src = (const char *)img->mem->map + img->mem_offset +
+                     (uint64_t)pc->image_offset.y * img->row_pitch +
+                     (uint64_t)pc->image_offset.x * bpp;
+   char *dst = (char *)buf->mem->map + buf->offset + pc->buffer_offset;
+
+   for (uint32_t y = 0; y < rows; y++)
+      memcpy(dst + (uint64_t)y * dst_row_texels * bpp,
+             src + (uint64_t)y * img->row_pitch, (size_t)w * bpp);
+}
+
+/* Forward one command buffer's recorded draw to the host, then run its deferred
+ * copies. A command buffer with no draw (e.g. a pure clear/copy) skips the ioctl. */
+static VkResult
+infinigpu_replay_cmd_buffer(struct infinigpu_device *dev,
+                            struct infinigpu_cmd_buffer *cmd)
+{
+   int drm_fd = dev->physical_device->drm_fd;
+
+   if (cmd->draw_count > 0 && cmd->color_att && cmd->bound_pipeline) {
+      struct infinigpu_pipeline *p = cmd->bound_pipeline;
+      const struct infinigpu_pipeline_stage *vs = NULL, *fs = NULL;
+      for (uint32_t s = 0; s < p->stage_count; s++) {
+         if (p->stages[s].stage == VK_SHADER_STAGE_VERTEX_BIT)
+            vs = &p->stages[s];
+         else if (p->stages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+            fs = &p->stages[s];
+      }
+      if (!vs || !fs)
+         return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                          "forwarded draw needs a vertex + fragment stage");
+
+      struct infinigpu_image *img = cmd->color_att->image;
+      if (!img || !img->mem)
+         return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                          "color attachment has no bound memory");
+
+      const uint32_t width = img->vk.extent.width;
+      const uint32_t height = img->vk.extent.height;
+      float bg[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+      if (cmd->has_clear)
+         for (int c = 0; c < 4; c++)
+            bg[c] = cmd->clear_value.float32[c];
+
+      const uint32_t topo =
+         (p->topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
+            ? INFINIGPU_VK_TOPOLOGY_TRIANGLE_STRIP
+            : INFINIGPU_VK_TOPOLOGY_TRIANGLE_LIST;
+
+      const size_t cap = 128 + vs->spirv_size + fs->spirv_size +
+                         strlen(vs->entrypoint) + 1 + strlen(fs->entrypoint) + 1;
+      uint8_t *payload = malloc(cap);
+      if (!payload)
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+      /* scanout_addr=0: the KMD overwrites it with the target BO's dma_addr. */
+      const size_t n = infinigpu_encode_forwarded(
+         payload, cap, width, height, bg, 0, cmd->draw_vertex_count, topo,
+         vs->spirv, vs->spirv_size / 4, fs->spirv, fs->spirv_size / 4,
+         vs->entrypoint, fs->entrypoint);
+      if (n == 0) {
+         free(payload);
+         return vk_errorf(dev, VK_ERROR_UNKNOWN, "forwarded payload did not fit");
+      }
+
+      const int ret = infinigpu_submit_forwarded(drm_fd, img->mem->gem_handle,
+                                                  width, height, payload, (uint32_t)n);
+      free(payload);
+      if (ret != 0)
+         return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
+                          "SUBMIT_FORWARDED failed (%d)", ret);
+   }
+
+   for (uint32_t c = 0; c < cmd->copy_count; c++)
+      infinigpu_run_copy(&cmd->copies[c]);
+
+   return VK_SUCCESS;
+}
+
+VkResult
+infinigpu_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+{
+   struct infinigpu_queue *queue =
+      container_of(vk_queue, struct infinigpu_queue, vk);
+   struct infinigpu_device *dev = queue->device;
+
+   /* 1. Honor waits. Synchronous driver => already signaled, returns at once. */
+   VkResult result = vk_sync_wait_many(&dev->vk, submit->wait_count, submit->waits,
+                                       VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* 2. Forward each command buffer's draw (blocking ioctl) + deferred copies. */
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      struct infinigpu_cmd_buffer *cmd =
+         container_of(submit->command_buffers[i], struct infinigpu_cmd_buffer, vk);
+      result = infinigpu_replay_cmd_buffer(dev, cmd);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   /* 3. Work is complete — signal all signal syncs (fences/semaphores). */
+   for (uint32_t i = 0; i < submit->signal_count; i++) {
+      result = vk_sync_signal(&dev->vk, submit->signals[i].sync,
+                              submit->signals[i].signal_value);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   return VK_SUCCESS;
+}

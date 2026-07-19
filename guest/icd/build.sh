@@ -27,6 +27,10 @@ echo ">> injecting driver source into $DST/vulkan"
 mkdir -p "$DST/vulkan"
 cp "$ICD_SRC"/infinigpu_*.c "$ICD_SRC"/infinigpu_*.h "$ICD_SRC/meson.build" "$DST/vulkan/"
 cp "$ICD_SRC/meson.wrapper.build" "$DST/meson.build"
+# The shared guest headers the ICD consumes: the wire ABI (infinigpu_abi.h — used by the forwarded
+# encoder) and the render-node uAPI (infinigpu_drm.h — the SUBMIT_FORWARDED ioctl + dumb-buffer path).
+# They live in guest/include; copy them alongside the driver so `#include "infinigpu_abi.h"` resolves.
+cp "$ICD_SRC/../include/infinigpu_abi.h" "$ICD_SRC/../include/infinigpu_drm.h" "$DST/vulkan/"
 
 # --- idempotent registration edits into the Mesa tree ---------------------------------
 opts="$MESA_SRC/meson_options.txt"
