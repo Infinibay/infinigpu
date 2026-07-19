@@ -216,6 +216,63 @@ impl SharedGpu {
         let g = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
         g.as_ref().map(|x| x.cache_stats())
     }
+
+    /// Fix D: whether the open GPU can DMA a frame straight into an imported guest pointer
+    /// (`VK_EXT_external_memory_host`). `false` if the GPU isn't open — call after a prewarm
+    /// (`device_name()`), which the submit path does.
+    pub fn supports_zerocopy(&self) -> bool {
+        let g = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref()
+            .map(|x| x.supports_zerocopy_scanout())
+            .unwrap_or(false)
+    }
+
+    /// Fix D: render a forwarded draw and DMA the result **straight into the guest scanout** at
+    /// `guest_ptr` — no host readback buffer, no CPU copy. Returns whether the render succeeded.
+    ///
+    /// # Safety
+    /// `[guest_ptr, guest_ptr + width*height*4)` must be valid, page-aligned, mapped guest RAM that
+    /// stays mapped for the call; the caller drops the import on any DMA remap (see
+    /// [`Self::forget_all_guest_imports`]).
+    pub unsafe fn render_forwarded_zerocopy(
+        &self,
+        width: u32,
+        height: u32,
+        bg: [f32; 4],
+        draw: &ForwardedDraw,
+        guest_ptr: *mut u8,
+    ) -> bool {
+        let mut g = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            match HostGpu::open() {
+                Ok(x) => *g = Some(x),
+                Err(e) => {
+                    log::error!("cannot open replay GPU: {e}");
+                    return false;
+                }
+            }
+        }
+        match g
+            .as_ref()
+            .unwrap()
+            .render_forwarded_zerocopy(width, height, bg, draw, guest_ptr)
+        {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("zerocopy render failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// Fix D: drop every cached guest-scanout import — call whenever guest RAM is remapped, else an
+    /// import can dangle. No-op if the GPU isn't open.
+    pub fn forget_all_guest_imports(&self) {
+        let g = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(x) = g.as_ref() {
+            x.forget_all_guest_imports();
+        }
+    }
 }
 
 impl Default for SharedGpu {
@@ -499,6 +556,11 @@ pub struct InfinigpuBackend {
     /// Opt-in per-submit latency profiler (env `INFINIGPU_PROFILE`); `None` in production so the
     /// hot path is unaffected. See [`profile`].
     profiler: Option<profile::SubmitProfiler>,
+    /// Fix D (opt-in, env `INFINIGPU_ZEROCOPY_SCANOUT`): DMA the rendered frame straight into the
+    /// guest scanout (imported guest RAM) instead of a host readback buffer + CPU copy — removes the
+    /// biggest remaining hot-path cost (~1 ms/frame at 1080p). Falls back to the one-copy present
+    /// when off, unsupported, or the scanout isn't a mapped page-aligned region.
+    zerocopy_scanout: bool,
 }
 
 impl Default for InfinigpuBackend {
@@ -608,6 +670,9 @@ impl InfinigpuBackend {
             vulkan_submits: 0,
             scanout_vram_dims: None,
             profiler,
+            zerocopy_scanout: std::env::var("INFINIGPU_ZEROCOPY_SCANOUT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 
@@ -1259,6 +1324,10 @@ impl InfinigpuBackend {
         let t_start = std::time::Instant::now();
         let mut decode_us = 0u64;
         let scanout_addr = wl.scanout_addr; // 0 → render-only (no scanout present)
+        // Fix D: DMA straight into the guest scanout when enabled + supported. Checked once here
+        // (after the prewarm opened the GPU) so the hot path just branches on a bool.
+        let use_zerocopy =
+            self.zerocopy_scanout && scanout_addr != 0 && self.shared_gpu.supports_zerocopy();
         let (wait_us, render_us, dma_us, presented) = if op == vk_op::FORWARDED {
             // Phase-1 own-ICD path: the guest ICD forwarded a real app's shaders + draw. Decode
             // the tail + SPIR-V (fail-closed on hostile input), then replay it on the GPU.
@@ -1268,25 +1337,55 @@ impl InfinigpuBackend {
                 return;
             };
             decode_us = t_start.elapsed().as_micros() as u64;
-            // One-copy path: dma-write the frame straight from the GPU readback mapping into the
-            // guest scanout (no intermediate Frame Vec, no per-frame heap alloc — perf finding #5).
-            // The present closure runs inside the timed region, so subtract it back out below.
-            let dma = &self.dma;
-            match self.ticket.as_ref().unwrap().run_timed(move || {
-                gpu.render_forwarded_present(w, h, bg, &fwd.as_draw(), |px| {
-                    scanout_addr == 0 || dma.write(scanout_addr, px)
-                })
-            }) {
-                Ok((Some(ps), st)) => (
-                    st.wait_us,
-                    st.gpu_us.saturating_sub(ps.present_us),
-                    ps.present_us,
-                    ps.presented,
-                ),
-                _ => {
-                    // GPU-open/render failure (already logged) — retire so the ring never wedges.
-                    self.ring_retired[ctx] = sc.seqno;
-                    return;
+
+            // Fix D zero-copy: resolve the scanout to a page-aligned host pointer in guest RAM and
+            // have the GPU DMA straight into it — no readback buffer, no CPU copy. The imported size
+            // is rounded up to a page. Falls back to the one-copy present if the region isn't mapped
+            // as a single page-aligned interval.
+            let aligned = (((w as u64) * (h as u64) * 4) + 4095) & !4095;
+            let zc_ptr = if use_zerocopy {
+                // SAFETY: host_ptr bounds-checks [scanout_addr, +aligned) against a single mapping.
+                unsafe { self.dma.host_ptr(scanout_addr, aligned as usize) }
+            } else {
+                None
+            };
+            if let Some(ptr) = zc_ptr {
+                let ptr_addr = ptr as usize; // pass as usize to keep the closure Send-clean
+                match self.ticket.as_ref().unwrap().run_timed(move || {
+                    // SAFETY: ptr is a page-aligned guest-RAM region valid for the frame; the device
+                    // drops all imports on any DMA remap, so it can't dangle mid-submit.
+                    unsafe {
+                        gpu.render_forwarded_zerocopy(w, h, bg, &fwd.as_draw(), ptr_addr as *mut u8)
+                    }
+                }) {
+                    // The writeback is folded into the GPU phase (DMA during execution) — no dma hop.
+                    Ok((ok, st)) => (st.wait_us, st.gpu_us, 0, ok),
+                    Err(_) => {
+                        self.ring_retired[ctx] = sc.seqno;
+                        return;
+                    }
+                }
+            } else {
+                // One-copy present: dma-write straight from the GPU readback mapping into the guest
+                // scanout (no intermediate Frame Vec — finding #5). The present closure runs inside
+                // the timed region, so subtract it back out below.
+                let dma = &self.dma;
+                match self.ticket.as_ref().unwrap().run_timed(move || {
+                    gpu.render_forwarded_present(w, h, bg, &fwd.as_draw(), |px| {
+                        scanout_addr == 0 || dma.write(scanout_addr, px)
+                    })
+                }) {
+                    Ok((Some(ps), st)) => (
+                        st.wait_us,
+                        st.gpu_us.saturating_sub(ps.present_us),
+                        ps.present_us,
+                        ps.presented,
+                    ),
+                    _ => {
+                        // GPU-open/render failure (already logged) — retire so the ring never wedges.
+                        self.ring_retired[ctx] = sc.seqno;
+                        return;
+                    }
                 }
             }
         } else {
@@ -1881,6 +1980,8 @@ impl ServerBackend for InfinigpuBackend {
         match fd {
             Some(f) => {
                 info!("DMA_MAP iova={address:#x} size={size:#x} (guest RAM mapped zero-copy)");
+                // Fix D: any remap can invalidate the host pointers behind cached scanout imports.
+                self.shared_gpu.forget_all_guest_imports();
                 self.dma.map(address, offset, size, f)
             }
             // No fd: a region QEMU can't share by fd (BIOS/ROM shadow, MMIO holes).
@@ -1900,6 +2001,9 @@ impl ServerBackend for InfinigpuBackend {
             "DMA_UNMAP iova={address:#x} all={}",
             flags.contains(DmaUnmapFlags::UNMAP_ALL)
         );
+        // Fix D: the guest RAM behind any cached scanout import may be going away — drop them all
+        // (re-imported lazily on the next zero-copy render).
+        self.shared_gpu.forget_all_guest_imports();
         if flags.contains(DmaUnmapFlags::UNMAP_ALL) {
             self.dma.clear();
         } else {

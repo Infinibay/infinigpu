@@ -14,7 +14,7 @@
 use ash::vk;
 use std::collections::HashMap;
 use std::error::Error;
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, c_void, CStr};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -180,6 +180,33 @@ pub struct HostGpu {
     /// `wait_for_fences` (env `INFINIGPU_FENCE_SPIN_US`, default 0 = always block). A short spin
     /// catches the common fast completion without a sleep+wakeup context switch.
     fence_spin_us: u64,
+    /// Fix D (zero-copy scanout): `VK_EXT_external_memory_host` loader, present iff the device
+    /// supports importing a host pointer as `VkDeviceMemory`. Lets the GPU DMA a rendered frame
+    /// **straight into the guest scanout** (memfd-backed guest RAM), skipping the CPU readback copy.
+    ext_mem_host: Option<ash::ext::external_memory_host::Device>,
+    /// The alignment a host pointer must satisfy to be imported (`minImportedHostPointerAlignment`,
+    /// 4096 on NVIDIA); 0 when import is unsupported.
+    host_ptr_align: u64,
+    /// Fix D: imported guest scanout buffers, keyed by `(host_ptr, size)`. Stable per VM boot (the
+    /// scanout address rarely changes), so an import is reused across frames. Invalidated via
+    /// [`Self::forget_guest_import`] when the device unmaps that guest RAM (else the import dangles).
+    guest_imports: Mutex<HashMap<(usize, u64), ImportedGuest>>,
+}
+
+/// Fix D: a guest-RAM region imported as a `TRANSFER_DST` buffer the GPU can copy a frame into.
+struct ImportedGuest {
+    mem: vk::DeviceMemory,
+    buffer: vk::Buffer,
+}
+
+impl ImportedGuest {
+    /// # Safety
+    /// `dev` must be the device the buffer/memory were created on, and no submission may still
+    /// reference the buffer.
+    unsafe fn destroy(&self, dev: &ash::Device) {
+        dev.destroy_buffer(self.buffer, None);
+        dev.free_memory(self.mem, None); // does NOT unmap the guest RAM (imported, not owned)
+    }
 }
 
 /// RAII cleanup for the per-render Vulkan objects of [`HostGpu::render_triangle_inner`]. Every
@@ -588,12 +615,17 @@ impl HostGpu {
         };
         let want_fd = has_ext(ash::khr::external_memory_fd::NAME);
         let want_dma_buf = want_fd && has_ext(ash::ext::external_memory_dma_buf::NAME);
+        // Fix D: import a host pointer (the guest scanout) as VkDeviceMemory for zero-copy writeback.
+        let want_mem_host = has_ext(ash::ext::external_memory_host::NAME);
         let mut enabled_exts: Vec<*const c_char> = Vec::new();
         if want_fd {
             enabled_exts.push(ash::khr::external_memory_fd::NAME.as_ptr());
         }
         if want_dma_buf {
             enabled_exts.push(ash::ext::external_memory_dma_buf::NAME.as_ptr());
+        }
+        if want_mem_host {
+            enabled_exts.push(ash::ext::external_memory_host::NAME.as_ptr());
         }
 
         let priorities = [1.0f32];
@@ -610,6 +642,19 @@ impl HostGpu {
 
         let external_fd =
             want_fd.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
+
+        // Fix D: build the host-pointer-import loader and read the required alignment.
+        let (ext_mem_host, host_ptr_align) = if want_mem_host {
+            let mut hp = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut hp);
+            unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
+            (
+                Some(ash::ext::external_memory_host::Device::new(&instance, &device)),
+                hp.min_imported_host_pointer_alignment,
+            )
+        } else {
+            (None, 0)
+        };
 
         // Fix A: pipeline/shader caching on by default; INFINIGPU_PIPELINE_CACHE=0/false restores
         // the per-submit compile path so the owner can measure the tail before/after on one binary.
@@ -654,7 +699,17 @@ impl HostGpu {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
+            ext_mem_host,
+            host_ptr_align,
+            guest_imports: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Fix D: whether this device can DMA a rendered frame straight into an imported guest pointer
+    /// (i.e. `VK_EXT_external_memory_host` is available). The device server checks this before
+    /// attempting the zero-copy path and falls back to the one-copy present otherwise.
+    pub fn supports_zerocopy_scanout(&self) -> bool {
+        self.ext_mem_host.is_some() && self.host_ptr_align != 0
     }
 
     /// Wait for `fence`, spin-polling for up to `fence_spin_us` first (micro-opt: skips the
@@ -1655,67 +1710,7 @@ impl HostGpu {
 
         // Single submit thread per device process + fence-wait before return ⇒ no frame N+1 vs. N
         // hazard on the reused objects; reset the pool + fence and re-record for this frame.
-        unsafe {
-            dev.reset_command_pool(ss.pool, vk::CommandPoolResetFlags::empty())?;
-            dev.begin_command_buffer(
-                ss.cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )?;
-            let clears = [vk::ClearValue { color: vk::ClearColorValue { float32: bg } }];
-            dev.cmd_begin_render_pass(
-                ss.cmd,
-                &vk::RenderPassBeginInfo::default()
-                    .render_pass(render_pass)
-                    .framebuffer(ss.framebuffer)
-                    .render_area(vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent: vk::Extent2D { width, height },
-                    })
-                    .clear_values(&clears),
-                vk::SubpassContents::INLINE,
-            );
-            dev.cmd_bind_pipeline(ss.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            dev.cmd_set_viewport(
-                ss.cmd,
-                0,
-                &[vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: width as f32,
-                    height: height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                }],
-            );
-            dev.cmd_set_scissor(
-                ss.cmd,
-                0,
-                &[vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: vk::Extent2D { width, height },
-                }],
-            );
-            dev.cmd_draw(ss.cmd, draw.vertex_count, 1, 0, 0);
-            dev.cmd_end_render_pass(ss.cmd);
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .mip_level(0)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                )
-                .image_extent(vk::Extent3D { width, height, depth: 1 });
-            dev.cmd_copy_image_to_buffer(
-                ss.cmd,
-                ss.image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                ss.readback,
-                &[region],
-            );
-            dev.end_command_buffer(ss.cmd)?;
-        }
+        self.record_forwarded_frame(ss, render_pass, pipeline, width, height, bg, draw, ss.readback)?;
         let t_record = bd.map(|_| Instant::now());
         unsafe {
             dev.reset_fences(&[ss.fence])?;
@@ -1788,6 +1783,233 @@ impl HostGpu {
             true
         })?;
         Ok(Frame { width, height, rgba })
+    }
+
+    /// Record one forwarded-draw frame into `ss`'s command buffer — clear to `bg`, draw, then copy
+    /// the result image into `dst` (the persistent readback buffer for the present path, or an
+    /// imported guest-scanout buffer for the Fix-D zero-copy path). Resets the pool first; one submit
+    /// thread per process ⇒ no in-flight hazard on the reused command buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn record_forwarded_frame(
+        &self,
+        ss: &SizedScratch,
+        render_pass: vk::RenderPass,
+        pipeline: vk::Pipeline,
+        width: u32,
+        height: u32,
+        bg: [f32; 4],
+        draw: &ForwardedDraw,
+        dst: vk::Buffer,
+    ) -> R<()> {
+        let dev = &self.device;
+        unsafe {
+            dev.reset_command_pool(ss.pool, vk::CommandPoolResetFlags::empty())?;
+            dev.begin_command_buffer(
+                ss.cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            let clears = [vk::ClearValue { color: vk::ClearColorValue { float32: bg } }];
+            dev.cmd_begin_render_pass(
+                ss.cmd,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(render_pass)
+                    .framebuffer(ss.framebuffer)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D { width, height },
+                    })
+                    .clear_values(&clears),
+                vk::SubpassContents::INLINE,
+            );
+            dev.cmd_bind_pipeline(ss.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            dev.cmd_set_viewport(
+                ss.cmd,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f32,
+                    height: height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            dev.cmd_set_scissor(
+                ss.cmd,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D { width, height },
+                }],
+            );
+            dev.cmd_draw(ss.cmd, draw.vertex_count, 1, 0, 0);
+            dev.cmd_end_render_pass(ss.cmd);
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+            dev.cmd_copy_image_to_buffer(
+                ss.cmd,
+                ss.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst,
+                &[region],
+            );
+            dev.end_command_buffer(ss.cmd)?;
+        }
+        Ok(())
+    }
+
+    /// Fix D: import `[ptr, ptr+size)` (page-aligned host memory — e.g. the guest scanout in
+    /// memfd-backed RAM) as a `TRANSFER_DST` buffer the GPU can copy a frame straight into. `size`
+    /// is rounded up to the import alignment for the allocation. Fails (→ caller uses the copy path)
+    /// if the extension is absent, the pointer is misaligned, or no HOST_VISIBLE type is compatible.
+    ///
+    /// # Safety
+    /// `[ptr, ptr + round_up(size))` must be valid, mapped host memory that stays mapped for as long
+    /// as the returned import is cached (see [`Self::forget_all_guest_imports`]).
+    unsafe fn import_guest_buffer(&self, ptr: *mut u8, size: u64) -> R<ImportedGuest> {
+        let loader = self
+            .ext_mem_host
+            .as_ref()
+            .ok_or("VK_EXT_external_memory_host not supported")?;
+        let align = self.host_ptr_align.max(1);
+        if (ptr as usize as u64) % align != 0 {
+            return Err(format!("guest pointer {ptr:?} not aligned to {align}").into());
+        }
+        let alloc_size = size.div_ceil(align) * align;
+        let dev = &self.device;
+        let handle_type = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+
+        // Which memory types can back this host pointer?
+        let mut hpp = vk::MemoryHostPointerPropertiesEXT::default();
+        let r = (loader.fp().get_memory_host_pointer_properties_ext)(
+            dev.handle(),
+            handle_type,
+            ptr as *const c_void,
+            &mut hpp,
+        );
+        if r != vk::Result::SUCCESS {
+            return Err(format!("vkGetMemoryHostPointerPropertiesEXT: {r:?}").into());
+        }
+        let type_index = (0..self.mem_props.memory_type_count)
+            .find(|&i| {
+                (hpp.memory_type_bits & (1 << i)) != 0
+                    && self.mem_props.memory_types[i as usize]
+                        .property_flags
+                        .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+            })
+            .ok_or("no HOST_VISIBLE memory type compatible with the guest pointer")?;
+
+        let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(handle_type)
+            .host_pointer(ptr as *mut c_void);
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(alloc_size)
+            .memory_type_index(type_index)
+            .push_next(&mut import);
+        let mem = dev.allocate_memory(&alloc, None)?;
+
+        let mut ext = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
+        let buf_ci = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut ext);
+        let buffer = match dev.create_buffer(&buf_ci, None) {
+            Ok(b) => b,
+            Err(e) => {
+                dev.free_memory(mem, None);
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = dev.bind_buffer_memory(buffer, mem, 0) {
+            dev.destroy_buffer(buffer, None);
+            dev.free_memory(mem, None);
+            return Err(e.into());
+        }
+        Ok(ImportedGuest { mem, buffer })
+    }
+
+    /// Fix D: render a forwarded draw and DMA the result **straight into the imported guest scanout**
+    /// at `guest_ptr` — no host readback buffer, no CPU copy (the biggest remaining hot-path cost,
+    /// ~1 ms/frame at 1080p). Reuses the cached `(w,h)` scratch for everything but the copy
+    /// destination, and caches the import keyed by `(guest_ptr, size)` (stable per VM boot). Requires
+    /// the scratch cache + `VK_EXT_external_memory_host`; returns Err (→ caller falls back to the
+    /// one-copy present) if import fails.
+    ///
+    /// # Safety
+    /// `[guest_ptr, guest_ptr + width*height*4)` must be valid, mapped, page-aligned guest RAM that
+    /// stays mapped until [`Self::forget_all_guest_imports`] is called (the device does so on any DMA
+    /// remap). One submit thread per process ⇒ no concurrent forget vs. in-flight submit.
+    pub unsafe fn render_forwarded_zerocopy(
+        &self,
+        width: u32,
+        height: u32,
+        bg: [f32; 4],
+        draw: &ForwardedDraw,
+        guest_ptr: *mut u8,
+    ) -> R<()> {
+        const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+        let size = (width as u64) * (height as u64) * 4;
+        let key = (guest_ptr as usize, size);
+
+        let mut throwaway = RenderScratch::new(&self.device);
+        let (render_pass, pipeline) = self.pipeline_for(&mut throwaway, draw, FORMAT)?;
+
+        // Import (cached) — do it first so a failure returns before we touch the render scratch.
+        let dst = {
+            let mut imports = self.guest_imports.lock().unwrap_or_else(|e| e.into_inner());
+            if !imports.contains_key(&key) {
+                if imports.len() >= MAX_CACHED_SCRATCH {
+                    for (_, ig) in imports.drain() {
+                        ig.destroy(&self.device);
+                    }
+                }
+                let ig = self.import_guest_buffer(guest_ptr, size)?;
+                imports.insert(key, ig);
+            }
+            imports.get(&key).expect("just inserted above").buffer
+        }; // the ImportedGuest stays in the map (alive) after the guard drops — `dst` is a handle
+
+        let mut cache = self.scratch_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if !cache.contains_key(&(width, height)) {
+            if cache.len() >= MAX_CACHED_SCRATCH {
+                for (_, ss) in cache.drain() {
+                    ss.destroy(&self.device);
+                }
+            }
+            let ss = self.build_sized_scratch(width, height, render_pass)?;
+            cache.insert((width, height), ss);
+        }
+        let ss = cache.get(&(width, height)).expect("just inserted above");
+
+        self.record_forwarded_frame(ss, render_pass, pipeline, width, height, bg, draw, dst)?;
+        self.device.reset_fences(&[ss.fence])?;
+        let cmds = [ss.cmd];
+        let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+        self.device.queue_submit(self.queue, &submit, ss.fence)?;
+        self.wait_fence(ss.fence)?;
+        // The GPU wrote guest RAM directly over PCIe (snooped → cache-coherent on x86), so the guest
+        // CPU sees it after the fence. No CPU copy, and no invalidate (that was only for reading a
+        // HOST_CACHED *host* readback buffer back on the CPU).
+        Ok(())
+    }
+
+    /// Fix D: drop every cached guest-scanout import. The device calls this whenever it remaps guest
+    /// RAM (a DMA_MAP/UNMAP), because the underlying host pointers may become invalid; the next
+    /// zero-copy render re-imports lazily. No-op if none are cached.
+    pub fn forget_all_guest_imports(&self) {
+        let mut imports = self.guest_imports.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, ig) in imports.drain() {
+            unsafe { ig.destroy(&self.device) };
+        }
     }
 
     /// Fix B: build the persistent per-frame objects for `(width,height)`, sharing `render_pass`
@@ -2255,6 +2477,9 @@ impl Drop for HostGpu {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            // Fix D: free the imported guest-scanout buffers/memory before the device (freeing the
+            // VkDeviceMemory does NOT unmap the guest RAM — the import doesn't own it).
+            self.forget_all_guest_imports();
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -2284,6 +2509,62 @@ fn cstr_from_arr(buf: &[c_char]) -> &CStr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fix D: render straight into an imported page-aligned host buffer (standing in for the
+    /// memfd-backed guest scanout) and prove the pixels are byte-identical to the CPU-copy path.
+    /// Validates the whole `VK_EXT_external_memory_host` import + `cmd_copy_image_to_buffer` →
+    /// guest-RAM writeback mechanic on real silicon, without needing a full guest/QEMU stack.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn render_forwarded_zerocopy_matches_builtin() {
+        use std::alloc::{alloc_zeroed, dealloc, Layout};
+        // The zero-copy path reuses the (w,h) scratch, so the scratch cache must be on.
+        std::env::set_var("INFINIGPU_SCRATCH_CACHE", "1");
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        if !gpu.supports_zerocopy_scanout() {
+            eprintln!("skipping: no VK_EXT_external_memory_host on {}", gpu.device_name());
+            return;
+        }
+        let (w, h) = (256u32, 256u32);
+        let draw = ForwardedDraw::builtin_triangle();
+        let bg = [0.02f32, 0.02, 0.03, 1.0];
+
+        // Reference via the normal (copy) path.
+        let reference = gpu.render_forwarded(w, h, bg, &draw).expect("reference render");
+
+        // A page-aligned host buffer standing in for guest scanout RAM.
+        let size = (w * h * 4) as usize;
+        let align = 4096usize;
+        let alloc = size.div_ceil(align) * align;
+        let layout = Layout::from_size_align(alloc, align).expect("layout");
+        // SAFETY: nonzero layout; freed below with the same layout.
+        let raw = unsafe { alloc_zeroed(layout) };
+        assert!(!raw.is_null(), "alloc");
+
+        // SAFETY: `raw` is page-aligned and `[raw, raw+size)` is valid for the render's lifetime.
+        unsafe {
+            gpu.render_forwarded_zerocopy(w, h, bg, &draw, raw)
+                .expect("zerocopy render");
+        }
+        let got = unsafe { std::slice::from_raw_parts(raw as *const u8, size) };
+        let lit = got
+            .chunks_exact(4)
+            .filter(|p| p[0] > 8 || p[1] > 8 || p[2] > 8)
+            .count();
+        eprintln!("render_forwarded_zerocopy: lit={lit}/{}, matches builtin", w * h);
+        assert_eq!(
+            got,
+            reference.rgba.as_slice(),
+            "zerocopy pixels must be identical to the copy path"
+        );
+        unsafe { dealloc(raw, layout) };
+    }
 
     // GPU-touching; #[ignore]'d so `cargo test` stays green on hosts without a Vulkan device.
     // Run on real silicon with: `cargo test -p infinigpu-replay -- --ignored`.

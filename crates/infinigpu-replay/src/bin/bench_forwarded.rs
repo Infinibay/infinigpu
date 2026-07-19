@@ -49,45 +49,58 @@ fn main() {
     let draw = ForwardedDraw::builtin_triangle();
     let bg = [0.02f32, 0.02, 0.03, 1.0];
 
-    // Simulated guest scanout: the device dma.writes the frame here. BENCH_PRESENT=1 uses the
-    // one-copy present callback (readback→guest directly); default is the production two-copy path
-    // (render_forwarded allocs+copies a Vec, then we copy that Vec into the scanout like dma.write).
-    let present = env_usize("BENCH_PRESENT", 0) != 0;
-    let mut scanout = vec![0u8; (w * h * 4) as usize];
-    eprintln!("bench{tag}: present(one-copy)={present}");
+    // Simulated guest scanout: the device writes the frame here. BENCH_PRESENT selects the datapath:
+    //   0 = production two-copy (render_forwarded allocs+copies a Vec, then we copy into scanout)
+    //   1 = one-copy present callback (readback→scanout directly)
+    //   2 = zero-copy (Fix D): GPU DMAs straight into the imported scanout — no CPU copy at all.
+    let mode = env_usize("BENCH_PRESENT", 0);
+    // Page-aligned scanout (required for the zero-copy import; harmless for the others).
+    let size = (w * h * 4) as usize;
+    let align = 4096usize;
+    let alloc = size.div_ceil(align) * align;
+    let layout = std::alloc::Layout::from_size_align(alloc, align).unwrap();
+    // SAFETY: nonzero layout; the process owns this buffer for its whole lifetime (never freed).
+    let scan_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!scan_ptr.is_null(), "alloc scanout");
+    let scanout = unsafe { std::slice::from_raw_parts_mut(scan_ptr, size) };
+    eprintln!("bench{tag}: mode={mode} (0=two-copy 1=one-copy 2=zero-copy)");
+    if mode == 2 && !gpu.supports_zerocopy_scanout() {
+        eprintln!("bench{tag}: zero-copy unsupported on this device");
+        std::process::exit(2);
+    }
+
+    let run_once = |scanout: &mut [u8]| -> bool {
+        match mode {
+            // SAFETY: scan_ptr is page-aligned and valid for `size` bytes for the whole run.
+            2 => unsafe {
+                gpu.render_forwarded_zerocopy(w, h, bg, &draw, scanout.as_mut_ptr())
+                    .is_ok()
+            },
+            1 => gpu
+                .render_forwarded_present(w, h, bg, &draw, |px| {
+                    scanout[..px.len()].copy_from_slice(px);
+                    true
+                })
+                .is_ok(),
+            _ => match gpu.render_forwarded(w, h, bg, &draw) {
+                Ok(f) => {
+                    scanout[..f.rgba.len()].copy_from_slice(&f.rgba);
+                    true
+                }
+                Err(_) => false,
+            },
+        }
+    };
 
     for _ in 0..warmup {
-        if present {
-            let _ = gpu.render_forwarded_present(w, h, bg, &draw, |px| {
-                scanout[..px.len()].copy_from_slice(px);
-                true
-            });
-        } else {
-            if let Ok(f) = gpu.render_forwarded(w, h, bg, &draw) {
-                scanout[..f.rgba.len()].copy_from_slice(&f.rgba);
-            }
-        }
+        run_once(scanout);
     }
 
     let mut samples: Vec<u64> = Vec::with_capacity(iters);
     let t_all = Instant::now();
     for _ in 0..iters {
         let t = Instant::now();
-        let ok = if present {
-            gpu.render_forwarded_present(w, h, bg, &draw, |px| {
-                scanout[..px.len()].copy_from_slice(px);
-                true
-            })
-            .is_ok()
-        } else {
-            match gpu.render_forwarded(w, h, bg, &draw) {
-                Ok(f) => {
-                    scanout[..f.rgba.len()].copy_from_slice(&f.rgba);
-                    true
-                }
-                Err(_) => false,
-            }
-        };
+        let ok = run_once(scanout);
         let us = t.elapsed().as_micros() as u64;
         if ok {
             samples.push(us);

@@ -39,7 +39,7 @@ Consequences:
 | 8 | NUMA (memfd bind + prealloc, device-server membind) | `QemuCommandBuilder.ts`, `InfinigpuDeviceServer.ts` | **E** | ✅ done (`INFINIGPU_NUMA_NODE`, off) |
 | 3 | `dma_alloc_coherent(total_len, GFP_KERNEL)` per submit (fragmentation) | `igpu_ioctl_submit_forwarded` (`guest/linux/infinigpu.c`) | **B** (KMD pool) | 📐 designed — needs a guest build/test env (KMD DMA/concurrency) |
 | 4 | ICD re-serializes full SPIR-V + malloc/free per submit | `guest/icd/infinigpu_sync.c`, `infinigpu_forwarded.c` | **B** (ICD payload cache) | 📐 designed — guest build/test env |
-| 5 | Two CPU copies of the frame (`map`+`to_vec`, then `dma.write`) + a per-frame heap alloc of the whole frame; dma-buf export unused | `render_forwarded_present`; `submit_vulkan` | **D** | ✅ host one-copy — the device dma-writes straight from the readback mapping (no intermediate `Frame` Vec, no per-frame alloc); rides `INFINIGPU_SCRATCH_CACHE`. Full zero-copy (import guest memfd) still larger |
+| 5 | Two CPU copies of the frame (`map`+`to_vec`, then `dma.write`) + a per-frame heap alloc of the whole frame; dma-buf export unused | `render_forwarded_present` / `render_forwarded_zerocopy`; `submit_vulkan` | **D** | ✅ one-copy (dma-write from the readback mapping) **and** ✅ zero-copy (Fix D: GPU DMAs straight into the imported guest scanout — no CPU copy). Zero-copy gated `INFINIGPU_ZEROCOPY_SCANOUT`, GPU core validated on A5000 (p99 −60%, p999 −86% @1080p); needs full-stack validation — see [`FIX-D-ZEROCOPY.md`](./FIX-D-ZEROCOPY.md) |
 | 6 | run_lock over the whole compile+render, inline on the trap thread | `GpuBroker::run` (`infinigpu-sched:590`) | **C** | latent (per-process lock) |
 | 9 | Token-bucket `thread::sleep` up to 50ms on the inline thread (before the lock) | `GpuBroker::run` (`infinigpu-sched:583`) | yield/async | latent |
 
@@ -155,13 +155,15 @@ one of the already-designed architectural fixes:
 - **`gpu` (1.3–3.9 ms)** → **Fix F (async submit)**: overlap frame N+1's GPU work with N's readback+copy so the
   PCIe DMA and the copy are hidden behind the next submit. Under multi-VM it is ultimately GPU-contention-bound
   (a shared broker + real serialization is the QoS lever, not a micro-opt).
-- **`copy` (~1 ms pure memcpy)** → **Fix D-full (zero-copy)**: import the guest scanout memfd as Vulkan external
-  memory and `cmd_copy_image_to_buffer` **straight into guest RAM**, removing both the CPU memcpy *and* the
-  intermediate host readback buffer (the DMA lands in guest memory directly). This is the single biggest
-  remaining win (~1 ms/frame) but needs the memfd-import plumbing and a real guest/QEMU env to validate.
+- **`copy` (~1 ms pure memcpy)** → **Fix D (zero-copy)** — **IMPLEMENTED + core-validated.** Import the guest
+  scanout host pointer via `VK_EXT_external_memory_host` and `cmd_copy_image_to_buffer` **straight into guest
+  RAM**, removing both the CPU memcpy *and* the intermediate readback buffer. Shell-validated on the A5000
+  (byte-identical render + p99 −60%, p999 −86%, ×2.4 throughput @1080p); gated `INFINIGPU_ZEROCOPY_SCANOUT`,
+  pending only full-stack (real guest) validation. See [`FIX-D-ZEROCOPY.md`](./FIX-D-ZEROCOPY.md).
 
-Both require the owner's host + a decision; neither is safe to write blind. This is the honest stop line for
-the shell-measurable micro-opt phase.
+`gpu` still needs the owner's host + a decision (async submit / shared broker). This was the honest stop line
+for shell-*measurable* micro-opts; Fix D turned out to be shell-*validatable* (import a page-aligned host
+buffer standing in for guest RAM), so it got implemented and measured rather than just designed.
 
 ## Fix A (done)
 
@@ -197,6 +199,7 @@ state and the cache hit rate to approach 100%.
 | `INFINIGPU_SCRATCH_CACHE=1` | B (host) | Reuse per-(w,h) image/memory/framebuffer/readback (persistent map); needs pipeline cache on |
 | `INFINIGPU_NUMA_NODE=<n>` (infinization) | E | Bind guest RAM + device-server CPU/mem to the GPU's NUMA node + prealloc |
 | `INFINIGPU_FENCE_SPIN_US=<n>` (default **0**) | — | Spin-poll the fence up to `n` µs before blocking; skips the sleep/wakeup for fast frames. 50–100µs on well-provisioned hosts; leave 0 if VMs > CPU cores |
+| `INFINIGPU_ZEROCOPY_SCANOUT=1` (default off) | D | GPU DMAs the frame straight into the imported guest scanout (`VK_EXT_external_memory_host`) — no CPU copy. Needs the scratch cache + a page-aligned mapped scanout; falls back to one-copy present otherwise. Core-validated on A5000; needs full-stack validation |
 
 Land each remaining fix (B KMD/ICD, D-full, F) **only** once its own before/after p99 justifies it (golden
 rule). The gated fixes above are implemented but need A5000 render-validation + a measured win before their
