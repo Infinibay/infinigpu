@@ -259,9 +259,23 @@ fn decode_forwarded(payload: &[u8], max_bytes: usize) -> Option<OwnedForwardedDr
         std::ffi::CString::new(&b[..nul]).ok()
     };
 
+    let vertex_spirv = to_words(vspirv_b);
+    let fragment_spirv = to_words(fspirv_b);
+
+    // Cheap sanity gate: both blobs must start with the SPIR-V magic word. This rejects trivially
+    // garbage input before it reaches the driver's shader compiler. It does NOT make the SPIR-V
+    // safe — an adversarial-but-well-formed module can still hang/crash the compiler, and because
+    // SharedGpu runs one VkDevice across tenants (ADR-0003 per-VM jailed replay process is the
+    // deferred real isolation), that would wedge co-tenants. Full validation (spirv-val) / process
+    // isolation is tracked for a later phase; this is defense-in-depth, not a security boundary.
+    const SPIRV_MAGIC: u32 = 0x0723_0203;
+    if vertex_spirv.first() != Some(&SPIRV_MAGIC) || fragment_spirv.first() != Some(&SPIRV_MAGIC) {
+        return None;
+    }
+
     Some(OwnedForwardedDraw {
-        vertex_spirv: to_words(vspirv_b),
-        fragment_spirv: to_words(fspirv_b),
+        vertex_spirv,
+        fragment_spirv,
         vertex_entry: cstr(ventry_b)?,
         fragment_entry: cstr(fentry_b)?,
         vertex_count: tail.vertex_count,
@@ -2428,42 +2442,62 @@ mod tests {
 
     /// The wire decoder round-trips a real forwarded draw and rejects hostile inputs fail-closed —
     /// no GPU needed. Proves the byte layout + bounds checks the host relies on before it hands
-    /// guest-controlled SPIR-V to the driver.
+    /// guest-controlled SPIR-V to the driver. Uses DISTINCT vertex/fragment blobs + entries + a
+    /// non-default topology so a slot swap, transposition, or field mis-placement can't hide.
     #[test]
     fn forwarded_draw_decodes_and_rejects_hostile() {
         const CAP: usize = 64 * 1024 * 1024;
-        let draw = ForwardedDraw::builtin_triangle();
-        let payload = encode_forwarded(64, 64, [0.0; 4], 0, &draw);
+        const MAGIC: u32 = 0x0723_0203; // SPIR-V magic; decode_forwarded requires it as word 0.
+        // Distinct blobs (different content AND different length) so vertex/fragment can't be
+        // confused; distinct entry names; topology=1 (strip) and vertex_count=5, both non-default.
+        let vspirv: [u32; 3] = [MAGIC, 0x1111_1111, 0x2222_2222];
+        let fspirv: [u32; 5] = [MAGIC, 0x3333_3333, 0x4444_4444, 0x5555_5555, 0x6666_6666];
+        let draw = ForwardedDraw {
+            vertex_spirv: &vspirv,
+            vertex_entry: c"vmain",
+            fragment_spirv: &fspirv,
+            fragment_entry: c"fragmain",
+            vertex_count: 5,
+            topology: 1,
+        };
+        let payload = encode_forwarded(32, 16, [0.1, 0.2, 0.3, 1.0], 0, &draw);
 
-        // Round-trip: the decoded draw matches the source.
+        // Round-trip: EVERY field decodes to the source (distinct blobs catch a vs/fs swap;
+        // asserting topology catches a mis-placed tail field the old test missed).
         let owned = decode_forwarded(&payload, CAP).expect("valid forwarded payload decodes");
-        assert_eq!(owned.vertex_spirv, draw.vertex_spirv, "vertex SPIR-V round-trips");
-        assert_eq!(owned.fragment_spirv, draw.fragment_spirv, "fragment SPIR-V round-trips");
-        assert_eq!(owned.vertex_entry.as_c_str(), draw.vertex_entry);
-        assert_eq!(owned.fragment_entry.as_c_str(), draw.fragment_entry);
-        assert_eq!(owned.vertex_count, 3);
+        assert_eq!(owned.vertex_spirv, vspirv, "vertex SPIR-V round-trips (not the fragment blob)");
+        assert_eq!(owned.fragment_spirv, fspirv, "fragment SPIR-V round-trips (not the vertex blob)");
+        assert_eq!(owned.vertex_entry.as_c_str(), c"vmain");
+        assert_eq!(owned.fragment_entry.as_c_str(), c"fragmain");
+        assert_eq!(owned.vertex_count, 5);
+        assert_eq!(owned.topology, 1, "topology round-trips");
+
+        // Byte offsets within the payload (VulkanWorkload 40 + ForwardedDrawTail 24, then blobs).
+        let (hdr, tail) = (40usize, 24usize);
+        let (vlen, flen) = (vspirv.len() * 4, fspirv.len() * 4);
+        let velen = c"vmain".to_bytes_with_nul().len(); // 6
+        let ventry_off = hdr + tail + vlen + flen;
 
         // Hostile inputs → None (dropped fail-closed, caller still retires the fence):
         // (a) truncated before the tail even fits.
-        assert!(decode_forwarded(&payload[..44], CAP).is_none(), "truncated tail rejected");
-        // (b) truncated mid-SPIR-V (tail claims more bytes than present).
-        assert!(decode_forwarded(&payload[..payload.len() - 4], CAP).is_none(), "short blob rejected");
-        // (c) a SPIR-V length that isn't a multiple of 4. ForwardedDrawTail starts at byte 40;
-        // vertex_spirv_len is its 3rd u32 → low byte at 40 + 8 = 48.
+        assert!(decode_forwarded(&payload[..hdr + 4], CAP).is_none(), "truncated tail rejected");
+        // (b) truncated so the declared blobs no longer fit (aggregate length check).
+        assert!(decode_forwarded(&payload[..payload.len() - 4], CAP).is_none(), "short payload rejected");
+        // (c) vertex_spirv_len (tail's 3rd u32 → offset 40+8) made non-word-aligned.
         let mut bad_len = payload.clone();
-        bad_len[48] = bad_len[48].wrapping_add(1);
+        bad_len[hdr + 8] = bad_len[hdr + 8].wrapping_add(1);
         assert!(decode_forwarded(&bad_len, CAP).is_none(), "non-word-aligned SPIR-V rejected");
-        // (d) an entry name with no NUL terminator: zero out the vertex-entry NUL byte.
-        let mut no_nul = payload.clone();
-        for b in no_nul.iter_mut().rev() {
-            if *b == 0 {
-                *b = b'x';
-                break;
-            }
-        }
-        assert!(decode_forwarded(&no_nul, CAP).is_none(), "entry name without NUL rejected");
+        // (d) the VERTEX entry's NUL specifically removed (its own bounds check, independent of the
+        // fragment entry's) — offset = start of vertex entry + (name len) = its terminating NUL.
+        let mut no_vnul = payload.clone();
+        no_vnul[ventry_off + velen - 1] = b'x';
+        assert!(decode_forwarded(&no_vnul, CAP).is_none(), "vertex entry without NUL rejected");
         // (e) a blob larger than the cap.
         assert!(decode_forwarded(&payload, 8).is_none(), "SPIR-V over the byte cap rejected");
+        // (f) a blob whose first word is not the SPIR-V magic (word 0 of the vertex blob).
+        let mut bad_magic = payload.clone();
+        bad_magic[hdr + tail] = bad_magic[hdr + tail].wrapping_add(1);
+        assert!(decode_forwarded(&bad_magic, CAP).is_none(), "non-SPIR-V (bad magic) rejected");
     }
 
     /// Phase-1b end-to-end on real silicon: a `vk_op::FORWARDED` submit carrying serialized SPIR-V

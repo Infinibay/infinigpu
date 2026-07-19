@@ -149,6 +149,108 @@ pub struct HostGpu {
     dma_buf_supported: bool,
 }
 
+/// RAII cleanup for the per-render Vulkan objects of [`HostGpu::render_triangle_inner`]. Every
+/// handle is registered here as it is created and destroyed on `Drop` — so an early `?` return
+/// from ANY fallible driver call (e.g. a guest-forwarded pipeline that fails to compile) frees the
+/// resources instead of leaking them on the long-lived, tenant-shared `VkDevice`. Without this, a
+/// guest could flood malformed FORWARDED draws and exhaust VRAM for every co-tenant (found by the
+/// Phase-1b adversarial review). All handles start null; `Drop` skips the ones never created, in
+/// dependency-safe order (objects before the memory they bind).
+struct RenderScratch<'a> {
+    dev: &'a ash::Device,
+    fence: vk::Fence,
+    pool: vk::CommandPool,
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    vs_module: vk::ShaderModule,
+    fs_module: vk::ShaderModule,
+    framebuffer: vk::Framebuffer,
+    render_pass: vk::RenderPass,
+    view: vk::ImageView,
+    image: vk::Image,
+    img_mem: vk::DeviceMemory,
+    readback: vk::Buffer,
+    rb_mem: vk::DeviceMemory,
+    export_buffer: vk::Buffer,
+    export_mem: vk::DeviceMemory,
+}
+
+impl<'a> RenderScratch<'a> {
+    fn new(dev: &'a ash::Device) -> Self {
+        RenderScratch {
+            dev,
+            fence: vk::Fence::null(),
+            pool: vk::CommandPool::null(),
+            pipeline: vk::Pipeline::null(),
+            layout: vk::PipelineLayout::null(),
+            vs_module: vk::ShaderModule::null(),
+            fs_module: vk::ShaderModule::null(),
+            framebuffer: vk::Framebuffer::null(),
+            render_pass: vk::RenderPass::null(),
+            view: vk::ImageView::null(),
+            image: vk::Image::null(),
+            img_mem: vk::DeviceMemory::null(),
+            readback: vk::Buffer::null(),
+            rb_mem: vk::DeviceMemory::null(),
+            export_buffer: vk::Buffer::null(),
+            export_mem: vk::DeviceMemory::null(),
+        }
+    }
+}
+
+impl Drop for RenderScratch<'_> {
+    fn drop(&mut self) {
+        let d = self.dev;
+        unsafe {
+            if self.fence != vk::Fence::null() {
+                d.destroy_fence(self.fence, None);
+            }
+            if self.pool != vk::CommandPool::null() {
+                d.destroy_command_pool(self.pool, None); // also frees its command buffers
+            }
+            if self.export_buffer != vk::Buffer::null() {
+                d.destroy_buffer(self.export_buffer, None);
+            }
+            if self.export_mem != vk::DeviceMemory::null() {
+                d.free_memory(self.export_mem, None);
+            }
+            if self.readback != vk::Buffer::null() {
+                d.destroy_buffer(self.readback, None);
+            }
+            if self.rb_mem != vk::DeviceMemory::null() {
+                d.free_memory(self.rb_mem, None);
+            }
+            if self.pipeline != vk::Pipeline::null() {
+                d.destroy_pipeline(self.pipeline, None);
+            }
+            if self.layout != vk::PipelineLayout::null() {
+                d.destroy_pipeline_layout(self.layout, None);
+            }
+            if self.vs_module != vk::ShaderModule::null() {
+                d.destroy_shader_module(self.vs_module, None);
+            }
+            if self.fs_module != vk::ShaderModule::null() {
+                d.destroy_shader_module(self.fs_module, None);
+            }
+            if self.framebuffer != vk::Framebuffer::null() {
+                d.destroy_framebuffer(self.framebuffer, None);
+            }
+            if self.render_pass != vk::RenderPass::null() {
+                d.destroy_render_pass(self.render_pass, None);
+            }
+            if self.view != vk::ImageView::null() {
+                d.destroy_image_view(self.view, None);
+            }
+            if self.image != vk::Image::null() {
+                d.destroy_image(self.image, None);
+            }
+            if self.img_mem != vk::DeviceMemory::null() {
+                d.free_memory(self.img_mem, None);
+            }
+        }
+    }
+}
+
 impl HostGpu {
     pub fn device_name(&self) -> &str {
         &self.device_name
@@ -936,6 +1038,10 @@ impl HostGpu {
         let dev = &self.device;
         let size = width as u64 * height as u64 * 4;
 
+        // Everything created below is registered into `sc` and freed on Drop — so any early `?`
+        // (e.g. a guest-forwarded pipeline that fails to compile) can't leak on the shared device.
+        let mut sc = RenderScratch::new(dev);
+
         // ---- color image (device-local) + view ----
         let image = unsafe {
             dev.create_image(
@@ -952,6 +1058,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.image = image;
         let img_req = unsafe { dev.get_image_memory_requirements(image) };
         let img_mem = unsafe {
             dev.allocate_memory(
@@ -963,6 +1070,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.img_mem = img_mem;
         unsafe { dev.bind_image_memory(image, img_mem, 0)? };
         let view = unsafe {
             dev.create_image_view(
@@ -974,6 +1082,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.view = view;
 
         // ---- render pass (clear bg -> store -> TRANSFER_SRC) + framebuffer ----
         let attach = vk::AttachmentDescription::default()
@@ -998,6 +1107,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.render_pass = render_pass;
         let views = [view];
         let framebuffer = unsafe {
             dev.create_framebuffer(
@@ -1010,6 +1120,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.framebuffer = framebuffer;
 
         // ---- graphics pipeline (FORWARDED SPIR-V; no vertex buffers) ----
         // Two modules even when both stages alias one blob (the combined builtin case) — a
@@ -1021,15 +1132,18 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.vs_module = vs_module;
         let fs_module = unsafe {
             dev.create_shader_module(
                 &vk::ShaderModuleCreateInfo::default().code(draw.fragment_spirv),
                 None,
             )?
         };
+        sc.fs_module = fs_module;
         let layout = unsafe {
             dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)?
         };
+        sc.layout = layout;
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -1084,6 +1198,7 @@ impl HostGpu {
             dev.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
                 .map_err(|(_, e)| e)?[0]
         };
+        sc.pipeline = pipeline;
 
         // ---- host-visible readback buffer ----
         let readback = unsafe {
@@ -1095,6 +1210,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.readback = readback;
         let rb_req = unsafe { dev.get_buffer_memory_requirements(readback) };
         let rb_mem = unsafe {
             dev.allocate_memory(
@@ -1107,6 +1223,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.rb_mem = rb_mem;
         unsafe { dev.bind_buffer_memory(readback, rb_mem, 0)? };
 
         // ---- optional device-local, exportable buffer ----
@@ -1145,6 +1262,12 @@ impl HostGpu {
         } else {
             (None, None, 0, vk::ExternalMemoryHandleTypeFlags::empty(), "")
         };
+        if let Some(b) = export_buffer {
+            sc.export_buffer = b;
+        }
+        if let Some(m) = export_mem {
+            sc.export_mem = m;
+        }
 
         // ---- record ----
         let pool = unsafe {
@@ -1153,6 +1276,7 @@ impl HostGpu {
                 None,
             )?
         };
+        sc.pool = pool;
         let cmd = unsafe {
             dev.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -1217,6 +1341,7 @@ impl HostGpu {
 
         // ---- submit + fence ----
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None)? };
+        sc.fence = fence;
         let cmds = [cmd];
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
         unsafe {
@@ -1240,35 +1365,17 @@ impl HostGpu {
                 )?
             };
             // SAFETY: `raw` is a fresh fd owned by us (Vulkan dup'd it); OwnedFd closes it.
-            // The exported fd keeps its own reference to the underlying allocation, so
-            // freeing the VkDeviceMemory below does not invalidate it (Vulkan spec).
+            // The exported fd keeps its own reference to the underlying allocation, so freeing
+            // the VkDeviceMemory when `sc` drops does not invalidate it (Vulkan spec).
             let fd = unsafe { OwnedFd::from_raw_fd(raw) };
             Some(DmaBufExport { fd, size: export_size, handle_type: handle_str })
         } else {
             None
         };
 
-        // ---- teardown ----
-        unsafe {
-            dev.destroy_fence(fence, None);
-            dev.destroy_command_pool(pool, None);
-            if let (Some(ebuf), Some(emem)) = (export_buffer, export_mem) {
-                dev.destroy_buffer(ebuf, None);
-                dev.free_memory(emem, None);
-            }
-            dev.destroy_buffer(readback, None);
-            dev.free_memory(rb_mem, None);
-            dev.destroy_pipeline(pipeline, None);
-            dev.destroy_pipeline_layout(layout, None);
-            dev.destroy_shader_module(vs_module, None);
-            dev.destroy_shader_module(fs_module, None);
-            dev.destroy_framebuffer(framebuffer, None);
-            dev.destroy_render_pass(render_pass, None);
-            dev.destroy_image_view(view, None);
-            dev.destroy_image(image, None);
-            dev.free_memory(img_mem, None);
-        }
-
+        // All per-render objects are freed by `sc`'s Drop as it goes out of scope here — on this
+        // success path and on every early `?` above alike. The export fd (extracted above) keeps
+        // its own reference, so freeing export_mem in Drop does not invalidate it.
         Ok((Frame { width, height, rgba }, export))
     }
 }
@@ -1493,5 +1600,44 @@ mod tests {
         // Faithful forwarding: identical to the fixed path, byte-for-byte.
         assert_eq!(forwarded.rgba, builtin.rgba, "forwarded render differs from builtin");
         eprintln!("render_forwarded: lit={lit}/{total}, matches builtin");
+    }
+
+    // Regression guard for the Phase-1b adversarial-review finding: a forwarded draw that fails a
+    // driver call (here an entry-point name matching no OpEntryPoint → create_graphics_pipelines
+    // errors) must return Err cleanly and free its Vulkan objects via RenderScratch's Drop — NOT
+    // leak them on the shared VkDevice. A flood of such submits previously leaked up to ~64 MiB
+    // each. Here we fire many, assert each errors without panicking, then confirm the device is
+    // still healthy (a good render succeeds) — i.e. the error path is clean and repeatable.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn render_forwarded_bad_entry_errors_without_leaking() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let (w, h) = (64u32, 64u32);
+        let bg = [0.0, 0.0, 0.0, 1.0];
+        let bad = ForwardedDraw {
+            vertex_spirv: &shaders::TRIANGLE_SPV,
+            vertex_entry: c"no_such_entry", // valid module, but no such OpEntryPoint
+            fragment_spirv: &shaders::TRIANGLE_SPV,
+            fragment_entry: c"fs_main",
+            vertex_count: 3,
+            topology: 0,
+        };
+        for i in 0..64 {
+            assert!(
+                gpu.render_forwarded(w, h, bg, &bad).is_err(),
+                "bad entry point must Err (not panic/succeed) on iteration {i}"
+            );
+        }
+        // The shared device is still usable after the error flood — no wedge, no fatal exhaustion.
+        let good = gpu
+            .render_forwarded(w, h, bg, &ForwardedDraw::builtin_triangle())
+            .expect("a good forwarded render still succeeds after the error flood");
+        assert_eq!((good.width, good.height), (w, h));
     }
 }
