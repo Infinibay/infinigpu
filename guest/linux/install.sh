@@ -60,5 +60,38 @@ mkdir -p /etc/modules-load.d
 printf 'drm_dma_helper\ninfinigpu\n' > /etc/modules-load.d/infinigpu.conf
 log "[OK] /etc/modules-load.d/infinigpu.conf written"
 
+# 5. Vulkan ICD (userspace driver): unlike the DKMS kernel module, the ICD is a
+#    compiled Mesa-tree artifact shipped PREBUILT in this bundle. Install the .so where
+#    the manifest's library_path points and drop the manifest in the loader search path.
+if [ -f "$SRC_DIR/libvulkan_infinigpu.so" ] && [ -f "$SRC_DIR/infinigpu_icd.json" ]; then
+  LIBDIR="/usr/local/lib/x86_64-linux-gnu"   # == the manifest library_path
+  ICDDIR="/usr/share/vulkan/icd.d"
+  mkdir -p "$LIBDIR" "$ICDDIR"
+  install -m0644 "$SRC_DIR/libvulkan_infinigpu.so" "$LIBDIR/libvulkan_infinigpu.so"
+  install -m0644 "$SRC_DIR/infinigpu_icd.json" "$ICDDIR/infinigpu_icd.x86_64.json"
+  ldconfig 2>/dev/null || true
+  # Vulkan loader + libdrm at runtime; headers/tools for the validation app (best-effort).
+  if [ "$PM" = apt ]; then
+    apt-get install -y libvulkan1 libdrm2 mesa-vulkan-drivers vulkan-tools libvulkan-dev 2>&1 | tee -a "$LOG" || true
+  else
+    dnf install -y vulkan-loader libdrm vulkan-tools vulkan-headers 2>&1 | tee -a "$LOG" || true
+  fi
+  log "[OK] installed Vulkan ICD → $ICDDIR/infinigpu_icd.x86_64.json (lib in $LIBDIR)"
+
+  # Ship + best-effort build the end-to-end validation app (run it after the GPU attaches).
+  if [ -f "$SRC_DIR/infinigpu_tri_test.c" ]; then
+    SHARE=/usr/local/share/infinigpu; mkdir -p "$SHARE"
+    cp -f "$SRC_DIR/infinigpu_tri_test.c" "$SRC_DIR/infinigpu_tri_spv.h" "$SHARE/" 2>/dev/null || true
+    if command -v cc >/dev/null 2>&1 && \
+       cc -O2 -o /usr/local/bin/infinigpu-tri-test "$SHARE/infinigpu_tri_test.c" -I"$SHARE" -lvulkan 2>>"$LOG"; then
+      log "[OK] built validation app — after the GPU attaches, run: infinigpu-tri-test"
+    else
+      log "[INFO] validation app source in $SHARE (build: cc -O2 -o tri $SHARE/infinigpu_tri_test.c -I$SHARE -lvulkan)"
+    fi
+  fi
+else
+  log "[INFO] no Vulkan ICD in bundle — DRM display only, no guest Vulkan"
+fi
+
 log "=== done (module builds + loads on next boot as the guest's DRM display) ==="
 exit 0

@@ -69,9 +69,24 @@ echo ">> device binary published → ${OUT}/bin/infinigpu-device"
 GD_BASE="${INFINIBAY_BASE_DIR:-/opt/infinibay}/gpu-driver/linux"
 if [ -d "${INFINIBAY_BASE_DIR:-/opt/infinibay}" ]; then
   mkdir -p "${GD_BASE}"
-  tar -czf "${GD_BASE}/source.tar.gz" -C "${SRC}/guest/linux" \
-    infinigpu.c Makefile dkms.conf install.sh
-  echo ">> staged Linux guest driver → ${GD_BASE}/source.tar.gz"
+  # Assemble the guest bundle: the DKMS kernel-module SOURCE (built in-guest on first
+  # boot) PLUS the prebuilt Vulkan ICD (libvulkan_infinigpu.so + manifest) and the
+  # validation app. The ICD is a compiled Mesa-tree artifact — NOT in-guest buildable —
+  # so it ships prebuilt, reused from the host build under /src (mirrors the viewer at
+  # target/release/infinigpu-viewer; produce it with guest/icd/build.sh + stage-icd.sh).
+  STAGE="$(mktemp -d)"
+  cp "${SRC}/guest/linux/infinigpu.c" "${SRC}/guest/linux/Makefile" \
+     "${SRC}/guest/linux/dkms.conf" "${SRC}/guest/linux/install.sh" "${STAGE}/"
+  if [ -f "${SRC}/target/icd/libvulkan_infinigpu.so" ] && [ -f "${SRC}/target/icd/infinigpu_icd.json" ]; then
+    cp "${SRC}/target/icd/libvulkan_infinigpu.so" "${SRC}/target/icd/infinigpu_icd.json" "${STAGE}/"
+    cp "${SRC}/guest/icd/infinigpu_tri_test.c" "${SRC}/guest/icd/infinigpu_tri_spv.h" "${STAGE}/" 2>/dev/null || true
+    echo ">> including prebuilt Vulkan ICD (+ validation app) in the guest bundle"
+  else
+    echo ">> (no prebuilt ICD at ${SRC}/target/icd — guest gets the DRM module only; run guest/icd/build.sh + stage-icd.sh)"
+  fi
+  tar -czf "${GD_BASE}/source.tar.gz" -C "${STAGE}" .
+  rm -rf "${STAGE}"
+  echo ">> staged Linux guest bundle → ${GD_BASE}/source.tar.gz"
 
   # Stage the native viewer (desktop client) for the Settings download. Reuse a
   # host-built binary if one is present under the mounted source tree; the
