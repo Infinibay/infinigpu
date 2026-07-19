@@ -51,6 +51,32 @@ Still open: **bind-offset ABI bug** — the render writeback ignores the image's
 applies it (breaks suballocators/VMA). The real fix adds `bo_offset` to `drm_infinigpu_submit_forwarded` and
 threads it host↔guest; needs a GPU test.
 
+## Measured impact (RTX A5000, `bench_forwarded`)
+
+`render_forwarded` (builtin triangle, 256×256) latency. Reproduce with
+`cargo run --release -p infinigpu-replay --bin bench_forwarded` (see the bin's header for env).
+
+**Single VkDevice** (2000 iters):
+
+| Config | p50 | p99 | p999 | submit/s | cache hit |
+|--------|----:|----:|-----:|---------:|----------:|
+| baseline (`INFINIGPU_PIPELINE_CACHE=0`) | 1764µs | 2268µs | 3401µs | 556 | 0% |
+| Fix A (pipeline cache) | 1195µs | 1814µs (−20%) | 2059µs | 818 | 100% |
+| Fix A + Fix B (`INFINIGPU_SCRATCH_CACHE=1`) | 729µs | **928µs (−59%)** | 1591µs | 1330 (+139%) | 100% |
+
+**4 concurrent VkDevices on one GPU = the multi-VM tail** (1500 iters each), fleet **worst** p99:
+
+| Config | worst-VM p99 | % of a 60 Hz frame |
+|--------|-------------:|-------------------:|
+| baseline | 5968µs | 35.8% |
+| Fix A | 5079µs | 30.5% |
+| **Fix A + Fix B** | **1525µs** | **9.1% (−74%)** |
+
+Key finding, confirmed: under multi-VM contention the per-submit **allocation** churn (finding #2) is the
+dominant cost — Fix A alone (compile cache) barely moves the fleet worst-p99 because the N processes still
+contend on the driver allocator, but Fix B (allocation-free hot path) collapses it. Deploy **both**. Render
+output is validated identical to the reference (`render_forwarded_matches_builtin`) with both caches on.
+
 ## Fix A (done)
 
 `HostGpu` owns a real `VkPipelineCache` + a SPIR-V-hash-keyed memo (`GpuObjCache`) of shader modules, render
