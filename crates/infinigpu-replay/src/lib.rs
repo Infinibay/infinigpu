@@ -168,6 +168,10 @@ pub struct HostGpu {
     scratch_cache: Mutex<HashMap<(u32, u32), SizedScratch>>,
     /// Opt-in per-phase timing of the cached render path (env `INFINIGPU_BREAKDOWN`); `None` in prod.
     breakdown: Option<Breakdown>,
+    /// Micro-opt: spin-poll the fence for up to this many µs before falling back to a blocking
+    /// `wait_for_fences` (env `INFINIGPU_FENCE_SPIN_US`, default 0 = always block). A short spin
+    /// catches the common fast completion without a sleep+wakeup context switch.
+    fence_spin_us: u64,
 }
 
 /// RAII cleanup for the per-render Vulkan objects of [`HostGpu::render_triangle_inner`]. Every
@@ -635,7 +639,34 @@ impl HostGpu {
                     .unwrap_or(false),
             scratch_cache: Mutex::new(HashMap::new()),
             breakdown: std::env::var_os("INFINIGPU_BREAKDOWN").map(|_| Breakdown::default()),
+            fence_spin_us: std::env::var("INFINIGPU_FENCE_SPIN_US")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
         })
+    }
+
+    /// Wait for `fence`, spin-polling for up to `fence_spin_us` first (micro-opt: skips the
+    /// sleep+wakeup context switch when the GPU finishes quickly) before a blocking wait.
+    fn wait_fence(&self, fence: vk::Fence) -> R<()> {
+        let dev = &self.device;
+        if self.fence_spin_us != 0 {
+            let start = Instant::now();
+            loop {
+                match unsafe { dev.get_fence_status(fence) } {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {
+                        if start.elapsed().as_micros() as u64 >= self.fence_spin_us {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                    Err(_) => break, // fall through to the blocking wait (surfaces the real error)
+                }
+            }
+        }
+        unsafe { dev.wait_for_fences(&[fence], true, u64::MAX)? };
+        Ok(())
     }
 
     /// Whether this device can export rendered memory as an fd (dma-buf or opaque).
@@ -1122,8 +1153,8 @@ impl HostGpu {
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
         unsafe {
             dev.queue_submit(self.queue, &submit, fence)?;
-            dev.wait_for_fences(&[fence], true, u64::MAX)?;
         }
+        self.wait_fence(fence)?;
 
         // ---- read back ----
         let rgba = unsafe {
@@ -1492,8 +1523,8 @@ impl HostGpu {
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
         unsafe {
             dev.queue_submit(self.queue, &submit, fence)?;
-            dev.wait_for_fences(&[fence], true, u64::MAX)?;
         }
+        self.wait_fence(fence)?;
         let rgba = unsafe {
             let ptr = dev.map_memory(rb_mem, 0, rb_size, vk::MemoryMapFlags::empty())? as *const u8;
             let out = std::slice::from_raw_parts(ptr, rb_size as usize).to_vec();
@@ -1653,8 +1684,8 @@ impl HostGpu {
             let cmds = [ss.cmd];
             let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
             dev.queue_submit(self.queue, &submit, ss.fence)?;
-            dev.wait_for_fences(&[ss.fence], true, u64::MAX)?;
         }
+        self.wait_fence(ss.fence)?;
         let t_gpu = bd.map(|_| Instant::now());
         // HOST_CACHED readback: invalidate so the GPU's writes are visible before the (cached, fast)
         // read — reading write-combined/uncached memory was ~72% of the hot path. Coherent memory
@@ -2086,8 +2117,8 @@ impl HostGpu {
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
         unsafe {
             dev.queue_submit(self.queue, &submit, fence)?;
-            dev.wait_for_fences(&[fence], true, u64::MAX)?;
         }
+        self.wait_fence(fence)?;
 
         // ---- read back (HOST_CACHED: invalidate so the GPU's writes are visible before the
         // cached, fast read; coherent memory needs none — reading uncached memory dominated) ----

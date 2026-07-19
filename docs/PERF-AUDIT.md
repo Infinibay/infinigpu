@@ -80,10 +80,33 @@ Key findings, confirmed by a per-phase breakdown (`INFINIGPU_BREAKDOWN=1`):
 2. The frame **readback copy** was ~72% of a small single-VM frame (221µs for 256 KB) because the readback
    buffer was HOST_COHERENT → write-combined/**uncached** on NVIDIA. Switching it to **HOST_CACHED** (+
    invalidate) cut the copy to ~32µs (−86%) and roughly halves the multi-VM tail again.
-3. After those, the remaining single-VM cost is `submit + fence-wait` (~78µs GPU round-trip) — the next lever
-   is async submit (Fix F), a larger change.
+3. After those, the remaining single-VM cost is `submit + fence-wait` (~78µs GPU round-trip). Most of that
+   is the **sleep+wakeup context switch** of a blocking `vkWaitForFences`, not GPU work — a short spin on
+   `vkGetFenceStatus` before blocking removes it (fence-spin, below) without the larger async-submit change (Fix F).
 
 Render output validated identical to the reference (`render_forwarded_matches_builtin`) with all of the above.
+
+### Fence-spin (context-switch elimination)
+
+`HostGpu::wait_fence` spin-polls `vkGetFenceStatus` for up to `INFINIGPU_FENCE_SPIN_US` µs before falling
+back to a blocking `vkWaitForFences`. When the GPU finishes within the window (the common case for a small
+frame), it skips the ~50–80µs sleep/wakeup entirely. All three readback paths (default 3D, `render_clear`,
+`convert_present`) and the Fix-B cached path route through it. Measured on the A5000 (`bench_forwarded`,
+256×256, 3000 iters), single VkDevice:
+
+| Path | spin | p50 | p99 | submit/s |
+|------|-----:|----:|----:|---------:|
+| default (scratch off, alloc-bound) | 0 | 750µs | 1225µs | 1273 |
+| default | 100µs | 739µs | **870µs (−29%)** | 1345 |
+| **Fix B (scratch on)** | 0 | 145µs | 160µs | 7806 |
+| **Fix B** | **100µs** | **78µs (−46%)** | **84µs (−48%)** | **12502 (+60%)** |
+
+The win is largest on the cheap Fix-B path, where the fence-wait is the dominant remaining cost — p99 falls
+to **84µs = 0.5% of a 60 Hz frame**. Multi-VM: at 4 VMs the win narrows (worst p99 637→588µs) because the
+shared GPU is genuinely busy so the spin usually times out and blocks; at 12 VMs oversubscribed (48-CPU host)
+it still helps slightly (2145→1979µs) with no regression. **Caveat:** the spin busy-waits, so on a
+CPU-oversubscribed host (VMs > cores) it steals cycles a vCPU could use — hence **default 0 (off)**; enable a
+small value (50–100µs) on well-provisioned hosts. Render validated identical with spin on.
 
 ## Fix A (done)
 
@@ -118,6 +141,7 @@ state and the cache hit rate to approach 100%.
 | `INFINIGPU_PIPELINE_CACHE` (default **on**) | A | Cache pipelines/shaders across submits; `=0` restores per-submit compile |
 | `INFINIGPU_SCRATCH_CACHE=1` | B (host) | Reuse per-(w,h) image/memory/framebuffer/readback (persistent map); needs pipeline cache on |
 | `INFINIGPU_NUMA_NODE=<n>` (infinization) | E | Bind guest RAM + device-server CPU/mem to the GPU's NUMA node + prealloc |
+| `INFINIGPU_FENCE_SPIN_US=<n>` (default **0**) | — | Spin-poll the fence up to `n` µs before blocking; skips the sleep/wakeup for fast frames. 50–100µs on well-provisioned hosts; leave 0 if VMs > CPU cores |
 
 Land each remaining fix (B KMD/ICD, D-full, F) **only** once its own before/after p99 justifies it (golden
 rule). The gated fixes above are implemented but need A5000 render-validation + a measured win before their
