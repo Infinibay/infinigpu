@@ -22,7 +22,7 @@ pub mod resource;
 
 use dma::DmaTable;
 use infinigpu_abi::regs;
-use infinigpu_replay::{Frame, HostGpu};
+use infinigpu_replay::{ForwardedDraw, Frame, HostGpu};
 use infinigpu_sched::{BrokerConfig, GpuBroker, VmConfig, VmTicket};
 use log::info;
 use std::fs::File;
@@ -108,6 +108,39 @@ impl SharedGpu {
         }
     }
 
+    /// Lazily open the GPU, then replay a **forwarded** guest draw (`vk_op::FORWARDED`): the host
+    /// compiles the guest ICD's forwarded SPIR-V with the real driver and executes the draw on the
+    /// physical GPU. `None` on GPU-open/render failure (logged). Call only from inside a broker
+    /// `run()` closure.
+    pub fn render_forwarded(
+        &self,
+        width: u32,
+        height: u32,
+        bg: [f32; 4],
+        draw: &ForwardedDraw,
+    ) -> Option<Frame> {
+        let mut g = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            match HostGpu::open() {
+                Ok(x) => {
+                    info!("replay GPU: {} ({:?})", x.device_name(), x.driver_id());
+                    *g = Some(x);
+                }
+                Err(e) => {
+                    log::error!("cannot open replay GPU: {e}");
+                    return None;
+                }
+            }
+        }
+        match g.as_ref().unwrap().render_forwarded(width, height, bg, draw) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                log::error!("forwarded render failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Lazily open the GPU and return its HAL capabilities (ADR-0008) — vendor, driver,
     /// render/timestamp/external-memory/priority flags — or `None` if no GPU.
     pub fn caps(&self) -> Option<infinigpu_hal::GpuCaps> {
@@ -145,6 +178,95 @@ impl Default for SharedGpu {
             gpu: Mutex::new(None),
         }
     }
+}
+
+/// Host-decoded, owning form of a `vk_op::FORWARDED` wire draw (see [`decode_forwarded`]). Owns the
+/// SPIR-V words + entry names so a borrowing [`ForwardedDraw`] can be built inside the GPU run
+/// closure (which must be `'static`).
+struct OwnedForwardedDraw {
+    vertex_spirv: Vec<u32>,
+    fragment_spirv: Vec<u32>,
+    vertex_entry: std::ffi::CString,
+    fragment_entry: std::ffi::CString,
+    vertex_count: u32,
+    topology: u32,
+}
+
+impl OwnedForwardedDraw {
+    fn as_draw(&self) -> ForwardedDraw<'_> {
+        ForwardedDraw {
+            vertex_spirv: &self.vertex_spirv,
+            vertex_entry: &self.vertex_entry,
+            fragment_spirv: &self.fragment_spirv,
+            fragment_entry: &self.fragment_entry,
+            vertex_count: self.vertex_count,
+            topology: self.topology,
+        }
+    }
+}
+
+/// Decode the [`ForwardedDrawTail`](infinigpu_abi::wire::ForwardedDrawTail) + trailing SPIR-V/entry
+/// blobs that follow the fixed [`VulkanWorkload`] in a `vk_op::FORWARDED` SUBMIT_CMD payload. Fully
+/// bounds-checked against hostile guest input: every declared length must fit the remaining bytes
+/// without overflow, each SPIR-V blob must be a non-empty multiple of 4 (Vulkan words) within
+/// `max_bytes`, and each entry name must be a NUL-terminated string in its declared span. Returns
+/// `None` on ANY violation, so the caller drops the submit and still retires the fence (fail-closed).
+fn decode_forwarded(payload: &[u8], max_bytes: usize) -> Option<OwnedForwardedDraw> {
+    use infinigpu_abi::wire::ForwardedDrawTail;
+    use zerocopy::FromBytes;
+
+    // The tail sits right after the fixed VulkanWorkload header.
+    let tail_bytes = payload.get(size_of::<infinigpu_abi::wire::VulkanWorkload>()..)?;
+    let (tail, rest) = ForwardedDrawTail::read_from_prefix(tail_bytes).ok()?;
+
+    let vlen = tail.vertex_spirv_len as usize;
+    let flen = tail.fragment_spirv_len as usize;
+    let velen = tail.vertex_entry_len as usize;
+    let felen = tail.fragment_entry_len as usize;
+
+    // SPIR-V: non-empty u32-word streams, bounded. Entry names: non-empty, reasonably short.
+    if vlen == 0
+        || flen == 0
+        || !vlen.is_multiple_of(4)
+        || !flen.is_multiple_of(4)
+        || vlen > max_bytes
+        || flen > max_bytes
+        || velen == 0
+        || felen == 0
+        || velen > 256
+        || felen > 256
+    {
+        return None;
+    }
+    // The four blobs must fit `rest` exactly-or-less, with no length overflow.
+    let total = vlen.checked_add(flen)?.checked_add(velen)?.checked_add(felen)?;
+    if total > rest.len() {
+        return None;
+    }
+    let (vspirv_b, r) = rest.split_at(vlen);
+    let (fspirv_b, r) = r.split_at(flen);
+    let (ventry_b, r) = r.split_at(velen);
+    let (fentry_b, _) = r.split_at(felen);
+
+    // Copy SPIR-V into aligned u32 vectors (native byte order — host and guest share endianness).
+    let to_words = |b: &[u8]| -> Vec<u32> {
+        b.chunks_exact(4)
+            .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+    let cstr = |b: &[u8]| -> Option<std::ffi::CString> {
+        let nul = b.iter().position(|&c| c == 0)?;
+        std::ffi::CString::new(&b[..nul]).ok()
+    };
+
+    Some(OwnedForwardedDraw {
+        vertex_spirv: to_words(vspirv_b),
+        fragment_spirv: to_words(fspirv_b),
+        vertex_entry: cstr(ventry_b)?,
+        fragment_entry: cstr(fentry_b)?,
+        vertex_count: tail.vertex_count,
+        topology: tail.topology,
+    })
 }
 use vfio_bindings::bindings::vfio::{
     vfio_region_info, VFIO_IRQ_INFO_EVENTFD, VFIO_IRQ_SET_ACTION_TRIGGER,
@@ -1043,15 +1165,37 @@ impl InfinigpuBackend {
         // never billed to this tenant), then replay the named workload under the fair-share run-lock.
         let _ = self.shared_gpu.device_name();
         let gpu = Arc::clone(&self.shared_gpu);
-        let frame = match self.ticket.as_ref().unwrap().run(move || match op {
-            vk_op::TRIANGLE => gpu.render_triangle(w, h, bg),
-            _ => gpu.render_clear(w, h, bg), // vk_op::CLEAR + forward-compat default
-        }) {
-            Ok(Some(f)) => f,
-            _ => {
-                // GPU-open/render failure (already logged) — retire so the ring never wedges.
+        let frame = if op == vk_op::FORWARDED {
+            // Phase-1 own-ICD path: the guest ICD forwarded a real app's shaders + draw. Decode
+            // the tail + SPIR-V (fail-closed on hostile input), then replay it on the GPU.
+            let Some(fwd) = decode_forwarded(payload, MAX_CMD_BYTES as usize) else {
+                log::warn!("vulkan submit ctx={ctx}: malformed forwarded draw — dropped");
                 self.ring_retired[ctx] = sc.seqno;
                 return;
+            };
+            match self
+                .ticket
+                .as_ref()
+                .unwrap()
+                .run(move || gpu.render_forwarded(w, h, bg, &fwd.as_draw()))
+            {
+                Ok(Some(f)) => f,
+                _ => {
+                    self.ring_retired[ctx] = sc.seqno;
+                    return;
+                }
+            }
+        } else {
+            match self.ticket.as_ref().unwrap().run(move || match op {
+                vk_op::TRIANGLE => gpu.render_triangle(w, h, bg),
+                _ => gpu.render_clear(w, h, bg), // vk_op::CLEAR + forward-compat default
+            }) {
+                Ok(Some(f)) => f,
+                _ => {
+                    // GPU-open/render failure (already logged) — retire so the ring never wedges.
+                    self.ring_retired[ctx] = sc.seqno;
+                    return;
+                }
             }
         };
         // DMA-write the GPU-produced R8G8B8A8 result to the guest scanout (like
@@ -2223,6 +2367,162 @@ mod tests {
             .filter(|p| p[0] as u16 + p[1] as u16 + p[2] as u16 > 96)
             .count();
         assert!(lit > 0, "the GPU-rendered triangle wrote lit pixels to the guest scanout ({lit})");
+
+        unsafe { libc::munmap(ram as *mut libc::c_void, size) };
+    }
+
+    // --- Phase 1b: forwarded-draw wire (vk_op::FORWARDED) ---
+
+    fn spirv_bytes(words: &[u32]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(words.len() * 4);
+        for &w in words {
+            v.extend_from_slice(&w.to_ne_bytes());
+        }
+        v
+    }
+
+    /// Serialize a [`ForwardedDraw`] into a `vk_op::FORWARDED` SUBMIT_CMD payload exactly as the
+    /// guest ICD's `driver_submit` will: fixed VulkanWorkload, then the tail, then the SPIR-V blobs
+    /// and NUL-terminated entry names. Kept in the test for now; promotes to a shared encoder in 1c.
+    fn encode_forwarded(
+        width: u32,
+        height: u32,
+        bg: [f32; 4],
+        scanout_addr: u64,
+        draw: &ForwardedDraw,
+    ) -> Vec<u8> {
+        use infinigpu_abi::wire::{vk_op, ForwardedDrawTail, VulkanWorkload};
+        use zerocopy::IntoBytes;
+
+        let vspv = spirv_bytes(draw.vertex_spirv);
+        let fspv = spirv_bytes(draw.fragment_spirv);
+        let ventry = draw.vertex_entry.to_bytes_with_nul();
+        let fentry = draw.fragment_entry.to_bytes_with_nul();
+
+        let wl = VulkanWorkload {
+            op: vk_op::FORWARDED,
+            width,
+            height,
+            _pad: 0,
+            bg,
+            scanout_addr,
+        };
+        let tail = ForwardedDrawTail {
+            vertex_count: draw.vertex_count,
+            topology: draw.topology,
+            vertex_spirv_len: vspv.len() as u32,
+            fragment_spirv_len: fspv.len() as u32,
+            vertex_entry_len: ventry.len() as u32,
+            fragment_entry_len: fentry.len() as u32,
+        };
+
+        let mut p = Vec::new();
+        p.extend_from_slice(wl.as_bytes());
+        p.extend_from_slice(tail.as_bytes());
+        p.extend_from_slice(&vspv);
+        p.extend_from_slice(&fspv);
+        p.extend_from_slice(ventry);
+        p.extend_from_slice(fentry);
+        p
+    }
+
+    /// The wire decoder round-trips a real forwarded draw and rejects hostile inputs fail-closed —
+    /// no GPU needed. Proves the byte layout + bounds checks the host relies on before it hands
+    /// guest-controlled SPIR-V to the driver.
+    #[test]
+    fn forwarded_draw_decodes_and_rejects_hostile() {
+        const CAP: usize = 64 * 1024 * 1024;
+        let draw = ForwardedDraw::builtin_triangle();
+        let payload = encode_forwarded(64, 64, [0.0; 4], 0, &draw);
+
+        // Round-trip: the decoded draw matches the source.
+        let owned = decode_forwarded(&payload, CAP).expect("valid forwarded payload decodes");
+        assert_eq!(owned.vertex_spirv, draw.vertex_spirv, "vertex SPIR-V round-trips");
+        assert_eq!(owned.fragment_spirv, draw.fragment_spirv, "fragment SPIR-V round-trips");
+        assert_eq!(owned.vertex_entry.as_c_str(), draw.vertex_entry);
+        assert_eq!(owned.fragment_entry.as_c_str(), draw.fragment_entry);
+        assert_eq!(owned.vertex_count, 3);
+
+        // Hostile inputs → None (dropped fail-closed, caller still retires the fence):
+        // (a) truncated before the tail even fits.
+        assert!(decode_forwarded(&payload[..44], CAP).is_none(), "truncated tail rejected");
+        // (b) truncated mid-SPIR-V (tail claims more bytes than present).
+        assert!(decode_forwarded(&payload[..payload.len() - 4], CAP).is_none(), "short blob rejected");
+        // (c) a SPIR-V length that isn't a multiple of 4. ForwardedDrawTail starts at byte 40;
+        // vertex_spirv_len is its 3rd u32 → low byte at 40 + 8 = 48.
+        let mut bad_len = payload.clone();
+        bad_len[48] = bad_len[48].wrapping_add(1);
+        assert!(decode_forwarded(&bad_len, CAP).is_none(), "non-word-aligned SPIR-V rejected");
+        // (d) an entry name with no NUL terminator: zero out the vertex-entry NUL byte.
+        let mut no_nul = payload.clone();
+        for b in no_nul.iter_mut().rev() {
+            if *b == 0 {
+                *b = b'x';
+                break;
+            }
+        }
+        assert!(decode_forwarded(&no_nul, CAP).is_none(), "entry name without NUL rejected");
+        // (e) a blob larger than the cap.
+        assert!(decode_forwarded(&payload, 8).is_none(), "SPIR-V over the byte cap rejected");
+    }
+
+    /// Phase-1b end-to-end on real silicon: a `vk_op::FORWARDED` submit carrying serialized SPIR-V
+    /// must be decoded, compiled by the real driver, executed on the physical GPU, and DMA-written
+    /// to the guest scanout — the same proof as the named-triangle E2E, but the shader arrives over
+    /// the wire (the shape the guest ICD produces). GPU-gated; run with `--ignored --test-threads=1`.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_draw_renders_to_scanout() {
+        use std::os::unix::io::FromRawFd;
+
+        const GUEST_BASE: u64 = 0xB000_0000;
+        const SCAN_OFF: usize = 0x1000;
+        let (w, h): (u32, u32) = (64, 64);
+        let fb_bytes = (w * h * 4) as usize;
+        let size = SCAN_OFF + fb_bytes + 0x1000;
+
+        let fd = unsafe { libc::memfd_create(c"vkfwd".as_ptr(), 0) };
+        assert!(fd >= 0);
+        assert_eq!(unsafe { libc::ftruncate(fd, size as libc::off_t) }, 0);
+        let ram = unsafe {
+            libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
+        } as *mut u8;
+        assert_ne!(ram as *mut libc::c_void, libc::MAP_FAILED);
+
+        let scanout_addr = GUEST_BASE + SCAN_OFF as u64;
+        let draw = ForwardedDraw::builtin_triangle();
+        let payload = encode_forwarded(w, h, [0.02, 0.02, 0.05, 1.0], scanout_addr, &draw);
+        let sc = infinigpu_abi::wire::SubmitCmd {
+            ctx_id: 0,
+            encoding: infinigpu_abi::wire::encoding::VULKAN_VENUSLIKE,
+            payload_len: payload.len() as u32,
+            flags: 0,
+            seqno: 5,
+            in_fence: 0,
+            out_fence: 5,
+        };
+
+        let mut b = InfinigpuBackend::new();
+        let file = unsafe { <std::fs::File as FromRawFd>::from_raw_fd(fd) };
+        b.dma.map(GUEST_BASE, 0, size as u64, file).unwrap();
+
+        if b.shared_gpu.device_name().is_none() {
+            eprintln!("skipping: no GPU");
+            unsafe { libc::munmap(ram as *mut libc::c_void, size) };
+            return;
+        }
+
+        b.submit_vulkan(&sc, &payload, 0);
+        assert_eq!(b.ring_retired[0], 5, "the forwarded 3D fence retired");
+        assert_eq!(b.vulkan_submits, 1);
+
+        let px = unsafe { std::slice::from_raw_parts(ram.add(SCAN_OFF), fb_bytes) };
+        let lit = px
+            .chunks_exact(4)
+            .filter(|p| p[0] as u16 + p[1] as u16 + p[2] as u16 > 96)
+            .count();
+        assert!(lit > 0, "the forwarded-SPIR-V triangle wrote lit pixels to the guest scanout ({lit})");
+        eprintln!("forwarded_draw_renders_to_scanout: lit={lit}/{}", (w * h) as usize);
 
         unsafe { libc::munmap(ram as *mut libc::c_void, size) };
     }

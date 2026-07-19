@@ -69,6 +69,10 @@ mod layout_asserts {
     // scanout_addr must stay 8-aligned so the u64 reads directly out of the payload.
     const _: () = assert!(size_of::<VulkanWorkload>() == 40);
     const _: () = assert!(offset_of!(VulkanWorkload, scanout_addr) == 32);
+    // ForwardedDrawTail (vk_op::FORWARDED): 6×u32 = 24, 4-byte aligned; the SPIR-V blobs +
+    // entry-name strings follow it in the payload (variable length).
+    const _: () = assert!(size_of::<ForwardedDrawTail>() == 24);
+    const _: () = assert!(align_of::<ForwardedDrawTail>() == 4);
     const _: () = assert!(size_of::<ScanoutPresent>() == 24);
     const _: () = assert!(offset_of!(ScanoutPresent, scanout_addr) == 16);
     // ScanoutPresentDamaged is a ScanoutPresent superset (same prefix + scanout_addr@16)
@@ -107,7 +111,7 @@ mod tests {
             abi_version(),
             (u32::from(ABI_MAJOR) << 16) | u32::from(ABI_MINOR)
         );
-        assert_eq!(abi_version(), 0x0000_0005);
+        assert_eq!(abi_version(), 0x0000_0006);
     }
 
     #[test]

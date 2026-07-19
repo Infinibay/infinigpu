@@ -72,7 +72,20 @@ pub struct ForwardedDraw<'a> {
     pub fragment_entry: &'a CStr,
     /// Vertices for the `draw(vertex_count, 1, 0, 0)` (no vertex buffers — SM-generated).
     pub vertex_count: u32,
-    pub topology: vk::PrimitiveTopology,
+    /// Primitive topology as the wire's `infinigpu_abi::wire::vk_topology` u32 (0 = triangle
+    /// list, 1 = triangle strip). Kept as a plain u32 so this public API — and the host device
+    /// crate that builds a `ForwardedDraw` from the wire — need not depend on ash/Vulkan headers;
+    /// [`map_topology`] converts it just before pipeline creation.
+    pub topology: u32,
+}
+
+/// Wire `vk_topology` u32 → `VkPrimitiveTopology`. Unknown values fall back to a triangle list
+/// (fail-safe: an unrecognized topology still draws something rather than erroring).
+fn map_topology(t: u32) -> vk::PrimitiveTopology {
+    match t {
+        1 => vk::PrimitiveTopology::TRIANGLE_STRIP,
+        _ => vk::PrimitiveTopology::TRIANGLE_LIST,
+    }
 }
 
 impl<'a> ForwardedDraw<'a> {
@@ -86,7 +99,7 @@ impl<'a> ForwardedDraw<'a> {
             fragment_spirv: &shaders::TRIANGLE_SPV,
             fragment_entry: c"fs_main",
             vertex_count: 3,
-            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            topology: 0, // vk_topology::TRIANGLE_LIST
         }
     }
 }
@@ -1029,7 +1042,7 @@ impl HostGpu {
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_asm = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(draw.topology);
+            .topology(map_topology(draw.topology));
         let viewports = [vk::Viewport {
             x: 0.0,
             y: 0.0,

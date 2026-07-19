@@ -34,8 +34,10 @@ pub const ABI_MAJOR: u16 = 0;
 /// added the blob-backing wire (`AttachBacking`, `MemEntry` — the `RESOURCE_ATTACH_BACKING` payload
 /// the PR4 ring drainer records into the per-VM `ResourceTable`). v5 added the Phase-0 own-remoting
 /// 3D payload (`VulkanWorkload`, `vk_op` — the `VULKAN_VENUSLIKE` submit body the host replays on the
-/// real GPU via ash, no Mesa venus dependency).
-pub const ABI_MINOR: u16 = 5;
+/// real GPU via ash, no Mesa venus dependency). v6 added the Phase-1 own-ICD forwarded-draw
+/// (`vk_op::FORWARDED` + `ForwardedDrawTail` + trailing SPIR-V — the guest ICD serializes a real
+/// app's shaders + draw and the host compiles/replays the forwarded SPIR-V).
+pub const ABI_MINOR: u16 = 6;
 
 /// Packed `ABI_VERSION` register value (`major << 16 | minor`).
 pub const fn abi_version() -> u32 {

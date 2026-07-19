@@ -344,6 +344,19 @@ pub mod vk_op {
     pub const CLEAR: u32 = 0;
     /// Draw a shader-executed triangle over `bg` — real SM/pipeline execution on the host GPU.
     pub const TRIANGLE: u32 = 1;
+    /// **Forwarded draw** (Phase-1 own-ICD, `docs/adr/GUEST-ICD-IMPLEMENTATION.md`): the guest
+    /// ICD serialized a real app's shaders + draw. The [`VulkanWorkload`] is immediately
+    /// followed by a [`ForwardedDrawTail`] + the SPIR-V blobs + entry-point names; the host
+    /// compiles the forwarded SPIR-V with the real driver and replays the draw (no fixed op).
+    pub const FORWARDED: u32 = 2;
+}
+
+/// Primitive topology on the wire ([`ForwardedDrawTail::topology`]) — our own small enum so the
+/// wire doesn't couple to any Vulkan header's numeric values; the host maps it to the real
+/// `VkPrimitiveTopology`. Phase 1 only needs the triangle list; unknown values map to it.
+pub mod vk_topology {
+    pub const TRIANGLE_LIST: u32 = 0;
+    pub const TRIANGLE_STRIP: u32 = 1;
 }
 
 /// `SUBMIT_CMD` payload for [`encoding::VULKAN_VENUSLIKE`] — the Phase-0 own-remoting 3D
@@ -363,6 +376,32 @@ pub struct VulkanWorkload {
     pub _pad: u32,
     pub bg: [f32; 4],
     pub scanout_addr: u64,
+}
+
+/// Trailing header for a [`vk_op::FORWARDED`] draw. Sits immediately after the fixed
+/// [`VulkanWorkload`] in the `SUBMIT_CMD` payload and is itself followed, in order, by:
+///   1. vertex-stage SPIR-V — `vertex_spirv_len` bytes (a multiple of 4),
+///   2. fragment-stage SPIR-V — `fragment_spirv_len` bytes,
+///   3. vertex entry-point name — `vertex_entry_len` bytes (incl. trailing NUL),
+///   4. fragment entry-point name — `fragment_entry_len` bytes (incl. trailing NUL).
+/// The render target `width`/`height`, clear `bg`, and `scanout_addr` come from the enclosing
+/// [`VulkanWorkload`]. All lengths are guest-controlled and MUST be bounds-checked against the
+/// actual payload length by the host before use (fail-closed). 24 bytes, 4-byte aligned.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct ForwardedDrawTail {
+    /// Vertices for `draw(vertex_count, 1, 0, 0)` (no vertex buffers — SM-generated).
+    pub vertex_count: u32,
+    /// [`vk_topology`].
+    pub topology: u32,
+    /// Byte length of the vertex-stage SPIR-V blob that follows.
+    pub vertex_spirv_len: u32,
+    /// Byte length of the fragment-stage SPIR-V blob.
+    pub fragment_spirv_len: u32,
+    /// Byte length of the vertex entry-point name (incl. trailing NUL).
+    pub vertex_entry_len: u32,
+    /// Byte length of the fragment entry-point name (incl. trailing NUL).
+    pub fragment_entry_len: u32,
 }
 
 /// `DISPLAY_SCANOUT` payload (see [`encoding::DISPLAY_SCANOUT`]): the guest's real

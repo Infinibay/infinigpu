@@ -382,3 +382,41 @@ struct VulkanWorkload {
   float bg[4];
   uint64_t scanout_addr;
 };
+
+/**
+ * Trailing header for a [`vk_op::FORWARDED`] draw. Sits immediately after the fixed
+ * [`VulkanWorkload`] in the `SUBMIT_CMD` payload and is itself followed, in order, by:
+ *   1. vertex-stage SPIR-V — `vertex_spirv_len` bytes (a multiple of 4),
+ *   2. fragment-stage SPIR-V — `fragment_spirv_len` bytes,
+ *   3. vertex entry-point name — `vertex_entry_len` bytes (incl. trailing NUL),
+ *   4. fragment entry-point name — `fragment_entry_len` bytes (incl. trailing NUL).
+ * The render target `width`/`height`, clear `bg`, and `scanout_addr` come from the enclosing
+ * [`VulkanWorkload`]. All lengths are guest-controlled and MUST be bounds-checked against the
+ * actual payload length by the host before use (fail-closed). 24 bytes, 4-byte aligned.
+ */
+struct ForwardedDrawTail {
+  /**
+   * Vertices for `draw(vertex_count, 1, 0, 0)` (no vertex buffers — SM-generated).
+   */
+  uint32_t vertex_count;
+  /**
+   * [`vk_topology`].
+   */
+  uint32_t topology;
+  /**
+   * Byte length of the vertex-stage SPIR-V blob that follows.
+   */
+  uint32_t vertex_spirv_len;
+  /**
+   * Byte length of the fragment-stage SPIR-V blob.
+   */
+  uint32_t fragment_spirv_len;
+  /**
+   * Byte length of the vertex entry-point name (incl. trailing NUL).
+   */
+  uint32_t vertex_entry_len;
+  /**
+   * Byte length of the fragment entry-point name (incl. trailing NUL).
+   */
+  uint32_t fragment_entry_len;
+};
