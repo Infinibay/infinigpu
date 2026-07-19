@@ -2,8 +2,9 @@
  * Copyright 2024 Infinibay
  * SPDX-License-Identifier: MIT
  *
- * VkPhysicalDevice: enumerate one device backed by /dev/dri/renderD128 iff its
- * drm name is "infinigpu", fabricate properties, and answer the *2 property
+ * VkPhysicalDevice: enumerate one device backed by the infinigpu PRIMARY node
+ * (/dev/dri/card*, selected by drm name — NOT the render node, which forbids the
+ * dumb-buffer ioctls our allocations need), fabricate properties, and answer the *2 property
  * queries.  Cribbed from lavapipe (lvp_physical_device_init /
  * lvp_enumerate_physical_devices / lvp_get_properties / the *2 getters).
  *
@@ -166,6 +167,44 @@ infinigpu_physical_device_destroy(struct vk_physical_device *vk_pdev)
    vk_free(&pdev->vk.instance->alloc, pdev);
 }
 
+/* Open the infinigpu DRM node that backs allocations + submits.
+ *
+ * IMPORTANT: buffer storage is DRM "dumb" buffers (CREATE_DUMB/MAP_DUMB), and the
+ * DRM core forbids those ioctls on RENDER nodes — they lack DRM_RENDER_ALLOW, so a
+ * render-node fd gets EACCES. They ARE permitted on the PRIMARY node (card*) with no
+ * DRM master, and our render-allowed ioctl (SUBMIT_FORWARDED) works there too. So we
+ * bind the PRIMARY node, selected by DRM driver name — never the render node.
+ *
+ * Returns an fd (caller owns) or -1 if no infinigpu primary node is present. In smoke
+ * mode, falls back to the render node so the bring-up path is still exercised. */
+static int
+infinigpu_open_node(bool smoke)
+{
+   for (int i = 0; i < 16; i++) {
+      char path[32];
+      snprintf(path, sizeof(path), "/dev/dri/card%d", i);
+      int fd = open(path, O_RDWR | O_CLOEXEC);
+      if (fd < 0)
+         continue;
+      /* drmGetVersion / drmFreeVersion: xf86drm.h (libdrm). ->name is NUL-term. */
+      drmVersionPtr v = drmGetVersion(fd);
+      const bool match = v && v->name && strcmp(v->name, INFINIGPU_DRM_NAME) == 0;
+      if (v)
+         drmFreeVersion(v);
+      if (match) {
+         IGPU_TRACE("open node: %s is the infinigpu primary node -> fd %d", path, fd);
+         return fd;
+      }
+      close(fd);
+   }
+   if (smoke) {
+      int fd = open(INFINIGPU_RENDER_NODE, O_RDWR | O_CLOEXEC);
+      IGPU_TRACE("open node: smoke fallback open(%s) -> %d", INFINIGPU_RENDER_NODE, fd);
+      return fd;
+   }
+   return -1;
+}
+
 VkResult
 infinigpu_enumerate_physical_devices(struct vk_instance *vk_instance)
 {
@@ -173,32 +212,19 @@ infinigpu_enumerate_physical_devices(struct vk_instance *vk_instance)
       container_of(vk_instance, struct infinigpu_instance, vk);
 
    /* INFINIGPU_SMOKE_ANY_NODE: dev/test escape hatch. The real infinigpu DRM
-    * device only exists inside a guest VM; on a bare host renderD128 is the
-    * physical GPU (e.g. nvidia, often not even group-openable). In smoke mode we
-    * (a) skip the drm name check and, (b) if the node can't be opened at all,
-    * fabricate a device with NO backing fd (drm_fd = -1) — Phase 0 renders
+    * device only exists inside a guest VM; on a bare host card0 is the physical
+    * GPU (e.g. nvidia, often not even group-openable). In smoke mode we (a) skip
+    * the drm name check (accept the render node) and, (b) if no node can be opened
+    * at all, fabricate a device with NO backing fd (drm_fd = -1) — Phase 0 renders
     * nothing, so the whole load -> enumerate -> CreateDevice -> property-query
     * path is exercised without a real device. Never set it in production. */
    const bool smoke = getenv("INFINIGPU_SMOKE_ANY_NODE") != NULL;
    IGPU_TRACE("enumerate: called (smoke=%d)", smoke);
 
-   int fd = open(INFINIGPU_RENDER_NODE, O_RDWR | O_CLOEXEC);
-   IGPU_TRACE("enumerate: open(%s) -> %d", INFINIGPU_RENDER_NODE, fd);
+   int fd = infinigpu_open_node(smoke);
+   IGPU_TRACE("enumerate: node fd -> %d", fd);
    if (fd < 0 && !smoke)
       return VK_SUCCESS; /* no compatible device -> empty list */
-
-   if (fd >= 0) {
-      /* drmGetVersion / drmFreeVersion: xf86drm.h (libdrm). ->name is NUL-term. */
-      drmVersionPtr version = drmGetVersion(fd);
-      const bool is_infinigpu = version && version->name &&
-                                strcmp(version->name, INFINIGPU_DRM_NAME) == 0;
-      if (version)
-         drmFreeVersion(version);
-      if (!is_infinigpu && !smoke) {
-         close(fd);
-         return VK_SUCCESS;
-      }
-   }
 
    struct infinigpu_physical_device *pdev =
       vk_zalloc2(&instance->vk.alloc, NULL, sizeof(*pdev), 8,
