@@ -1,6 +1,7 @@
 # ADR: infinigpu guest Vulkan ICD (own thin driver on Mesa's runtime)
 
-**Status:** ACCEPTED (direction), IN PROGRESS (Phase 0). Supersedes the "reuse Mesa Venus"
+**Status:** ACCEPTED (direction); Phase 0 + Phase 1 **IMPLEMENTED** (builds + links clean via
+`guest/icd/build.sh`; host smoke binds; the guest-VM triangle render is owner-validated). Supersedes the "reuse Mesa Venus"
 option for 3D — see [`../spikes/venus-nvidia-a5000.md`](../spikes/venus-nvidia-a5000.md).
 
 ## Context
@@ -99,6 +100,42 @@ In parallel, host + wire + guest-KMD work:
 
 **Deliverable:** a real Vulkan program renders a triangle **through the ICD**, read back = lit
 pixels, GPU-executed on the A5000 — **replacing `submit3d_test.c` with the real Vulkan API**.
+
+**Status: IMPLEMENTED.** As-built notes (where the plan was refined):
+- **Runtime:** stays on `idep_vulkan_lite_runtime`. Shader-module / graphics-pipeline / pipeline-cache
+  are hand-written (the lite runtime doesn't backfill them — their `vk_common` lives in the full
+  runtime, which would drag in nir/vtn; a *forwarding* driver must not compile SPIR-V, so this is
+  correct). `PipelineLayout`/`RenderPass2`/`Framebuffer`/`SetViewport`/`SetScissor` come free from
+  `vk_common`. Files: `infinigpu_{memory,image,pipeline,cmd_buffer,sync,kmd}.c`.
+- **Transport (the plan's "richer submit ioctl"):** the forwarded body carries the app's SPIR-V (KBs),
+  too large for the command ring's 128 B inline slot — so it travels **out-of-line**: ABI v7 adds
+  `desc_flags::PAYLOAD_ABS` (host DMA-reads the body from an absolute guest address, like a scanout
+  target). The KMD's `DRM_IOCTL_INFINIGPU_SUBMIT_FORWARDED` stages `[submit_cmd][body]`, overwrites
+  the workload's width/height/scanout_addr from the validated args + BO `dma_addr` (fail-closed
+  writeback bound), and publishes it via `igpu_ring2_push_abs`.
+- **Host:** `submit_vulkan` already generalized (`decode_forwarded` → `HostGpu::render_forwarded`),
+  compiling the forwarded vertex+fragment SPIR-V into a pipeline and DMA-writing the result back.
+- **Sync:** a binary CPU sync in **IMMEDIATE** submit mode — `driver_submit` runs synchronously and
+  the forwarded-draw ioctl blocks until the host GPU DMA-write completes, so fences signal right
+  after. `CmdCopyImageToBuffer2` is deferred to submit (runs after the render). Emulated timeline +
+  `timelineSemaphore` are a conformance follow-up.
+- **Linear color image:** row pitch is **packed** (`width*bpp`) so the host's tightly-packed writeback
+  lands exactly and `GetImageSubresourceLayout` reports the same stride for readback.
+
+**Validate in the guest VM** (the DRM node must be `infinigpu`, i.e. boot with the module +
+`infinigpu.ring_drainer=1`, and the VM must have the GPU attached — setup-complete):
+```
+# 1) build + install the ICD (guest/icd/build.sh drops libvulkan_infinigpu.so + the ICD json)
+# 2) build the validation app against the guest's Vulkan loader:
+cc -O2 -o infinigpu_tri_test guest/icd/infinigpu_tri_test.c -Iguest/icd -lvulkan
+# 3) run it, pointing the loader at the infinigpu ICD:
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/infinigpu_icd.x86_64.json ./infinigpu_tri_test
+# expect: "PASS", "lit (non-background) pixels: >0", and infinigpu_tri.ppm = an RGB triangle.
+```
+It forwards the same triangle SPIR-V the host replay is unit-tested against (`vs_main`/`fs_main`), so
+a PASS proves guest ICD + KMD + host agree end to end. First-milestone limits: color image must be a
+**dedicated allocation at offset 0**, format `R8G8B8A8_UNORM` (host writes that byte order),
+shaders ≤ 1 MiB.
 
 ### Phase 2 — WSI → `vkcube`  *(present path)*
 
