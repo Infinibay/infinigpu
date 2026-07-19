@@ -58,24 +58,32 @@ threads it host↔guest; needs a GPU test.
 
 **Single VkDevice** (2000 iters):
 
-| Config | p50 | p99 | p999 | submit/s | cache hit |
-|--------|----:|----:|-----:|---------:|----------:|
-| baseline (`INFINIGPU_PIPELINE_CACHE=0`) | 1764µs | 2268µs | 3401µs | 556 | 0% |
-| Fix A (pipeline cache) | 1195µs | 1814µs (−20%) | 2059µs | 818 | 100% |
-| Fix A + Fix B (`INFINIGPU_SCRATCH_CACHE=1`) | 729µs | **928µs (−59%)** | 1591µs | 1330 (+139%) | 100% |
+| Config | p50 | p99 | submit/s | cache hit |
+|--------|----:|----:|---------:|----------:|
+| baseline (`INFINIGPU_PIPELINE_CACHE=0`) | 1764µs | 2268µs | 556 | 0% |
+| Fix A (pipeline cache) | 1195µs | 1814µs | 818 | 100% |
+| Fix A + cached readback | 784µs | 1226µs | 1211 | 100% |
+| **Fix A + Fix B + cached readback** | **119µs** | **185µs (−92%)** | **7396 (13×)** | 100% |
 
 **4 concurrent VkDevices on one GPU = the multi-VM tail** (1500 iters each), fleet **worst** p99:
 
 | Config | worst-VM p99 | % of a 60 Hz frame |
 |--------|-------------:|-------------------:|
-| baseline | 5968µs | 35.8% |
-| Fix A | 5079µs | 30.5% |
-| **Fix A + Fix B** | **1525µs** | **9.1% (−74%)** |
+| baseline (cache off) | 3931µs | 23.6% |
+| Fix A + cached readback | 3396µs | 20.4% |
+| **Fix A + Fix B + cached readback** | **660µs** | **4.0% (−83%)** |
 
-Key finding, confirmed: under multi-VM contention the per-submit **allocation** churn (finding #2) is the
-dominant cost — Fix A alone (compile cache) barely moves the fleet worst-p99 because the N processes still
-contend on the driver allocator, but Fix B (allocation-free hot path) collapses it. Deploy **both**. Render
-output is validated identical to the reference (`render_forwarded_matches_builtin`) with both caches on.
+Key findings, confirmed by a per-phase breakdown (`INFINIGPU_BREAKDOWN=1`):
+1. Under multi-VM contention the per-submit **allocation** churn (finding #2) dominates — Fix A alone barely
+   moves the fleet worst-p99 (the N processes still contend on the driver allocator); Fix B (allocation-free
+   hot path) collapses it. Deploy **both**.
+2. The frame **readback copy** was ~72% of a small single-VM frame (221µs for 256 KB) because the readback
+   buffer was HOST_COHERENT → write-combined/**uncached** on NVIDIA. Switching it to **HOST_CACHED** (+
+   invalidate) cut the copy to ~32µs (−86%) and roughly halves the multi-VM tail again.
+3. After those, the remaining single-VM cost is `submit + fence-wait` (~78µs GPU round-trip) — the next lever
+   is async submit (Fix F), a larger change.
+
+Render output validated identical to the reference (`render_forwarded_matches_builtin`) with all of the above.
 
 ## Fix A (done)
 

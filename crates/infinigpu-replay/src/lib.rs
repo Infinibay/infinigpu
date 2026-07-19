@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::{c_char, CStr};
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 
 mod shaders;
 
@@ -164,6 +166,8 @@ pub struct HostGpu {
     /// `INFINIGPU_SCRATCH_CACHE` (default off); only takes effect together with the pipeline cache.
     scratch_enabled: bool,
     scratch_cache: Mutex<HashMap<(u32, u32), SizedScratch>>,
+    /// Opt-in per-phase timing of the cached render path (env `INFINIGPU_BREAKDOWN`); `None` in prod.
+    breakdown: Option<Breakdown>,
 }
 
 /// RAII cleanup for the per-render Vulkan objects of [`HostGpu::render_triangle_inner`]. Every
@@ -460,6 +464,9 @@ struct SizedScratch {
     readback: vk::Buffer,
     rb_mem: vk::DeviceMemory,
     rb_ptr: usize,
+    /// Whether `rb_mem` is HOST_COHERENT; if not it is HOST_CACHED and must be invalidated before
+    /// each CPU read so the GPU's writes are visible.
+    rb_coherent: bool,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
@@ -480,6 +487,19 @@ impl SizedScratch {
         dev.destroy_image(self.image, None);
         dev.free_memory(self.img_mem, None);
     }
+}
+
+/// Per-phase latency accumulator for the cached render path (env `INFINIGPU_BREAKDOWN`). Splits the
+/// remaining hot-path cost after Fix A/B — setup (locks + cache lookups), command recording, the
+/// GPU submit+fence-wait (the CPU stall on the GPU), and the readback copy — so the next
+/// micro-optimization targets the real bottleneck instead of a guess. Logged every 1000 submits.
+#[derive(Default)]
+struct Breakdown {
+    setup_ns: AtomicU64,
+    record_ns: AtomicU64,
+    gpu_ns: AtomicU64,
+    copy_ns: AtomicU64,
+    count: AtomicU64,
 }
 
 impl HostGpu {
@@ -614,6 +634,7 @@ impl HostGpu {
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false),
             scratch_cache: Mutex::new(HashMap::new()),
+            breakdown: std::env::var_os("INFINIGPU_BREAKDOWN").map(|_| Breakdown::default()),
         })
     }
 
@@ -876,6 +897,23 @@ impl HostGpu {
                         .contains(flags)
             })
             .ok_or_else(|| "no compatible memory type".into())
+    }
+
+    /// Pick a host-visible memory type for CPU readback, preferring **HOST_CACHED** — cached reads
+    /// are ~10× faster than the default write-combined/uncached host-visible mapping, and the
+    /// readback copy is the dominant remaining hot-path cost (breakdown: ~72% of a small frame).
+    /// Prefers co-available HOST_COHERENT (no manual invalidate). Returns (type_index, coherent).
+    fn find_readback_mem(&self, type_bits: u32) -> R<(u32, bool)> {
+        use vk::MemoryPropertyFlags as F;
+        if let Ok(i) = self.find_mem(type_bits, F::HOST_VISIBLE | F::HOST_CACHED | F::HOST_COHERENT)
+        {
+            return Ok((i, true));
+        }
+        if let Ok(i) = self.find_mem(type_bits, F::HOST_VISIBLE | F::HOST_CACHED) {
+            return Ok((i, false)); // cached but not coherent → invalidate before reading
+        }
+        let i = self.find_mem(type_bits, F::HOST_VISIBLE | F::HOST_COHERENT)?;
+        Ok((i, true))
     }
 
     /// Render a headless frame: allocate a device-local color image, run a graphics
@@ -1528,6 +1566,8 @@ impl HostGpu {
     ) -> R<Frame> {
         const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
         let dev = &self.device;
+        let bd = self.breakdown.as_ref();
+        let t0 = bd.map(|_| Instant::now());
         let mut throwaway = RenderScratch::new(dev);
         let (render_pass, pipeline) = self.pipeline_for(&mut throwaway, draw, FORMAT)?;
 
@@ -1542,6 +1582,7 @@ impl HostGpu {
             cache.insert((width, height), ss);
         }
         let ss = cache.get(&(width, height)).expect("just inserted above");
+        let t_setup = bd.map(|_| Instant::now());
 
         // Single submit thread per device process + fence-wait before return ⇒ no frame N+1 vs. N
         // hazard on the reused objects; reset the pool + fence and re-record for this frame.
@@ -1605,17 +1646,50 @@ impl HostGpu {
                 &[region],
             );
             dev.end_command_buffer(ss.cmd)?;
+        }
+        let t_record = bd.map(|_| Instant::now());
+        unsafe {
             dev.reset_fences(&[ss.fence])?;
             let cmds = [ss.cmd];
             let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
             dev.queue_submit(self.queue, &submit, ss.fence)?;
             dev.wait_for_fences(&[ss.fence], true, u64::MAX)?;
         }
-        // Read straight from the persistent host-coherent mapping (also removes the per-frame
-        // map/unmap the default path pays — a Fix-D-adjacent win).
+        let t_gpu = bd.map(|_| Instant::now());
+        // HOST_CACHED readback: invalidate so the GPU's writes are visible before the (cached, fast)
+        // read — reading write-combined/uncached memory was ~72% of the hot path. Coherent memory
+        // needs no invalidate. Reads straight from the persistent mapping (no per-frame map/unmap).
+        if !ss.rb_coherent {
+            unsafe {
+                dev.invalidate_mapped_memory_ranges(&[vk::MappedMemoryRange::default()
+                    .memory(ss.rb_mem)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE)])?;
+            }
+        }
         let rgba = unsafe {
             std::slice::from_raw_parts(ss.rb_ptr as *const u8, ss.size as usize).to_vec()
         };
+        if let Some(bd) = bd {
+            let t_copy = Instant::now();
+            let d = |a: Option<Instant>, b: Option<Instant>| {
+                a.zip(b).map(|(x, y)| (y - x).as_nanos() as u64).unwrap_or(0)
+            };
+            bd.setup_ns.fetch_add(d(t0, t_setup), Ordering::Relaxed);
+            bd.record_ns.fetch_add(d(t_setup, t_record), Ordering::Relaxed);
+            bd.gpu_ns.fetch_add(d(t_record, t_gpu), Ordering::Relaxed);
+            bd.copy_ns.fetch_add(d(t_gpu, Some(t_copy)), Ordering::Relaxed);
+            let n = bd.count.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(1000) {
+                eprintln!(
+                    "breakdown (avg/{n}): setup={}ns record={}ns gpu(submit+wait)={}ns copy={}ns",
+                    bd.setup_ns.load(Ordering::Relaxed) / n,
+                    bd.record_ns.load(Ordering::Relaxed) / n,
+                    bd.gpu_ns.load(Ordering::Relaxed) / n,
+                    bd.copy_ns.load(Ordering::Relaxed) / n,
+                );
+            }
+        }
         Ok(Frame { width, height, rgba })
     }
 
@@ -1697,14 +1771,12 @@ impl HostGpu {
         };
         sc.readback = readback;
         let rb_req = unsafe { dev.get_buffer_memory_requirements(readback) };
+        let (rb_type, rb_coherent) = self.find_readback_mem(rb_req.memory_type_bits)?;
         let rb_mem = unsafe {
             dev.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(rb_req.size)
-                    .memory_type_index(self.find_mem(
-                        rb_req.memory_type_bits,
-                        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    )?),
+                    .memory_type_index(rb_type),
                 None,
             )?
         };
@@ -1741,6 +1813,7 @@ impl HostGpu {
             readback,
             rb_mem,
             rb_ptr,
+            rb_coherent,
             pool,
             cmd,
             fence,
@@ -1859,14 +1932,12 @@ impl HostGpu {
         };
         sc.readback = readback;
         let rb_req = unsafe { dev.get_buffer_memory_requirements(readback) };
+        let (rb_type, rb_coherent) = self.find_readback_mem(rb_req.memory_type_bits)?;
         let rb_mem = unsafe {
             dev.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(rb_req.size)
-                    .memory_type_index(self.find_mem(
-                        rb_req.memory_type_bits,
-                        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    )?),
+                    .memory_type_index(rb_type),
                 None,
             )?
         };
@@ -2018,9 +2089,16 @@ impl HostGpu {
             dev.wait_for_fences(&[fence], true, u64::MAX)?;
         }
 
-        // ---- read back the host-visible copy ----
+        // ---- read back (HOST_CACHED: invalidate so the GPU's writes are visible before the
+        // cached, fast read; coherent memory needs none — reading uncached memory dominated) ----
         let rgba = unsafe {
             let ptr = dev.map_memory(rb_mem, 0, size, vk::MemoryMapFlags::empty())? as *const u8;
+            if !rb_coherent {
+                dev.invalidate_mapped_memory_ranges(&[vk::MappedMemoryRange::default()
+                    .memory(rb_mem)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE)])?;
+            }
             let out = std::slice::from_raw_parts(ptr, size as usize).to_vec();
             dev.unmap_memory(rb_mem);
             out
