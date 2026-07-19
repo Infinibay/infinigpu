@@ -172,6 +172,13 @@ pub struct BrokerConfig {
     /// **fail-closed `NoEncoderSession` denial** instead of a silent black stream (the failure
     /// mode PR8 exists to surface). Set host-wide via env `INFINIGPU_MAX_ENC_SESSIONS`.
     pub max_enc_sessions: Option<u32>,
+    /// Whether the token-bucket throttle is active. The bucket enforces *cross-tenant* fair-share,
+    /// so it only makes sense when a single broker arbitrates several VMs (`serve_with_broker`).
+    /// In the shipped topology each VM gets its **own** device process + broker, so throttling that
+    /// lone VM protects no one — it just caps it (~20% GPU duty at the default refill) and sleeps on
+    /// the doorbell-drain thread, parking the vCPU. The per-process device config disables it (see
+    /// `infinigpu-device::broker_config_from_nvml`); `serve_with_broker` and the tests keep it on.
+    pub throttle_enabled: bool,
 }
 
 impl Default for BrokerConfig {
@@ -189,6 +196,9 @@ impl Default for BrokerConfig {
             // Unlimited by default (matches drivers ≥550, which removed the consumer NVENC
             // session cap). A host on an older driver/SKU sets this to surface the limit.
             max_enc_sessions: None,
+            // On by default so a shared broker (`serve_with_broker`) and the fair-share tests keep
+            // enforcing cross-tenant share; the per-process device path turns it off.
+            throttle_enabled: true,
         }
     }
 }
@@ -545,7 +555,9 @@ impl GpuBroker {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let vm = st.vms.get_mut(vm_id).ok_or(NotAdmitted)?;
         vm.refill(now, &self.cfg);
-        if vm.tokens_us > 0 {
+        // Throttle disabled (per-process single-tenant broker) ⇒ never back-pressure the lone VM;
+        // tokens keep advancing for telemetry, but a VM with no co-tenant is never made to wait.
+        if !self.cfg.throttle_enabled || vm.tokens_us > 0 {
             Ok(Begin::Ready)
         } else {
             // Wait until the bucket climbs back to a 1 ms quantum.
@@ -874,6 +886,35 @@ mod tests {
         assert!(
             (2.9..=3.1).contains(&ratio),
             "weighted fair-share ratio {ratio} (heavy={bh} light={bl}) should be ≈3"
+        );
+    }
+
+    #[test]
+    fn throttle_disabled_never_blocks_a_lone_vm() {
+        // Per-process single-tenant broker: even a VM that far outspends its refill must never be
+        // throttled (no co-tenant to protect). With the bucket on, this refill would block it hard.
+        let clock = Arc::new(ManualClock::default());
+        let cfg = BrokerConfig {
+            bucket_burst_us: 1_000,
+            refill_us_per_s_per_weight: 1_000, // tiny — a real render empties the bucket immediately
+            min_refill_us_per_s: 0,
+            throttle_enabled: false,
+            ..Default::default()
+        };
+        let b = broker_with(clock.clone(), cfg);
+        let t = b.admit(VmConfig::new("solo", 1, 4_000), 1_000).unwrap();
+        // Each run debits 100 ms of GPU-time — 100× the whole per-second refill — yet none blocks.
+        for _ in 0..50 {
+            clock.advance_us(1_000); // wall barely moves; the bucket stays deeply negative
+            let (r, st) = t.run_timed(|| 7).unwrap();
+            assert_eq!(r, 7);
+            assert_eq!(st.wait_us, 0, "a throttle-disabled lone VM must never wait");
+            b.record(t.vm_id(), 100_000); // simulate a 100 ms GPU render debit
+        }
+        assert_eq!(
+            b.fleet_view().vms[0].throttle_events,
+            0,
+            "no throttle events when the bucket is disabled"
         );
     }
 

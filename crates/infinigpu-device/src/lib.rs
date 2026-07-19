@@ -577,6 +577,13 @@ impl Default for InfinigpuBackend {
 /// once the replay runs as a separate process.
 pub fn broker_config_from_nvml() -> BrokerConfig {
     let mut cfg = BrokerConfig::default();
+    // This broker is per-process and arbitrates exactly ONE VM (the shipped topology spawns one
+    // device process per GPU VM). The token bucket enforces cross-tenant fair-share, so throttling
+    // a lone VM protects no one — at the default refill it caps that VM to ~20% GPU duty and injects
+    // multi-ms sleeps onto the vfio-user doorbell-drain thread (parking the guest vCPU), amplifying
+    // exactly the tail we care about. Disable it here; a real shared broker (serve_with_broker /
+    // broker_demo) keeps its own throttle on to arbitrate several VMs.
+    cfg.throttle_enabled = false;
     // PR8: a host on an older driver/SKU whose NVENC block caps concurrent sessions sets this so
     // an over-cap streaming VM is denied-with-reason instead of getting a silent black stream.
     // Unset (default `None`) = unlimited, matching drivers ≥550.
@@ -1349,42 +1356,61 @@ impl InfinigpuBackend {
             } else {
                 None
             };
+            // Try zero-copy first; on failure DON'T drop the frame — latch zero-copy off and fall
+            // through to the one-copy present so the guest keeps getting correct frames. (`fwd` is
+            // re-viewed per closure so nothing is consumed before the fallback.)
+            let mut zc_result: Option<(u64, u64, u64, bool)> = None;
             if let Some(ptr) = zc_ptr {
                 let ptr_addr = ptr as usize; // pass as usize to keep the closure Send-clean
-                match self.ticket.as_ref().unwrap().run_timed(move || {
+                let gpu_zc = Arc::clone(&self.shared_gpu);
+                match self.ticket.as_ref().unwrap().run_timed(|| {
                     // SAFETY: ptr is a page-aligned guest-RAM region valid for the frame; the device
                     // drops all imports on any DMA remap, so it can't dangle mid-submit.
                     unsafe {
-                        gpu.render_forwarded_zerocopy(w, h, bg, &fwd.as_draw(), ptr_addr as *mut u8)
+                        gpu_zc.render_forwarded_zerocopy(w, h, bg, &fwd.as_draw(), ptr_addr as *mut u8)
                     }
                 }) {
-                    // The writeback is folded into the GPU phase (DMA during execution) — no dma hop.
-                    Ok((ok, st)) => (st.wait_us, st.gpu_us, 0, ok),
+                    // Success: the writeback is folded into the GPU phase (DMA during execution).
+                    Ok((true, st)) => zc_result = Some((st.wait_us, st.gpu_us, 0, true)),
+                    // Import/render failed: disable zero-copy for this VM and fall back this frame.
+                    Ok((false, _)) => {
+                        log::warn!(
+                            "vulkan submit ctx={ctx}: zero-copy scanout failed — disabling it and \
+                             falling back to the one-copy present path"
+                        );
+                        self.zerocopy_scanout = false;
+                    }
                     Err(_) => {
                         self.ring_retired[ctx] = sc.seqno;
                         return;
                     }
                 }
-            } else {
-                // One-copy present: dma-write straight from the GPU readback mapping into the guest
-                // scanout (no intermediate Frame Vec — finding #5). The present closure runs inside
-                // the timed region, so subtract it back out below.
-                let dma = &self.dma;
-                match self.ticket.as_ref().unwrap().run_timed(move || {
-                    gpu.render_forwarded_present(w, h, bg, &fwd.as_draw(), |px| {
-                        scanout_addr == 0 || dma.write(scanout_addr, px)
-                    })
-                }) {
-                    Ok((Some(ps), st)) => (
-                        st.wait_us,
-                        st.gpu_us.saturating_sub(ps.present_us),
-                        ps.present_us,
-                        ps.presented,
-                    ),
-                    _ => {
-                        // GPU-open/render failure (already logged) — retire so the ring never wedges.
-                        self.ring_retired[ctx] = sc.seqno;
-                        return;
+            }
+            match zc_result {
+                Some(t) => t,
+                None => {
+                    // One-copy present (the default, and the zero-copy fallback): dma-write straight
+                    // from the GPU readback mapping into the guest scanout (no intermediate Frame Vec
+                    // — finding #5). The present closure runs inside the timed region, so subtract it
+                    // back out below.
+                    let gpu_p = Arc::clone(&self.shared_gpu);
+                    let dma = &self.dma;
+                    match self.ticket.as_ref().unwrap().run_timed(|| {
+                        gpu_p.render_forwarded_present(w, h, bg, &fwd.as_draw(), |px| {
+                            scanout_addr == 0 || dma.write(scanout_addr, px)
+                        })
+                    }) {
+                        Ok((Some(ps), st)) => (
+                            st.wait_us,
+                            st.gpu_us.saturating_sub(ps.present_us),
+                            ps.present_us,
+                            ps.presented,
+                        ),
+                        _ => {
+                            // GPU-open/render failure (already logged) — retire so the ring never wedges.
+                            self.ring_retired[ctx] = sc.seqno;
+                            return;
+                        }
                     }
                 }
             }
