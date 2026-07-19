@@ -192,6 +192,24 @@ throttle that no `bench_forwarded` run could see (the bench drives `HostGpu` dir
 3D-accel **completeness** (vertex/index buffers, descriptors/UBO/textures, multi-draw, depth, formats) is a
 separate feature track — see [`3D-COMPLETENESS-ROADMAP.md`](./3D-COMPLETENESS-ROADMAP.md).
 
+### Creative micro-opts (both opt-in, both measured)
+
+Two ideas beyond the standard fixes, attacking metrics *adjacent* to the steady-state tail (which is now
+architecture-bound: shared broker + async submit):
+
+- **Idle-frame elision** (`INFINIGPU_ELIDE_UNCHANGED`) — skip the whole submit for a byte-identical repeat frame
+  (own-remoting forwards the complete input, so identical payload ⇒ the buffer already holds the pixels). Under
+  mixed multi-VM load, eliding idle VMs' redundant frames frees the shared GPU and lowers the *active* VMs' tail.
+  Hash cost ~0.5–3µs for typical payloads vs a ~1.3ms submit; keyed per scanout_addr (double-buffer safe),
+  fail-safe, invalidated on any other scanout write. End-to-end win is workload-dependent (idle-heavy = high).
+- **Shared on-disk `VkPipelineCache`** (`INFINIGPU_PIPELINE_CACHE_FILE`) — one blob shared across VM processes,
+  warm-starting pipeline creation from other VMs / prior boots (the N× redundant-compile cost). Measured on the
+  A5000 (first-render latency, single pipeline): **~6.3× faster (10ms → 1.6ms) even with the NVIDIA driver disk
+  cache on** — the driver cache warms the shader *compile*, this warms the *pipeline-object* creation the driver
+  cache doesn't cover (they're complementary); ~8.5× (22ms → 2.7ms) with the driver cache off. A real app
+  (hundreds of DXVK pipelines) compounds this into the boot-storm cost. Always correct; helps cold-start /
+  first-frame, not the steady-state tail.
+
 ## Fix A (done)
 
 `HostGpu` owns a real `VkPipelineCache` + a SPIR-V-hash-keyed memo (`GpuObjCache`) of shader modules, render
@@ -228,6 +246,7 @@ state and the cache hit rate to approach 100%.
 | `INFINIGPU_FENCE_SPIN_US=<n>` (default **0**) | — | Spin-poll the fence up to `n` µs before blocking; skips the sleep/wakeup for fast frames. 50–100µs on well-provisioned hosts; leave 0 if VMs > CPU cores |
 | `INFINIGPU_ZEROCOPY_SCANOUT=1` (default off) | D | GPU DMAs the frame straight into the imported guest scanout (`VK_EXT_external_memory_host`) — no CPU copy. Needs the scratch cache + a page-aligned mapped scanout; falls back to one-copy present otherwise. Core-validated on A5000; needs full-stack validation |
 | `INFINIGPU_ELIDE_UNCHANGED=1` (default off) | — | Skip the whole GPU submit + DMA when a forwarded frame is byte-identical to the last one rendered into the same scanout buffer (own-remoting forwards the complete input, so identical payload ⇒ identical pixels already in the buffer). Frees the shared GPU for busy VMs under mixed multi-VM load. Keyed per scanout_addr (double-buffer safe); invalidated on any non-forwarded scanout write / DMA remap / reset. Fail-safe (a hash collision repaints a stale frame, never UB) |
+| `INFINIGPU_PIPELINE_CACHE_FILE=<path>` (default unset) | — | Load/merge a **shared on-disk `VkPipelineCache`** across all VM device processes: warm-start pipeline creation from other VMs (and prior boots), cutting first-frame/boot-storm latency (the N× redundant-compile cross-VM cost). Always correct (the driver ignores a mismatched blob); merged+saved atomically on drop so concurrent writers never lose entries. The device server should point this at a shared host path |
 
 Land each remaining fix (B KMD/ICD, D-full, F) **only** once its own before/after p99 justifies it (golden
 rule). The gated fixes above are implemented but need A5000 render-validation + a measured win before their

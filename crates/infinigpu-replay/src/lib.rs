@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::{c_char, c_void, CStr};
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -162,6 +163,11 @@ pub struct HostGpu {
     /// Fix A: persistent driver pipeline cache passed to `create_graphics_pipelines` (vs. a null
     /// handle) so warm compiles are reused; `null` when caching is disabled.
     pipeline_cache: vk::PipelineCache,
+    /// Optional on-disk pipeline-cache blob shared across VM device processes (env
+    /// `INFINIGPU_PIPELINE_CACHE_FILE`). Loaded at `open()` to warm-start compiles from other VMs
+    /// (attacks the N× redundant-compile cross-VM cost / boot-storm stutter) and merged+saved on
+    /// drop. `None` disables the feature (the cache is then process-local, as before).
+    pipeline_cache_file: Option<PathBuf>,
     /// Fix A: memoize shader modules + pipelines across submits (env `INFINIGPU_PIPELINE_CACHE`,
     /// default on). Off restores the per-submit compile path for a before/after measurement.
     cache_enabled: bool,
@@ -662,10 +668,26 @@ impl HostGpu {
         let cache_enabled = std::env::var("INFINIGPU_PIPELINE_CACHE")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
+        // Optional shared on-disk cache blob: warm-start compiles from other VMs (and this VM's
+        // previous boots). The driver validates the blob header and silently ignores a mismatched
+        // one, so loading another process's/driver's blob is always safe.
+        let pipeline_cache_file = std::env::var_os("INFINIGPU_PIPELINE_CACHE_FILE").map(PathBuf::from);
         let pipeline_cache = if cache_enabled {
+            let blob = pipeline_cache_file
+                .as_ref()
+                .and_then(|p| std::fs::read(p).ok())
+                .unwrap_or_default();
+            let mut ci = vk::PipelineCacheCreateInfo::default();
+            if !blob.is_empty() {
+                ci = ci.initial_data(&blob);
+                eprintln!(
+                    "infinigpu-replay: warm-started pipeline cache from {} bytes",
+                    blob.len()
+                );
+            }
             unsafe {
                 device
-                    .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+                    .create_pipeline_cache(&ci, None)
                     .unwrap_or(vk::PipelineCache::null())
             }
         } else {
@@ -686,6 +708,7 @@ impl HostGpu {
             external_fd,
             dma_buf_supported: want_dma_buf,
             pipeline_cache,
+            pipeline_cache_file,
             cache_enabled,
             obj_cache: Mutex::new(GpuObjCache::default()),
             // Fix B (host): default ON (measured −92% single-VM p99, −83% multi-VM worst-p99; render
@@ -717,6 +740,45 @@ impl HostGpu {
         // align ≤ 4096 so the import can never reference a page past what the device validated
         // (NVIDIA reports exactly 4096; a hypothetical larger alignment falls back to the copy path).
         self.ext_mem_host.is_some() && self.host_ptr_align != 0 && self.host_ptr_align <= 4096
+    }
+
+    /// Merge this process's compiled pipelines into the shared on-disk cache blob (env
+    /// `INFINIGPU_PIPELINE_CACHE_FILE`) and write it back atomically, so a concurrent VM's entries
+    /// are never lost and the next VM warm-starts from the union. No-op if the feature is off or the
+    /// cache is empty. Called on drop (off the hot path).
+    fn save_pipeline_cache(&self) {
+        let Some(path) = self.pipeline_cache_file.as_ref() else {
+            return;
+        };
+        if self.pipeline_cache == vk::PipelineCache::null() {
+            return;
+        }
+        let dev = &self.device;
+        unsafe {
+            // Seed a temp cache from whatever's on disk now, merge ours in (so we never shrink the
+            // shared blob under concurrent writers), and dump the union.
+            let disk = std::fs::read(path).unwrap_or_default();
+            let mut ci = vk::PipelineCacheCreateInfo::default();
+            if !disk.is_empty() {
+                ci = ci.initial_data(&disk);
+            }
+            let Ok(merged) = dev.create_pipeline_cache(&ci, None) else {
+                return;
+            };
+            let _ = dev.merge_pipeline_caches(merged, &[self.pipeline_cache]);
+            let data = dev.get_pipeline_cache_data(merged).unwrap_or_default();
+            dev.destroy_pipeline_cache(merged, None);
+            if data.is_empty() {
+                return;
+            }
+            // Atomic replace: write a per-pid temp then rename (POSIX rename is atomic, so a
+            // concurrent reader/writer never sees a torn blob; last writer wins, and each write is a
+            // superset of the disk blob so nothing is lost).
+            let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+            if std::fs::write(&tmp, &data).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
     }
 
     /// Wait for `fence`, spin-polling for up to `fence_spin_us` first (micro-opt: skips the
@@ -2482,6 +2544,9 @@ impl infinigpu_hal::GpuBackend for HostGpu {
 
 impl Drop for HostGpu {
     fn drop(&mut self) {
+        // Persist compiled pipelines to the shared on-disk cache (if enabled) while the device +
+        // cache are still alive.
+        self.save_pipeline_cache();
         unsafe {
             let _ = self.device.device_wait_idle();
             // Fix D: free the imported guest-scanout buffers/memory before the device (freeing the
