@@ -2799,6 +2799,76 @@ mod tests {
         eprintln!("render_forwarded: lit={lit}/{total}, matches builtin");
     }
 
+    // Stronger than the byte-identity check: prove the forwarded SPIR-V actually EXECUTED correctly
+    // (right colours, right interpolation) across resolutions, and that the render is deterministic
+    // (which the frame-elision opt depends on). The built-in triangle's three vertex colours are
+    // (1,.15,.15)/(.15,1,.15)/(.15,.15,1) — each sums to 1.3 — so any barycentric blend of them sums
+    // to 1.3 too: EVERY lit pixel must have R+G+B ≈ 1.3·255 = 331. A flat/solid/wrong shader or broken
+    // interpolation breaks this invariant; a real gradient also shows each vertex colour near a corner.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn render_forwarded_colors_are_correct_and_deterministic() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let draw = ForwardedDraw::builtin_triangle();
+        let bg = [0.02f32, 0.02, 0.05, 1.0];
+        let bg8 = [
+            (bg[0] * 255.0).round() as u8,
+            (bg[1] * 255.0).round() as u8,
+            (bg[2] * 255.0).round() as u8,
+        ];
+        for &(w, h) in &[(16u32, 16u32), (64, 64), (256, 256), (640, 480), (1920, 1080), (200, 137)] {
+            let f = gpu.render_forwarded(w, h, bg, &draw).expect("render");
+            assert_eq!((f.width, f.height), (w, h));
+            let (mut lit, mut bad_sum) = (0usize, 0usize);
+            let (mut max_r, mut max_g, mut max_b) = (0u8, 0u8, 0u8);
+            for px in f.rgba.chunks_exact(4) {
+                let (r, g, b) = (px[0], px[1], px[2]);
+                // Background (allow a 1-LSB driver dither) → not a triangle pixel.
+                if (r as i32 - bg8[0] as i32).abs() <= 1
+                    && (g as i32 - bg8[1] as i32).abs() <= 1
+                    && (b as i32 - bg8[2] as i32).abs() <= 1
+                {
+                    continue;
+                }
+                lit += 1;
+                let sum = r as u32 + g as u32 + b as u32;
+                if !(300..=360).contains(&sum) {
+                    bad_sum += 1; // not a valid blend of the three vertex colours
+                }
+                max_r = max_r.max(r);
+                max_g = max_g.max(g);
+                max_b = max_b.max(b);
+            }
+            let total = (w * h) as usize;
+            assert!(
+                lit > total / 50 && lit < total,
+                "not a triangle at {w}x{h}: lit={lit}/{total}"
+            );
+            assert_eq!(
+                bad_sum, 0,
+                "at {w}x{h}: {bad_sum} lit pixels aren't a valid vertex-colour blend (R+G+B≉331) — \
+                 the fragment shader/interpolation is wrong"
+            );
+            // A real gradient reaches each vertex colour near its corner (a flat centroid fill would
+            // top out at ~110 per channel); this proves interpolation spans all three, not a constant.
+            assert!(
+                max_r > 170 && max_g > 170 && max_b > 170,
+                "at {w}x{h}: interpolation missing a vertex colour (max r={max_r} g={max_g} b={max_b})"
+            );
+            // Determinism (the frame-elision opt relies on identical input → identical output), through
+            // the default cached path.
+            let f2 = gpu.render_forwarded(w, h, bg, &draw).expect("render2");
+            assert_eq!(f.rgba, f2.rgba, "non-deterministic render at {w}x{h}");
+        }
+        eprintln!("render_forwarded_colors_are_correct_and_deterministic: OK across 6 resolutions");
+    }
+
     // Regression guard for the Phase-1b adversarial-review finding: a forwarded draw that fails a
     // driver call (here an entry-point name matching no OpEntryPoint → create_graphics_pipelines
     // errors) must return Err cleanly and free its Vulkan objects via RenderScratch's Drop — NOT

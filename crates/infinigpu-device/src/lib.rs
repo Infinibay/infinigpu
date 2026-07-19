@@ -2975,4 +2975,102 @@ mod tests {
 
         unsafe { libc::munmap(ram as *mut libc::c_void, size) };
     }
+
+    /// End-to-end validation of colour correctness + the frame-elision opt over the full device path:
+    /// a FORWARDED submit must render CORRECT triangle colours into the guest scanout (every lit pixel
+    /// a valid vertex-colour blend, R+G+B≈331 — not just "some pixels lit"); an identical resubmit is
+    /// elided (GPU skipped) yet the buffer still holds the correct frame; and after the elision cache
+    /// is invalidated (as a foreign 2D write would), the identical frame RE-RENDERS. Proves the
+    /// own-remoting datapath and `INFINIGPU_ELIDE_UNCHANGED` are correct on real silicon.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_e2e_colors_correct_and_elides() {
+        use std::os::unix::io::FromRawFd;
+
+        const GUEST_BASE: u64 = 0xC000_0000;
+        const SCAN_OFF: usize = 0x1000;
+        let (w, h): (u32, u32) = (64, 64);
+        let fb_bytes = (w * h * 4) as usize;
+        let size = SCAN_OFF + fb_bytes + 0x1000;
+
+        let fd = unsafe { libc::memfd_create(c"vkelide".as_ptr(), 0) };
+        assert!(fd >= 0);
+        assert_eq!(unsafe { libc::ftruncate(fd, size as libc::off_t) }, 0);
+        let ram = unsafe {
+            libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
+        } as *mut u8;
+        assert_ne!(ram as *mut libc::c_void, libc::MAP_FAILED);
+
+        let scanout_addr = GUEST_BASE + SCAN_OFF as u64;
+        let bg = [0.02f32, 0.02, 0.05, 1.0];
+        let bg8 = [
+            (bg[0] * 255.0).round() as u8,
+            (bg[1] * 255.0).round() as u8,
+            (bg[2] * 255.0).round() as u8,
+        ];
+        let draw = ForwardedDraw::builtin_triangle();
+        let payload = encode_forwarded(w, h, bg, scanout_addr, &draw);
+        let mk = |seqno: u64| infinigpu_abi::wire::SubmitCmd {
+            ctx_id: 0,
+            encoding: infinigpu_abi::wire::encoding::VULKAN_VENUSLIKE,
+            payload_len: payload.len() as u32,
+            flags: 0,
+            seqno,
+            in_fence: 0,
+            out_fence: seqno,
+        };
+
+        let mut b = InfinigpuBackend::new();
+        b.elide_unchanged = true; // exercise the elision path end-to-end
+        let file = unsafe { <std::fs::File as FromRawFd>::from_raw_fd(fd) };
+        b.dma.map(GUEST_BASE, 0, size as u64, file).unwrap();
+        if b.shared_gpu.device_name().is_none() {
+            eprintln!("skipping: no GPU");
+            unsafe { libc::munmap(ram as *mut libc::c_void, size) };
+            return;
+        }
+
+        // Every non-background scanout pixel must be a valid barycentric blend of the three vertex
+        // colours (each sums to 1.3 ⇒ R+G+B ≈ 331); a wrong shader/DMA breaks this.
+        let check = |label: &str| -> usize {
+            let px = unsafe { std::slice::from_raw_parts(ram.add(SCAN_OFF), fb_bytes) };
+            let (mut lit, mut bad) = (0usize, 0usize);
+            for p in px.chunks_exact(4) {
+                if [p[0], p[1], p[2]] == bg8 {
+                    continue;
+                }
+                lit += 1;
+                let s = p[0] as u32 + p[1] as u32 + p[2] as u32;
+                if !(300..=360).contains(&s) {
+                    bad += 1;
+                }
+            }
+            assert_eq!(bad, 0, "{label}: {bad} scanout pixels aren't a valid vertex-colour blend");
+            assert!(lit > 0 && lit < fb_bytes / 4, "{label}: expected a triangle (lit={lit})");
+            lit
+        };
+
+        // 1) Forwarded render → correct colours DMA'd into the guest scanout.
+        b.submit_vulkan(&mk(5), &payload, 0);
+        assert_eq!(b.ring_retired[0], 5, "forwarded fence retired");
+        assert_eq!(b.frames_elided, 0, "the first frame renders (nothing to elide yet)");
+        let lit1 = check("first render");
+
+        // 2) Identical payload → elided (GPU skipped); the buffer is untouched and still correct.
+        b.submit_vulkan(&mk(6), &payload, 0);
+        assert_eq!(b.ring_retired[0], 6, "an elided frame still retires the fence");
+        assert_eq!(b.frames_elided, 1, "an identical frame is elided");
+        assert_eq!(check("after elision"), lit1, "buffer still correct after elision");
+
+        // 3) Invalidating the cache (as a foreign 2D scanout write would) forces a RE-RENDER of the
+        //    identical frame — we must never elide onto a buffer we can't vouch for.
+        b.invalidate_elision();
+        b.submit_vulkan(&mk(7), &payload, 0);
+        assert_eq!(b.frames_elided, 1, "after invalidation the identical frame is not elided");
+        assert_eq!(b.ring_retired[0], 7);
+        assert_eq!(check("re-render after invalidation"), lit1);
+
+        unsafe { libc::munmap(ram as *mut libc::c_void, size) };
+        eprintln!("forwarded_e2e_colors_correct_and_elides: OK (lit={lit1}, elided 1, invalidation re-renders)");
+    }
 }
