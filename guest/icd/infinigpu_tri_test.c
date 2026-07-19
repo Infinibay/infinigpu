@@ -64,12 +64,16 @@ main(void)
    uint32_t pd_count = 0;
    CHECK(vkEnumeratePhysicalDevices(instance, &pd_count, NULL));
    if (pd_count == 0) {
-      fprintf(stderr, "FAIL: no Vulkan physical device (is renderD128 the infinigpu node?)\n");
+      fprintf(stderr, "FAIL: no Vulkan physical device (is the infinigpu module loaded, /dev/dri/card0 present?)\n");
       return 1;
    }
    VkPhysicalDevice *pds = calloc(pd_count, sizeof(*pds));
    CHECK(vkEnumeratePhysicalDevices(instance, &pd_count, pds));
-   VkPhysicalDevice phys = pds[0];
+   /* REQUIRE the infinigpu device — never fall back to pds[0]. A fallback would happily
+    * render on lavapipe/llvmpipe (CPU) and report PASS, hiding the very failure this test
+    * exists to catch (the ICD not enumerating the GPU render node). Honest validation
+    * fails loudly when infinigpu is absent. */
+   VkPhysicalDevice phys = VK_NULL_HANDLE;
    for (uint32_t i = 0; i < pd_count; i++) {
       VkPhysicalDeviceProperties props;
       vkGetPhysicalDeviceProperties(pds[i], &props);
@@ -79,6 +83,12 @@ main(void)
       }
    }
    free(pds);
+   if (phys == VK_NULL_HANDLE) {
+      fprintf(stderr, "FAIL: no 'infinigpu' Vulkan device enumerated — the infinigpu ICD is not "
+                      "driving the GPU (module loaded? /dev/dri/card0 is infinigpu? ICD installed?). "
+                      "Refusing to fall back to a software renderer.\n");
+      return 1;
+   }
 
    VkPhysicalDeviceProperties props;
    vkGetPhysicalDeviceProperties(phys, &props);
@@ -322,7 +332,8 @@ main(void)
    CHECK(vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, &ptr));
 
    const uint8_t bg[3] = { 26, 26, 31 }; /* ~ the clear colour in 8-bit */
-   uint32_t lit = 0;
+   uint32_t lit = 0;    /* differs from the clear colour → triangle (or garbage) */
+   uint32_t bgpx = 0;   /* matches the clear colour → the host really cleared the target */
    FILE *ppm = fopen("infinigpu_tri.ppm", "wb");
    if (ppm)
       fprintf(ppm, "P6\n%d %d\n255\n", W, H);
@@ -332,6 +343,8 @@ main(void)
          const uint8_t *px = row + x * 4; /* R8G8B8A8 */
          if (abs(px[0] - bg[0]) > 12 || abs(px[1] - bg[1]) > 12 || abs(px[2] - bg[2]) > 12)
             lit++;
+         else
+            bgpx++;
          if (ppm)
             fwrite(px, 1, 3, ppm);
       }
@@ -341,6 +354,7 @@ main(void)
    vkUnmapMemory(dev, mem);
 
    printf("lit (non-background) pixels: %u / %u\n", lit, W * H);
+   printf("background (clear-colour) pixels: %u / %u\n", bgpx, W * H);
    if (ppm)
       printf("wrote infinigpu_tri.ppm\n");
 
@@ -358,6 +372,17 @@ main(void)
 
    if (lit < 100) {
       fprintf(stderr, "FAIL: too few lit pixels (%u) — the forwarded triangle did not render\n", lit);
+      return 1;
+   }
+   /* A correct render is a triangle OVER the cleared background: both colours must be present.
+    * An all-uniform buffer passes the lit>=100 test dishonestly — e.g. an untouched (zeroed) BO
+    * reads as all-black, which "differs from the clear colour" for every pixel (65536/65536 lit)
+    * yet nothing was rendered. Require a real slab of the actual clear colour too: that only
+    * exists if the host GPU truly executed loadOp=CLEAR and DMA-wrote the result back. */
+   if (bgpx < (W * H) / 8) {
+      fprintf(stderr, "FAIL: no cleared-background region (%u clear-colour px) — the target was "
+                      "not rendered by the GPU (likely an untouched/zeroed buffer reading as "
+                      "uniform, not a real triangle-over-background)\n", bgpx);
       return 1;
    }
    printf("PASS\n");
