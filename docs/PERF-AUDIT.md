@@ -32,10 +32,11 @@ Consequences:
 | — | *(bug)* broker per-process → admission/fair-share/ledger inert | `serve` / `InfinigpuDeviceServer` | shared host-broker | ⏳ owner decision |
 | 7 | Doorbell is a synchronous trapped write → inline replay on the socket thread; vCPU parked the whole submit; ioeventfd rejected; guest retires via `udelay` busy-wait, no MSI-X | `Device::bar0_write_u32`/`submit_vulkan`; `infinigpu.c` | **F** (ioeventfd + IRQ) | ⏳ gated on measurement |
 | 8 | NUMA not enforced: device server, memfd, CPU-pinning are GPU-node-oblivious | `InfinigpuDeviceServer.ts`, `QemuCommandBuilder.ts`, `CpuPinningAdapter.ts` | **E** | ⏳ gated on measurement |
-| 2 | Per-frame Vulkan alloc churn (`RenderScratch` built+dropped each render) | `render_triangle_inner` | **B** (host) | ⏳ gated on measurement |
-| 3 | `dma_alloc_coherent(total_len, GFP_KERNEL)` per submit (fragmentation) | `igpu_ioctl_submit_forwarded` (`guest/linux/infinigpu.c`) | **B** (KMD pool) | ⏳ gated |
-| 4 | ICD re-serializes full SPIR-V + malloc/free per submit | `guest/icd/infinigpu_sync.c`, `infinigpu_forwarded.c` | **B** (ICD payload cache) | ⏳ gated |
-| 5 | Two CPU copies of the frame (`map`+`to_vec`, then `dma.write`); dma-buf export unused | `render_triangle_inner`; `submit_vulkan` | **D** (import guest memfd) | ⏳ gated |
+| 2 | Per-frame Vulkan alloc churn (`RenderScratch` built+dropped each render) | `render_triangle_inner` | **B** (host) | ✅ done (`INFINIGPU_SCRATCH_CACHE`, off) |
+| 8 | NUMA (memfd bind + prealloc, device-server membind) | `QemuCommandBuilder.ts`, `InfinigpuDeviceServer.ts` | **E** | ✅ done (`INFINIGPU_NUMA_NODE`, off) |
+| 3 | `dma_alloc_coherent(total_len, GFP_KERNEL)` per submit (fragmentation) | `igpu_ioctl_submit_forwarded` (`guest/linux/infinigpu.c`) | **B** (KMD pool) | 📐 designed — needs a guest build/test env (KMD DMA/concurrency) |
+| 4 | ICD re-serializes full SPIR-V + malloc/free per submit | `guest/icd/infinigpu_sync.c`, `infinigpu_forwarded.c` | **B** (ICD payload cache) | 📐 designed — guest build/test env |
+| 5 | Two CPU copies of the frame (`map`+`to_vec`, then `dma.write`); dma-buf export unused | `render_triangle_inner`; `submit_vulkan` | **D** | ½ done (Fix B host removes the per-frame re-map); full zero-copy (import guest memfd) is larger |
 | 6 | run_lock over the whole compile+render, inline on the trap thread | `GpuBroker::run` (`infinigpu-sched:590`) | **C** | latent (per-process lock) |
 | 9 | Token-bucket `thread::sleep` up to 50ms on the inline thread (before the lock) | `GpuBroker::run` (`infinigpu-sched:583`) | yield/async | latent |
 
@@ -74,5 +75,16 @@ INFINIGPU_PROFILE=1 INFINIGPU_PIPELINE_CACHE=1   # Fix A
 ```
 
 Compare the `render` and `total` **p99** (and its % of frame). Expect `render` p99 to collapse in steady
-state and the cache hit rate to approach 100%. Only once these numbers exist should Fix B/D/E/F land (golden
-rule: no perf refactor without p99 before/after).
+state and the cache hit rate to approach 100%.
+
+### All perf flags (each independent; default off unless noted; A/B on one binary)
+
+| Flag | Fix | Effect |
+|------|-----|--------|
+| `INFINIGPU_PIPELINE_CACHE` (default **on**) | A | Cache pipelines/shaders across submits; `=0` restores per-submit compile |
+| `INFINIGPU_SCRATCH_CACHE=1` | B (host) | Reuse per-(w,h) image/memory/framebuffer/readback (persistent map); needs pipeline cache on |
+| `INFINIGPU_NUMA_NODE=<n>` (infinization) | E | Bind guest RAM + device-server CPU/mem to the GPU's NUMA node + prealloc |
+
+Land each remaining fix (B KMD/ICD, D-full, F) **only** once its own before/after p99 justifies it (golden
+rule). The gated fixes above are implemented but need A5000 render-validation + a measured win before their
+flags become the default.
