@@ -171,7 +171,8 @@ pub struct HostGpu {
     obj_cache: Mutex<GpuObjCache>,
     /// Fix B (host): reuse the per-frame alloc-heavy objects (image/memory/view/framebuffer/
     /// readback+persistent map/pool/fence) across submits, keyed by (w,h). Env
-    /// `INFINIGPU_SCRATCH_CACHE` (default off); only takes effect together with the pipeline cache.
+    /// `INFINIGPU_SCRATCH_CACHE` (default **on**; `=0` restores the per-frame-alloc path); only
+    /// takes effect together with the pipeline cache.
     scratch_enabled: bool,
     scratch_cache: Mutex<HashMap<(u32, u32), SizedScratch>>,
     /// Opt-in per-phase timing of the cached render path (env `INFINIGPU_BREAKDOWN`); `None` in prod.
@@ -687,12 +688,14 @@ impl HostGpu {
             pipeline_cache,
             cache_enabled,
             obj_cache: Mutex::new(GpuObjCache::default()),
-            // Fix B (host): opt-in, and only meaningful with the pipeline cache (which owns the
-            // render pass the cached framebuffers bind to).
+            // Fix B (host): default ON (measured −92% single-VM p99, −83% multi-VM worst-p99; render
+            // validated identical). `INFINIGPU_SCRATCH_CACHE=0` restores the per-frame-alloc path for
+            // an A/B. Only meaningful with the pipeline cache (which owns the render pass the cached
+            // framebuffers bind to), so it stays gated behind `cache_enabled`.
             scratch_enabled: cache_enabled
                 && std::env::var("INFINIGPU_SCRATCH_CACHE")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false),
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true),
             scratch_cache: Mutex::new(HashMap::new()),
             breakdown: std::env::var_os("INFINIGPU_BREAKDOWN").map(|_| Breakdown::default()),
             fence_spin_us: std::env::var("INFINIGPU_FENCE_SPIN_US")
@@ -709,7 +712,11 @@ impl HostGpu {
     /// (i.e. `VK_EXT_external_memory_host` is available). The device server checks this before
     /// attempting the zero-copy path and falls back to the one-copy present otherwise.
     pub fn supports_zerocopy_scanout(&self) -> bool {
-        self.ext_mem_host.is_some() && self.host_ptr_align != 0
+        // The device bounds-checks the scanout region rounded to a 4 KiB DMA page before handing us
+        // the pointer, and import_guest_buffer rounds the allocation to `host_ptr_align`. Require
+        // align ≤ 4096 so the import can never reference a page past what the device validated
+        // (NVIDIA reports exactly 4096; a hypothetical larger alignment falls back to the copy path).
+        self.ext_mem_host.is_some() && self.host_ptr_align != 0 && self.host_ptr_align <= 4096
     }
 
     /// Wait for `fence`, spin-polling for up to `fence_spin_us` first (micro-opt: skips the
