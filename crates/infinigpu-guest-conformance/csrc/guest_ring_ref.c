@@ -63,7 +63,7 @@ uint64_t igpu_gref_push(uint8_t *idx_base, uint8_t *desc_base, uint32_t cap,
 	slot->len = len;
 	slot->data_offset = data_offset;
 	slot->seqno = seqno;
-	slot->_reserved = 0;
+	slot->payload_addr = 0;
 
 	idx->seqno_submit = seqno;
 	idx->tail = tail + 1u; /* .ko: smp_store_release(&idx->tail, tail + 1) */

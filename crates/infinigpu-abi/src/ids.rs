@@ -36,8 +36,12 @@ pub const ABI_MAJOR: u16 = 0;
 /// 3D payload (`VulkanWorkload`, `vk_op` — the `VULKAN_VENUSLIKE` submit body the host replays on the
 /// real GPU via ash, no Mesa venus dependency). v6 added the Phase-1 own-ICD forwarded-draw
 /// (`vk_op::FORWARDED` + `ForwardedDrawTail` + trailing SPIR-V — the guest ICD serializes a real
-/// app's shaders + draw and the host compiles/replays the forwarded SPIR-V).
-pub const ABI_MINOR: u16 = 6;
+/// app's shaders + draw and the host compiles/replays the forwarded SPIR-V). v7 added the out-of-line
+/// payload transport (`desc_flags::PAYLOAD_ABS` + `Descriptor::payload_addr` — a large SUBMIT_CMD
+/// body, e.g. a forwarded draw's KBs of SPIR-V, DMA-read from an absolute guest address instead of
+/// the fixed per-slot ring payload region; the guest ICD's `driver_submit` needs it to carry real
+/// shaders that never fit inline).
+pub const ABI_MINOR: u16 = 7;
 
 /// Packed `ABI_VERSION` register value (`major << 16 | minor`).
 pub const fn abi_version() -> u32 {

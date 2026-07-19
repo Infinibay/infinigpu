@@ -130,7 +130,7 @@ fn pr4_ring_drains_and_presents_over_vfio_user() {
                 len: len as u32,
                 data_offset: (off - DESC_OFF) as u32,
                 seqno: (i + 1) as u64,
-                _reserved: 0,
+                payload_addr: 0,
             })
             .unwrap();
         }

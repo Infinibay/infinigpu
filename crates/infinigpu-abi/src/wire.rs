@@ -128,6 +128,14 @@ pub mod desc_flags {
     /// Payload bytes live inline right after the descriptor (small messages),
     /// rather than in the ring's data region at `data_offset`.
     pub const INLINE: u32 = 1 << 1;
+    /// Payload lives **out-of-line** at an absolute guest-physical address carried in
+    /// [`Descriptor::payload_addr`] (the field otherwise `_reserved`), not at
+    /// `ring_base + data_offset`. Used for large SUBMIT_CMD bodies that don't fit the
+    /// per-slot ring payload region — e.g. a `vk_op::FORWARDED` draw carrying the guest
+    /// app's vertex/fragment SPIR-V (KBs). The host DMA-reads `len` bytes from that address
+    /// exactly as it already does for `VulkanWorkload::scanout_addr`, so no new host DMA
+    /// capability is required. `len` is still bounded to 64 MiB.
+    pub const PAYLOAD_ABS: u32 = 1 << 2;
 }
 
 /// Per-context index words, shared directly between guest and host via the
@@ -169,7 +177,10 @@ pub struct Descriptor {
     pub data_offset: u32,
     /// Submission seqno for this descriptor.
     pub seqno: u64,
-    pub _reserved: u64,
+    /// Absolute guest-physical address of the payload when [`desc_flags::PAYLOAD_ABS`]
+    /// is set (otherwise 0 / reserved). Lets a large out-of-line body live outside the
+    /// ring's fixed per-slot payload region.
+    pub payload_addr: u64,
 }
 
 /// TLV message header (`{type, length}`) for skip-unknown forward-compat. Precedes

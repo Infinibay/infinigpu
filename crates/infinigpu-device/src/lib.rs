@@ -983,11 +983,13 @@ impl InfinigpuBackend {
     }
 
     /// Phase 2 of the drain: execute one descriptor. DMA-reads its payload (at
-    /// `ring_base + data_offset`, bounded to 64 MiB) and dispatches the `RESOURCE_*` op into the
+    /// `ring_base + data_offset`, or an absolute guest address when [`desc_flags::PAYLOAD_ABS`]
+    /// is set — see below; both bounded to 64 MiB) and dispatches the `RESOURCE_*` op into the
     /// per-VM [`resource::ResourceTable`] (`dispatch::execute_resource`); a validated `RESOURCE_FLUSH`
     /// routes to the resource-backed present. Every malformed/rejected input is logged + dropped.
     fn execute_descriptor(&mut self, ctx: usize, desc: &infinigpu_abi::wire::Descriptor) {
         use crate::dispatch::{execute_resource, Executed};
+        use infinigpu_abi::wire::desc_flags;
 
         const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
         let len = desc.len as usize;
@@ -995,7 +997,16 @@ impl InfinigpuBackend {
             log::error!("drain ctx={ctx}: descriptor payload {len} exceeds cap — dropped");
             return;
         }
-        let payload_addr = self.ring_base[ctx] + desc.data_offset as u64;
+        // Out-of-line payload: a large SUBMIT_CMD body (e.g. a forwarded draw carrying the guest
+        // app's SPIR-V) that doesn't fit the ring's per-slot payload region lives at an absolute
+        // guest-physical address the guest wrote into `payload_addr`. The host DMA-reads it exactly
+        // as it reads any other guest buffer (a scanout target, the ring itself) — same capability,
+        // just a different source address. Inline payloads keep the ring-relative offset.
+        let payload_addr = if desc.flags & desc_flags::PAYLOAD_ABS != 0 {
+            desc.payload_addr
+        } else {
+            self.ring_base[ctx] + desc.data_offset as u64
+        };
         let mut payload = vec![0u8; len];
         if len > 0 && !self.dma.read(payload_addr, &mut payload) {
             log::error!("drain ctx={ctx}: payload {payload_addr:#x} ({len} B) not mapped");
@@ -2198,7 +2209,7 @@ mod tests {
                     len,
                     data_offset: off,
                     seqno: (i + 1) as u64,
-                    _reserved: 0,
+                    payload_addr: 0,
                 })
                 .unwrap();
             }
@@ -2300,7 +2311,7 @@ mod tests {
                 len: (sc_len + wl_len) as u32,
                 data_offset: (PAY_OFF - DESC_OFF) as u32,
                 seqno: 1,
-                _reserved: 0,
+                payload_addr: 0,
             })
             .unwrap();
         }
@@ -2309,6 +2320,90 @@ mod tests {
 
         assert_eq!(b.vulkan_submits, 1, "3D submit reached submit_vulkan via the ring drainer");
         assert_eq!(b.ring_retired[CTX], 1, "the 3D fence retired");
+
+        unsafe { libc::munmap(ram as *mut libc::c_void, SIZE) };
+    }
+
+    /// Out-of-line payload (`desc_flags::PAYLOAD_ABS`): a SUBMIT_CMD whose body lives at an absolute
+    /// guest address — the transport a forwarded draw uses to carry SPIR-V too large for the ring's
+    /// per-slot payload region — must be DMA-read from `payload_addr`, **not** `ring_base +
+    /// data_offset`. The descriptor here carries a deliberately-bogus `data_offset`: if the host
+    /// wrongly honored it, it would decode garbage and drop the submit (count 0). Reaching
+    /// `submit_vulkan` (count 1) proves the absolute-address path. Off-hardware (CLEAR, no writeback).
+    #[test]
+    fn out_of_line_payload_is_read_from_absolute_address() {
+        use infinigpu_abi::wire::{desc_flags, encoding, vk_op, Descriptor, SubmitCmd, VulkanWorkload};
+        use zerocopy::IntoBytes;
+
+        const GUEST_BASE: u64 = 0x9000_0000;
+        const SIZE: usize = 0x2000;
+        const IDX_OFF: usize = 0x0;
+        const DESC_OFF: usize = 0x40;
+        // The payload sits well past the ring's own region — an address the ring-relative math
+        // (ring_base + data_offset, with data_offset u32) would only reach with a bogus offset.
+        const PAY_OFF: usize = 0x1000;
+        const CAP: usize = 4;
+        const CTX: usize = 0;
+
+        let fd = unsafe { libc::memfd_create(c"vkabs".as_ptr(), 0) };
+        assert!(fd >= 0);
+        assert_eq!(unsafe { libc::ftruncate(fd, SIZE as libc::off_t) }, 0);
+        let ram = unsafe {
+            libc::mmap(std::ptr::null_mut(), SIZE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
+        } as *mut u8;
+        assert_ne!(ram as *mut libc::c_void, libc::MAP_FAILED);
+
+        let wl = VulkanWorkload {
+            op: vk_op::CLEAR,
+            width: 16,
+            height: 16,
+            _pad: 0,
+            bg: [0.0; 4],
+            scanout_addr: 0,
+        };
+        let sc = SubmitCmd {
+            ctx_id: 0,
+            encoding: encoding::VULKAN_VENUSLIKE,
+            payload_len: core::mem::size_of::<VulkanWorkload>() as u32,
+            flags: 0,
+            seqno: 1,
+            in_fence: 0,
+            out_fence: 1,
+        };
+        let sc_len = sc.as_bytes().len();
+        let wl_len = wl.as_bytes().len();
+        unsafe {
+            std::ptr::copy_nonoverlapping(sc.as_bytes().as_ptr(), ram.add(PAY_OFF), sc_len);
+            std::ptr::copy_nonoverlapping(wl.as_bytes().as_ptr(), ram.add(PAY_OFF + sc_len), wl_len);
+        };
+
+        let mut b = InfinigpuBackend::new();
+        let file = unsafe { <std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(fd) };
+        b.dma.map(GUEST_BASE, 0, SIZE as u64, file).unwrap();
+        b.ring_base[CTX] = GUEST_BASE + DESC_OFF as u64;
+        b.ring_cap[CTX] = CAP as u32;
+        b.ring_index[CTX] = GUEST_BASE + IDX_OFF as u64;
+
+        {
+            let ring = unsafe {
+                drain::ring_over_shared(ram.add(IDX_OFF), ram.add(DESC_OFF), CAP)
+            }
+            .unwrap();
+            ring.push(Descriptor {
+                msg_type: infinigpu_abi::wire::msg_type::SUBMIT_CMD,
+                flags: desc_flags::PAYLOAD_ABS,
+                len: (sc_len + wl_len) as u32,
+                data_offset: 0xDEAD_BEEF, // bogus on purpose: PAYLOAD_ABS must make the host ignore it
+                seqno: 1,
+                payload_addr: GUEST_BASE + PAY_OFF as u64,
+            })
+            .unwrap();
+        }
+
+        b.process_ring(CTX);
+
+        assert_eq!(b.vulkan_submits, 1, "out-of-line submit read from payload_addr, not data_offset");
+        assert_eq!(b.ring_retired[CTX], 1, "the out-of-line submit's fence retired");
 
         unsafe { libc::munmap(ram as *mut libc::c_void, SIZE) };
     }

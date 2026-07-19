@@ -33,7 +33,12 @@ struct Descriptor {
    * Submission seqno for this descriptor.
    */
   uint64_t seqno;
-  uint64_t _reserved;
+  /**
+   * Absolute guest-physical address of the payload when [`desc_flags::PAYLOAD_ABS`]
+   * is set (otherwise 0 / reserved). Lets a large out-of-line body live outside the
+   * ring's fixed per-slot payload region.
+   */
+  uint64_t payload_addr;
 };
 
 /**

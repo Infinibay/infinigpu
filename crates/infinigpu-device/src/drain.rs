@@ -127,7 +127,7 @@ mod tests {
             len: 0,
             data_offset: 0,
             seqno: 0,
-            _reserved: 0,
+            payload_addr: 0,
         }
     }
 
@@ -145,7 +145,7 @@ mod tests {
     }
 
     fn desc(msg_type: u32, seqno: u64) -> Descriptor {
-        Descriptor { msg_type, flags: 0, len: 0, data_offset: 0, seqno, _reserved: 0 }
+        Descriptor { msg_type, flags: 0, len: 0, data_offset: 0, seqno, payload_addr: 0 }
     }
 
     #[test]

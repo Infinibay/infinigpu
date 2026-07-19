@@ -69,7 +69,7 @@ fn main() {
         len: size_of::<ClearPresent>() as u32,
         data_offset: payload_off,
         seqno: 1,
-        _reserved: 0,
+        payload_addr: 0,
     };
     let submit = SubmitCmd {
         ctx_id: 0,

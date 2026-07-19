@@ -128,7 +128,7 @@ mod tests {
     use zerocopy::IntoBytes;
 
     fn desc(msg_type: u32) -> Descriptor {
-        Descriptor { msg_type, flags: 0, len: 0, data_offset: 0, seqno: 1, _reserved: 0 }
+        Descriptor { msg_type, flags: 0, len: 0, data_offset: 0, seqno: 1, payload_addr: 0 }
     }
 
     fn create_blob_payload(res_id: u32, size: u64) -> Vec<u8> {
