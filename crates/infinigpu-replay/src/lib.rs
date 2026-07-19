@@ -159,6 +159,11 @@ pub struct HostGpu {
     /// frame, memoized and reused. Guarded by a `Mutex` (near-uncontended: one submit thread per
     /// device process) so `HostGpu` stays `Sync`.
     obj_cache: Mutex<GpuObjCache>,
+    /// Fix B (host): reuse the per-frame alloc-heavy objects (image/memory/view/framebuffer/
+    /// readback+persistent map/pool/fence) across submits, keyed by (w,h). Env
+    /// `INFINIGPU_SCRATCH_CACHE` (default off); only takes effect together with the pipeline cache.
+    scratch_enabled: bool,
+    scratch_cache: Mutex<HashMap<(u32, u32), SizedScratch>>,
 }
 
 /// RAII cleanup for the per-render Vulkan objects of [`HostGpu::render_triangle_inner`]. Every
@@ -207,6 +212,26 @@ impl<'a> RenderScratch<'a> {
             export_buffer: vk::Buffer::null(),
             export_mem: vk::DeviceMemory::null(),
         }
+    }
+
+    /// Null every handle so `Drop` frees nothing — used after ownership of the built objects has
+    /// been transferred elsewhere (Fix B `build_sized_scratch`).
+    fn disarm(&mut self) {
+        self.fence = vk::Fence::null();
+        self.pool = vk::CommandPool::null();
+        self.pipeline = vk::Pipeline::null();
+        self.layout = vk::PipelineLayout::null();
+        self.vs_module = vk::ShaderModule::null();
+        self.fs_module = vk::ShaderModule::null();
+        self.framebuffer = vk::Framebuffer::null();
+        self.render_pass = vk::RenderPass::null();
+        self.view = vk::ImageView::null();
+        self.image = vk::Image::null();
+        self.img_mem = vk::DeviceMemory::null();
+        self.readback = vk::Buffer::null();
+        self.rb_mem = vk::DeviceMemory::null();
+        self.export_buffer = vk::Buffer::null();
+        self.export_mem = vk::DeviceMemory::null();
     }
 }
 
@@ -419,6 +444,44 @@ impl GpuObjCache {
     }
 }
 
+/// Fix B cache bound — a handful of resolutions in normal use; evict-all past this.
+const MAX_CACHED_SCRATCH: usize = 8;
+
+/// Per-(w,h) reusable per-frame objects for the 3D readback path (Fix B). The alloc-heavy pieces —
+/// the color image + its device memory, the readback buffer + its host-visible memory (mapped once,
+/// `rb_ptr`), the framebuffer, command pool, and fence — persist across submits; only the command
+/// buffer is re-recorded each frame. `rb_ptr` is a `usize` so the struct stays `Send+Sync` (HostGpu
+/// is shared); the pointee lives as long as `rb_mem`. The render pass is owned by the pipeline cache.
+struct SizedScratch {
+    image: vk::Image,
+    img_mem: vk::DeviceMemory,
+    view: vk::ImageView,
+    framebuffer: vk::Framebuffer,
+    readback: vk::Buffer,
+    rb_mem: vk::DeviceMemory,
+    rb_ptr: usize,
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    size: u64,
+}
+
+impl SizedScratch {
+    /// # Safety
+    /// `dev` must be the owning device and no submit using these objects may still be in flight.
+    unsafe fn destroy(self, dev: &ash::Device) {
+        dev.unmap_memory(self.rb_mem);
+        dev.destroy_fence(self.fence, None);
+        dev.destroy_command_pool(self.pool, None); // frees self.cmd too
+        dev.destroy_buffer(self.readback, None);
+        dev.free_memory(self.rb_mem, None);
+        dev.destroy_framebuffer(self.framebuffer, None);
+        dev.destroy_image_view(self.view, None);
+        dev.destroy_image(self.image, None);
+        dev.free_memory(self.img_mem, None);
+    }
+}
+
 impl HostGpu {
     pub fn device_name(&self) -> &str {
         &self.device_name
@@ -544,6 +607,13 @@ impl HostGpu {
             pipeline_cache,
             cache_enabled,
             obj_cache: Mutex::new(GpuObjCache::default()),
+            // Fix B (host): opt-in, and only meaningful with the pipeline cache (which owns the
+            // render pass the cached framebuffers bind to).
+            scratch_enabled: cache_enabled
+                && std::env::var("INFINIGPU_SCRATCH_CACHE")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
+            scratch_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1436,8 +1506,246 @@ impl HostGpu {
         bg: [f32; 4],
         draw: &ForwardedDraw,
     ) -> R<Frame> {
+        // Fix B (opt-in): reuse per-(w,h) alloc-heavy objects across submits. Isolated path — the
+        // default below is untouched, so with the flag off behavior is exactly as before.
+        if self.scratch_enabled {
+            return self.render_forwarded_cached(width, height, bg, draw);
+        }
         let (frame, _) = self.render_triangle_inner(width, height, bg, draw, false)?;
         Ok(frame)
+    }
+
+    /// Fix B: allocation-free forwarded render — reuses the persistent [`SizedScratch`] for
+    /// `(width,height)` (built once, then only the command buffer is re-recorded). Requires the
+    /// pipeline cache (guaranteed: `scratch_enabled` implies `cache_enabled`), so `pipeline_for`
+    /// takes the cached path and never registers into the throwaway guard.
+    fn render_forwarded_cached(
+        &self,
+        width: u32,
+        height: u32,
+        bg: [f32; 4],
+        draw: &ForwardedDraw,
+    ) -> R<Frame> {
+        const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+        let dev = &self.device;
+        let mut throwaway = RenderScratch::new(dev);
+        let (render_pass, pipeline) = self.pipeline_for(&mut throwaway, draw, FORMAT)?;
+
+        let mut cache = self.scratch_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if !cache.contains_key(&(width, height)) {
+            if cache.len() >= MAX_CACHED_SCRATCH {
+                for (_, ss) in cache.drain() {
+                    unsafe { ss.destroy(dev) };
+                }
+            }
+            let ss = self.build_sized_scratch(width, height, render_pass)?;
+            cache.insert((width, height), ss);
+        }
+        let ss = cache.get(&(width, height)).expect("just inserted above");
+
+        // Single submit thread per device process + fence-wait before return ⇒ no frame N+1 vs. N
+        // hazard on the reused objects; reset the pool + fence and re-record for this frame.
+        unsafe {
+            dev.reset_command_pool(ss.pool, vk::CommandPoolResetFlags::empty())?;
+            dev.begin_command_buffer(
+                ss.cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            let clears = [vk::ClearValue { color: vk::ClearColorValue { float32: bg } }];
+            dev.cmd_begin_render_pass(
+                ss.cmd,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(render_pass)
+                    .framebuffer(ss.framebuffer)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D { width, height },
+                    })
+                    .clear_values(&clears),
+                vk::SubpassContents::INLINE,
+            );
+            dev.cmd_bind_pipeline(ss.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            dev.cmd_set_viewport(
+                ss.cmd,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f32,
+                    height: height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            dev.cmd_set_scissor(
+                ss.cmd,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D { width, height },
+                }],
+            );
+            dev.cmd_draw(ss.cmd, draw.vertex_count, 1, 0, 0);
+            dev.cmd_end_render_pass(ss.cmd);
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+            dev.cmd_copy_image_to_buffer(
+                ss.cmd,
+                ss.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                ss.readback,
+                &[region],
+            );
+            dev.end_command_buffer(ss.cmd)?;
+            dev.reset_fences(&[ss.fence])?;
+            let cmds = [ss.cmd];
+            let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+            dev.queue_submit(self.queue, &submit, ss.fence)?;
+            dev.wait_for_fences(&[ss.fence], true, u64::MAX)?;
+        }
+        // Read straight from the persistent host-coherent mapping (also removes the per-frame
+        // map/unmap the default path pays — a Fix-D-adjacent win).
+        let rgba = unsafe {
+            std::slice::from_raw_parts(ss.rb_ptr as *const u8, ss.size as usize).to_vec()
+        };
+        Ok(Frame { width, height, rgba })
+    }
+
+    /// Fix B: build the persistent per-frame objects for `(width,height)`, sharing `render_pass`
+    /// from the pipeline cache. Builds into a RAII guard (so any early `?` frees the partial work),
+    /// then disarms it and moves ownership into the returned [`SizedScratch`].
+    fn build_sized_scratch(
+        &self,
+        width: u32,
+        height: u32,
+        render_pass: vk::RenderPass,
+    ) -> R<SizedScratch> {
+        const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+        let dev = &self.device;
+        let size = width as u64 * height as u64 * 4;
+        let mut sc = RenderScratch::new(dev);
+
+        let image = unsafe {
+            dev.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(FORMAT)
+                    .extent(vk::Extent3D { width, height, depth: 1 })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )?
+        };
+        sc.image = image;
+        let img_req = unsafe { dev.get_image_memory_requirements(image) };
+        let img_mem = unsafe {
+            dev.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(img_req.size)
+                    .memory_type_index(
+                        self.find_mem(img_req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?,
+                    ),
+                None,
+            )?
+        };
+        sc.img_mem = img_mem;
+        unsafe { dev.bind_image_memory(image, img_mem, 0)? };
+        let view = unsafe {
+            dev.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(FORMAT)
+                    .subresource_range(color_range()),
+                None,
+            )?
+        };
+        sc.view = view;
+        let views = [view];
+        let framebuffer = unsafe {
+            dev.create_framebuffer(
+                &vk::FramebufferCreateInfo::default()
+                    .render_pass(render_pass)
+                    .attachments(&views)
+                    .width(width)
+                    .height(height)
+                    .layers(1),
+                None,
+            )?
+        };
+        sc.framebuffer = framebuffer;
+        let readback = unsafe {
+            dev.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )?
+        };
+        sc.readback = readback;
+        let rb_req = unsafe { dev.get_buffer_memory_requirements(readback) };
+        let rb_mem = unsafe {
+            dev.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(rb_req.size)
+                    .memory_type_index(self.find_mem(
+                        rb_req.memory_type_bits,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )?),
+                None,
+            )?
+        };
+        sc.rb_mem = rb_mem;
+        unsafe { dev.bind_buffer_memory(readback, rb_mem, 0)? };
+        let pool = unsafe {
+            dev.create_command_pool(
+                &vk::CommandPoolCreateInfo::default().queue_family_index(self.queue_family),
+                None,
+            )?
+        };
+        sc.pool = pool;
+        let cmd = unsafe {
+            dev.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0]
+        };
+        let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None)? };
+        sc.fence = fence;
+        // Persistent host-coherent mapping (kept until destroy). Stored as usize (Send+Sync).
+        let rb_ptr =
+            unsafe { dev.map_memory(rb_mem, 0, size, vk::MemoryMapFlags::empty())? } as usize;
+
+        // Success — transfer ownership out of the RAII guard so Drop won't free these objects.
+        sc.disarm();
+        Ok(SizedScratch {
+            image,
+            img_mem,
+            view,
+            framebuffer,
+            readback,
+            rb_mem,
+            rb_ptr,
+            pool,
+            cmd,
+            fence,
+            size,
+        })
     }
 
     /// Render the triangle (as [`render_triangle`](Self::render_triangle)) into a
