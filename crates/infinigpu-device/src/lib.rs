@@ -171,6 +171,13 @@ impl SharedGpu {
         }
         g.as_ref().map(|x| x.device_name().to_string())
     }
+
+    /// Phase-2 instrumentation passthrough: pipeline-cache `(hits, misses, cached)` if the GPU is
+    /// open. `None` before the first render (GPU not yet lazily opened).
+    pub fn cache_stats(&self) -> Option<(u64, u64, usize)> {
+        let g = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|x| x.cache_stats())
+    }
 }
 
 impl Default for SharedGpu {
@@ -1193,6 +1200,15 @@ impl InfinigpuBackend {
                 "3D: vm={} replaying Vulkan workload op={op} {w}x{h} on the GPU → scanout {:#x} ({} total)",
                 self.vm_config.vm_id, wl.scanout_addr, self.vulkan_submits
             );
+            // Phase-2: pipeline-cache hit rate (Fix A). ~100% in steady state = compiles reused.
+            if let Some((hits, misses, cached)) = self.shared_gpu.cache_stats() {
+                let total = hits + misses;
+                let rate = if total > 0 { hits as f64 / total as f64 * 100.0 } else { 0.0 };
+                info!(
+                    "3D: vm={} pipeline cache: {hits} hit / {misses} miss ({rate:.1}% hit), {cached} pipelines cached",
+                    self.vm_config.vm_id
+                );
+            }
         }
         // Pre-warm the shared GPU OUTSIDE the broker's timed region (the one-time Vulkan init is
         // never billed to this tenant), then replay the named workload under the fair-share run-lock.

@@ -392,6 +392,10 @@ struct GpuObjCache {
     shader_modules: HashMap<u64, vk::ShaderModule>,
     render_passes: HashMap<i32, vk::RenderPass>,
     pipelines: HashMap<PipelineKey, CachedPipeline>,
+    /// Cumulative pipeline-cache hit/miss counts (Phase-2 instrumentation): the hit rate quantifies
+    /// Fix A's effect — in steady state it should approach 100%.
+    hits: u64,
+    misses: u64,
 }
 
 impl GpuObjCache {
@@ -546,6 +550,13 @@ impl HostGpu {
     /// Whether this device can export rendered memory as an fd (dma-buf or opaque).
     pub fn can_export(&self) -> bool {
         self.external_fd.is_some()
+    }
+
+    /// Phase-2 instrumentation: cumulative pipeline-cache `(hits, misses, cached_pipeline_count)`.
+    /// Hit rate → ~100% in steady state is the direct signal that Fix A is working.
+    pub fn cache_stats(&self) -> (u64, u64, usize) {
+        let c = self.obj_cache.lock().unwrap_or_else(|e| e.into_inner());
+        (c.hits, c.misses, c.pipelines.len())
     }
 
     /// Fix A: build the color render pass (CLEAR → STORE, ending TRANSFER_SRC) for `format`, with
@@ -719,8 +730,9 @@ impl HostGpu {
                 rp
             }
         };
-        if let Some(&CachedPipeline { pipeline, .. }) = cache.pipelines.get(&key) {
-            return Ok((rp, pipeline));
+        if let Some(cp) = cache.pipelines.get(&key).copied() {
+            cache.hits += 1;
+            return Ok((rp, cp.pipeline));
         }
         // Resolve shader modules, tracking which we create fresh so a failed pipeline build (e.g. a
         // hostile bad entry point) caches nothing and frees exactly the modules we just made.
@@ -765,6 +777,7 @@ impl HostGpu {
                 if fs_new {
                     cache.shader_modules.insert(fs_hash, fs);
                 }
+                cache.misses += 1;
                 cache.pipelines.insert(key, CachedPipeline { pipeline: pipe, layout });
                 Ok((rp, pipe))
             }
