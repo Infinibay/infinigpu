@@ -31,6 +31,7 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/mutex.h>
+#include <linux/uaccess.h>   /* copy_from_user, u64_to_user_ptr (forwarded-submit ioctl) */
 
 #include <drm/drm_drv.h>
 #include <drm/drm_device.h>
@@ -117,8 +118,12 @@
 
 struct igpu_descriptor {
 	u32 msg_type, flags, len, data_offset;
-	u64 seqno, reserved;
+	u64 seqno, payload_addr;   /* payload_addr valid iff flags & IGPU_DESC_F_PAYLOAD_ABS */
 };
+/* descriptor flags (mirror infinigpu-abi wire::desc_flags) */
+#define IGPU_DESC_F_PAYLOAD_ABS (1u << 2)   /* payload is at the absolute GPA `payload_addr`, not
+					     * ring_base+data_offset — for bodies too large for the
+					     * fixed per-slot ring payload (e.g. forwarded SPIR-V) */
 struct igpu_submit_cmd {
 	u32 ctx_id, encoding, payload_len, flags;
 	u64 seqno, in_fence, out_fence;
@@ -267,7 +272,7 @@ static u32 igpu_ring_submit(struct igpu_device *idev, u32 encoding,
 	d->len = payload_len;
 	d->data_offset = sizeof(*d) + sizeof(*s);
 	d->seqno = seq;
-	d->reserved = 0;
+	d->payload_addr = 0;
 
 	s->ctx_id = 0;
 	s->encoding = encoding;
@@ -333,7 +338,7 @@ static u32 igpu_submit_cursor(struct igpu_device *idev, const struct igpu_cursor
 	d->len = sizeof(*cu);
 	d->data_offset = sizeof(*d);
 	d->seqno = seq;
-	d->reserved = 0;
+	d->payload_addr = 0;
 
 	memcpy(p, cu, sizeof(*cu));
 
@@ -382,10 +387,48 @@ static u32 igpu_ring2_push(struct igpu_device *idev, u32 msg_type,
 	d->len = payload_len;
 	d->data_offset = IGPU_RING2_CAP * sizeof(*d) + slot * IGPU_RING2_PSTRIDE;
 	d->seqno = seq;
-	d->reserved = 0;
+	d->payload_addr = 0;
 
 	idx->seqno_submit = seq;
 	smp_store_release(&idx->tail, tail + 1);    /* slot visible before tail */
+
+	iowrite32(1, idev->bar0 + REG_DOORBELL_CMD0);
+	return (u32)smp_load_acquire(&idx->seqno_retired);
+}
+
+/* Like igpu_ring2_push, but the payload lives OUT-OF-LINE at the absolute guest-physical address
+ * `payload_dma` (a coherent DMA buffer the caller owns) instead of the ring's fixed per-slot region.
+ * The host DMA-reads `payload_len` bytes from that address (flags & IGPU_DESC_F_PAYLOAD_ABS). This is
+ * how a body too large for IGPU_RING2_PSTRIDE — a forwarded draw carrying the app's SPIR-V — reaches
+ * the host. Caller holds ring_lock and must keep `payload_dma` alive until the submit retires.
+ * Returns the host-retired seqno, or leaves the ring unchanged (returns retired) if full. */
+static u32 igpu_ring2_push_abs(struct igpu_device *idev, u32 msg_type,
+			       dma_addr_t payload_dma, u32 payload_len)
+{
+	struct igpu_ring_indices *idx = idev->ring2_idx;
+	u8 *descs = idev->ring2;
+	u32 tail = idx->tail;
+	u32 head = smp_load_acquire(&idx->head);
+	struct igpu_descriptor *d;
+	u32 slot;
+	u64 seq;
+
+	if ((u32)(tail - head) >= IGPU_RING2_CAP)
+		return (u32)smp_load_acquire(&idx->seqno_retired);
+
+	slot = tail & (IGPU_RING2_CAP - 1);
+	d = (struct igpu_descriptor *)(descs + slot * sizeof(*d));
+	seq = (u64)tail + 1;
+
+	d->msg_type = msg_type;
+	d->flags = IGPU_DESC_F_PAYLOAD_ABS;
+	d->len = payload_len;
+	d->data_offset = 0;                 /* ignored under PAYLOAD_ABS */
+	d->seqno = seq;
+	d->payload_addr = (u64)payload_dma;
+
+	idx->seqno_submit = seq;
+	smp_store_release(&idx->tail, tail + 1);    /* descriptor visible before tail */
 
 	iowrite32(1, idev->bar0 + REG_DOORBELL_CMD0);
 	return (u32)smp_load_acquire(&idx->seqno_retired);
@@ -485,6 +528,124 @@ static int igpu_ioctl_submit3d(struct drm_device *dev, void *data, struct drm_fi
 	wl.scanout_addr = dma_obj->dma_addr;      /* host DMA-writes the render here */
 
 	ret = igpu_submit_3d(idev, &wl);
+	drm_gem_object_put(obj);
+	return ret;
+}
+
+/* Out-of-line SUBMIT_CMD{VULKAN_VENUSLIKE}: publish `staging_dma` (a coherent DMA buffer holding a
+ * submit_cmd header + forwarded body) on the command ring via PAYLOAD_ABS and wait for the host to
+ * retire it. Same push-detect-retire dance as igpu_submit_3d; the caller must keep the DMA buffer
+ * alive until this returns (the host DMA-reads it during the synchronous doorbell). */
+static int igpu_submit_forwarded(struct igpu_device *idev, dma_addr_t staging_dma, u32 total_len)
+{
+	u64 want = 0;
+	int i;
+
+	for (i = 0; i < 64; i++) {
+		u64 before, after;
+
+		mutex_lock(&idev->ring_lock);
+		before = idev->ring2_idx->seqno_submit;
+		igpu_ring2_push_abs(idev, MSG_SUBMIT_CMD, staging_dma, total_len);
+		after = idev->ring2_idx->seqno_submit;
+		mutex_unlock(&idev->ring_lock);
+
+		if (after != before) {
+			want = after;
+			break;
+		}
+		iowrite32(1, idev->bar0 + REG_DOORBELL_CMD0);   /* nudge the drain, then retry */
+		udelay(50);
+	}
+	if (!want)
+		return -EBUSY;
+
+	/* First submit host-wide pays a one-time GPU (Vulkan) init — allow ~2s; steady state is µs. */
+	for (i = 0; i < 20000; i++) {
+		if (smp_load_acquire(&idev->ring2_idx->seqno_retired) >= want)
+			return 0;
+		udelay(100);
+	}
+	return -ETIMEDOUT;
+}
+
+/* Largest forwarded body we stage in one physically-contiguous coherent buffer. Real vertex+fragment
+ * SPIR-V for a first app (triangle, vkcube, small DXVK shaders) is a few KB; 1 MiB is generous while
+ * bounding a hostile allocation. Larger shader sets are a scatter-gather follow-up. */
+#define IGPU_FWD_MAX_PAYLOAD (1u << 20)
+
+/* DRM_IOCTL_INFINIGPU_SUBMIT_FORWARDED: the thin Mesa ICD's submit entrypoint. The caller hands us a
+ * pre-serialized forwarded-draw body (VulkanWorkload + ForwardedDrawTail + the app's SPIR-V); we wrap
+ * it as a SUBMIT_CMD{VULKAN_VENUSLIKE}, patch the workload's geometry + scanout target to the named
+ * GEM buffer (so the host DMA-writes the render into a buffer we validated the size of), and replay
+ * it on the host GPU. The body is too large for the ring's inline slot, so it rides out-of-line. */
+static int igpu_ioctl_submit_forwarded(struct drm_device *dev, void *data, struct drm_file *file)
+{
+	struct igpu_device *idev = to_igpu(dev);
+	struct drm_infinigpu_submit_forwarded *args = data;
+	struct drm_gem_object *obj;
+	struct drm_gem_dma_object *dma_obj;
+	struct igpu_submit_cmd *sc;
+	struct igpu_vulkan_workload *wl;
+	dma_addr_t staging_dma;
+	void *staging;
+	u32 total_len;
+	u64 need;
+	int ret;
+
+	if (!idev->ring_drainer)
+		return -ENODEV;   /* 3D submit rides the real command ring (infinigpu.ring_drainer=1) */
+	if (args->width == 0 || args->height == 0 ||
+	    args->width > 16384 || args->height > 16384)
+		return -EINVAL;
+	/* The body must at least contain the VulkanWorkload we patch; cap it to bound the DMA alloc. */
+	if (args->payload_len < sizeof(struct igpu_vulkan_workload) ||
+	    args->payload_len > IGPU_FWD_MAX_PAYLOAD)
+		return -EINVAL;
+
+	need = (u64)args->width * args->height * 4;
+
+	obj = drm_gem_object_lookup(file, args->bo_handle);
+	if (!obj)
+		return -ENOENT;
+	if (obj->size < need) {
+		drm_gem_object_put(obj);
+		return -EINVAL;   /* result buffer too small for the requested geometry */
+	}
+	dma_obj = to_drm_gem_dma_obj(obj);
+
+	total_len = sizeof(struct igpu_submit_cmd) + args->payload_len;
+	staging = dma_alloc_coherent(idev->drm.dev, total_len, &staging_dma, GFP_KERNEL);
+	if (!staging) {
+		drm_gem_object_put(obj);
+		return -ENOMEM;
+	}
+
+	/* [submit_cmd header][forwarded body]. Copy the body from userspace first, then stamp the
+	 * header and the fields the host trusts for its DMA writeback (width/height/scanout_addr) — we
+	 * OVERWRITE whatever the ICD encoded so the host's write size can't exceed the buffer we sized-
+	 * checked above. A hostile/buggy userspace can't make the host DMA past the target BO. */
+	if (copy_from_user(staging + sizeof(struct igpu_submit_cmd),
+			   u64_to_user_ptr(args->payload_ptr), args->payload_len)) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+	sc = staging;
+	memset(sc, 0, sizeof(*sc));
+	sc->ctx_id = 0;
+	sc->encoding = ENC_VULKAN_VENUSLIKE;
+	sc->payload_len = args->payload_len;
+
+	wl = staging + sizeof(struct igpu_submit_cmd);
+	wl->width = args->width;
+	wl->height = args->height;
+	wl->scanout_addr = dma_obj->dma_addr;   /* host DMA-writes the render here (validated size) */
+
+	ret = igpu_submit_forwarded(idev, staging_dma, total_len);
+
+out:
+	dma_free_coherent(idev->drm.dev, total_len, staging, staging_dma);
 	drm_gem_object_put(obj);
 	return ret;
 }
@@ -905,6 +1066,7 @@ DEFINE_DRM_GEM_DMA_FOPS(igpu_fops);
  * client (/dev/dri/renderD128) call it, not just the card node's DRM master. */
 static const struct drm_ioctl_desc igpu_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(INFINIGPU_SUBMIT3D, igpu_ioctl_submit3d, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(INFINIGPU_SUBMIT_FORWARDED, igpu_ioctl_submit_forwarded, DRM_RENDER_ALLOW),
 };
 
 static const struct drm_driver igpu_drm_driver = {
@@ -917,7 +1079,7 @@ static const struct drm_driver igpu_drm_driver = {
 	.name = "infinigpu",
 	.desc = "infinigpu paravirtual display (Phase-0)",
 	.major = 1,
-	.minor = 0,
+	.minor = 1,   /* +INFINIGPU_SUBMIT_FORWARDED (forwarded-draw render-node ioctl) */
 };
 
 /* Deterministic bring-up check: present a recognizable gradient through the KMS
@@ -984,6 +1146,9 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct igpu_resource_flush) != 24);
 	BUILD_BUG_ON(sizeof(struct igpu_vulkan_workload) != 40);
 	BUILD_BUG_ON(offsetof(struct igpu_vulkan_workload, scanout_addr) != 32);
+	/* Forwarded-submit uAPI: the naturally-packed args (4×u32 + u64) the ICD passes. */
+	BUILD_BUG_ON(sizeof(struct drm_infinigpu_submit_forwarded) != 24);
+	BUILD_BUG_ON(offsetof(struct drm_infinigpu_submit_forwarded, payload_ptr) != 16);
 	/* The 3D SUBMIT_CMD body (header + workload) must fit one ring payload slot. */
 	BUILD_BUG_ON(sizeof(struct igpu_submit_cmd) + sizeof(struct igpu_vulkan_workload) > IGPU_RING2_PSTRIDE);
 	BUILD_BUG_ON((IGPU_RING2_CAP & (IGPU_RING2_CAP - 1)) != 0); /* power of two */
