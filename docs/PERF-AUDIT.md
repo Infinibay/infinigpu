@@ -227,6 +227,7 @@ state and the cache hit rate to approach 100%.
 | `INFINIGPU_NUMA_NODE=<n>` (infinization) | E | Bind guest RAM + device-server CPU/mem to the GPU's NUMA node + prealloc |
 | `INFINIGPU_FENCE_SPIN_US=<n>` (default **0**) | — | Spin-poll the fence up to `n` µs before blocking; skips the sleep/wakeup for fast frames. 50–100µs on well-provisioned hosts; leave 0 if VMs > CPU cores |
 | `INFINIGPU_ZEROCOPY_SCANOUT=1` (default off) | D | GPU DMAs the frame straight into the imported guest scanout (`VK_EXT_external_memory_host`) — no CPU copy. Needs the scratch cache + a page-aligned mapped scanout; falls back to one-copy present otherwise. Core-validated on A5000; needs full-stack validation |
+| `INFINIGPU_ELIDE_UNCHANGED=1` (default off) | — | Skip the whole GPU submit + DMA when a forwarded frame is byte-identical to the last one rendered into the same scanout buffer (own-remoting forwards the complete input, so identical payload ⇒ identical pixels already in the buffer). Frees the shared GPU for busy VMs under mixed multi-VM load. Keyed per scanout_addr (double-buffer safe); invalidated on any non-forwarded scanout write / DMA remap / reset. Fail-safe (a hash collision repaints a stale frame, never UB) |
 
 Land each remaining fix (B KMD/ICD, D-full, F) **only** once its own before/after p99 justifies it (golden
 rule). The gated fixes above are implemented but need A5000 render-validation + a measured win before their

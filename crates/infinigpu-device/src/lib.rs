@@ -26,6 +26,7 @@ use infinigpu_abi::regs;
 use infinigpu_replay::{ForwardedDraw, Frame, HostGpu, PresentStats};
 use infinigpu_sched::{BrokerConfig, GpuBroker, VmConfig, VmTicket};
 use log::info;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::mem::size_of;
@@ -561,6 +562,19 @@ pub struct InfinigpuBackend {
     /// biggest remaining hot-path cost (~1 ms/frame at 1080p). Falls back to the one-copy present
     /// when off, unsupported, or the scanout isn't a mapped page-aligned region.
     zerocopy_scanout: bool,
+    /// Creative micro-opt (opt-in, env `INFINIGPU_ELIDE_UNCHANGED`): skip the whole GPU submit + DMA
+    /// when a forwarded draw is byte-identical to the last one rendered into the **same** scanout
+    /// buffer. Own-remoting forwards the *complete* render input (SPIR-V + draw + bg + scanout) in
+    /// the payload, so an identical payload yields identical pixels the buffer already holds. Keyed
+    /// per `scanout_addr` (correct under double-buffering); the map is cleared whenever a non-forwarded
+    /// path writes a scanout (so a 2D present can never leave us eliding onto stale content). Under
+    /// mixed multi-VM load, eliding the idle VMs' redundant frames frees the shared GPU and lowers
+    /// the *active* VMs' tail.
+    elide_unchanged: bool,
+    /// Per-`scanout_addr` FNV-1a hash of the last forwarded payload actually rendered into it.
+    last_forwarded_hash: HashMap<u64, u64>,
+    /// Count of frames skipped by [`Self::elide_unchanged`] (logged periodically).
+    frames_elided: u64,
 }
 
 impl Default for InfinigpuBackend {
@@ -575,6 +589,17 @@ impl Default for InfinigpuBackend {
 /// measured-capacity half of ADR-0003/0007. Per-VM VRAM attribution (each jailed replay
 /// process → its pid's VRAM via `infinigpu_nvml::NvmlProbe::process_vram`) layers on top
 /// once the replay runs as a separate process.
+/// FNV-1a 64-bit hash of a byte slice — used to detect a byte-identical repeated forwarded frame
+/// (fast, no allocation; collisions here only risk a wrongly-elided frame, a visual glitch, not UB).
+fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 pub fn broker_config_from_nvml() -> BrokerConfig {
     let mut cfg = BrokerConfig::default();
     // This broker is per-process and arbitrates exactly ONE VM (the shipped topology spawns one
@@ -680,6 +705,11 @@ impl InfinigpuBackend {
             zerocopy_scanout: std::env::var("INFINIGPU_ZEROCOPY_SCANOUT")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            elide_unchanged: std::env::var("INFINIGPU_ELIDE_UNCHANGED")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            last_forwarded_hash: HashMap::new(),
+            frames_elided: 0,
         }
     }
 
@@ -769,6 +799,9 @@ impl InfinigpuBackend {
         self.cursor_needs_resolicit = true;
         // 3D submit counter is per-attach observability; a fresh generation starts from zero.
         self.vulkan_submits = 0;
+        // Guest RAM is being remapped/re-set — any cached forwarded-frame hash is now meaningless.
+        self.last_forwarded_hash.clear();
+        self.frames_elided = 0;
         // The VRAM true-up re-runs on the next present after a reset (fresh mode negotiation).
         self.scanout_vram_dims = None;
         if let Some(p) = &self.pixel {
@@ -1207,6 +1240,7 @@ impl InfinigpuBackend {
     /// `ScanoutBuffer` and streamed. Fail-closed: an unbound resource, non-contiguous/short backing,
     /// or bad geometry degrades to a skip (the fence still retires in `drain_ctx`).
     fn present_resource_flush(&mut self, res_id: u32, rect: (u32, u32, u32, u32), seqno: u64, ctx: usize) {
+        self.invalidate_elision(); // presenting a resource can overwrite a cached forwarded buffer
         use infinigpu_abi::wire::ScanoutPresentDamaged;
 
         // Copy out the small facts we need so we don't hold a &self.resources borrow across the
@@ -1258,6 +1292,15 @@ impl InfinigpuBackend {
     /// driver-upgrade gate). Fail-closed throughout: bad admission/geometry/GPU error is logged and
     /// skipped, but the fence **always retires** so the guest's `out_fence` resolves and the ring
     /// never wedges.
+    /// Invalidate the frame-elision cache — a non-forwarded path is about to write a guest scanout,
+    /// so no buffer can be assumed to still hold the forwarded frame we last rendered into it.
+    #[inline]
+    fn invalidate_elision(&mut self) {
+        if !self.last_forwarded_hash.is_empty() {
+            self.last_forwarded_hash.clear();
+        }
+    }
+
     fn submit_vulkan(&mut self, sc: &infinigpu_abi::wire::SubmitCmd, payload: &[u8], ctx: usize) {
         use infinigpu_abi::wire::{vk_op, VulkanWorkload};
         use zerocopy::FromBytes;
@@ -1305,6 +1348,27 @@ impl InfinigpuBackend {
         // the executor, so the datapath is observable even on a host whose GPU render then fails).
         let (w, h, bg, op) = (wl.width, wl.height, wl.bg, wl.op);
         self.vulkan_submits += 1;
+
+        // Creative micro-opt: elide a byte-identical repeat frame. Own-remoting forwards the COMPLETE
+        // render input in `payload` (SPIR-V + draw + bg + scanout), so a payload identical to the last
+        // one we rendered into this same scanout buffer yields pixels the buffer already holds — skip
+        // the entire decode + GPU submit + DMA, just retire. Keyed per scanout_addr (double-buffer
+        // safe); the map is cleared on any non-forwarded scanout write. Frees the shared GPU for busy
+        // VMs under mixed load. Fail-safe: a hash collision only repaints a stale frame, never UB.
+        let payload_hash = (self.elide_unchanged && wl.scanout_addr != 0).then(|| fnv1a_64(payload));
+        if let Some(h) = payload_hash {
+            if self.last_forwarded_hash.get(&wl.scanout_addr) == Some(&h) {
+                self.frames_elided += 1;
+                if self.frames_elided.is_multiple_of(300) {
+                    info!(
+                        "3D: vm={} elided {} unchanged frames (GPU skipped)",
+                        self.vm_config.vm_id, self.frames_elided
+                    );
+                }
+                self.ring_retired[ctx] = sc.seqno;
+                return;
+            }
+        }
         if self.vulkan_submits.is_multiple_of(120) || self.vulkan_submits == 1 {
             info!(
                 "3D: vm={} replaying Vulkan workload op={op} {w}x{h} on the GPU → scanout {:#x} ({} total)",
@@ -1438,6 +1502,15 @@ impl InfinigpuBackend {
         };
         if !presented {
             log::error!("vulkan submit ctx={ctx}: scanout {scanout_addr:#x} not fully mapped");
+        }
+        // Remember this frame so an identical repeat to the same buffer elides next time. Only on a
+        // successful present (a failed render didn't write the buffer, so it must re-render). Bounded
+        // to a handful of swapchain buffers.
+        if let (Some(h), true) = (payload_hash, presented) {
+            if self.last_forwarded_hash.len() >= 8 {
+                self.last_forwarded_hash.clear();
+            }
+            self.last_forwarded_hash.insert(scanout_addr, h);
         }
         if let Some(p) = self.profiler.as_mut() {
             let now = std::time::Instant::now();
@@ -1585,6 +1658,7 @@ impl InfinigpuBackend {
         seqno: u64,
         ctx: usize,
     ) {
+        self.invalidate_elision(); // a damaged 2D present can overwrite a cached forwarded buffer
         use infinigpu_abi::wire::format;
 
         // Admission gate (fail-closed): a VM the broker didn't admit cannot present.
@@ -1902,6 +1976,7 @@ impl InfinigpuBackend {
         seqno: u64,
         ctx: usize,
     ) {
+        self.invalidate_elision(); // this write can change a buffer a forwarded frame was cached for
         log::debug!(
             "  render_clear_present {}x{} scanout={:#x}",
             cp.width,
@@ -2008,6 +2083,7 @@ impl ServerBackend for InfinigpuBackend {
                 info!("DMA_MAP iova={address:#x} size={size:#x} (guest RAM mapped zero-copy)");
                 // Fix D: any remap can invalidate the host pointers behind cached scanout imports.
                 self.shared_gpu.forget_all_guest_imports();
+                self.invalidate_elision(); // remapped guest RAM ⇒ cached frame content is unknowable
                 self.dma.map(address, offset, size, f)
             }
             // No fd: a region QEMU can't share by fd (BIOS/ROM shadow, MMIO holes).
@@ -2030,6 +2106,7 @@ impl ServerBackend for InfinigpuBackend {
         // Fix D: the guest RAM behind any cached scanout import may be going away — drop them all
         // (re-imported lazily on the next zero-copy render).
         self.shared_gpu.forget_all_guest_imports();
+        self.invalidate_elision(); // unmapped guest RAM ⇒ any cached frame content is gone
         if flags.contains(DmaUnmapFlags::UNMAP_ALL) {
             self.dma.clear();
         } else {
@@ -2168,6 +2245,18 @@ pub fn serve_with_broker(
 mod tests {
     use super::*;
     use infinigpu_abi::regs::{ctrl, CMD_RING_STRIDE};
+
+    #[test]
+    fn fnv1a_is_deterministic_and_sensitive() {
+        // Frame elision keys off this: identical payloads MUST hash equal (else we never elide);
+        // a single changed byte MUST change the hash (else we'd elide a genuinely different frame).
+        let a = b"\x01\x02\x03forwarded-payload-bytes";
+        let mut b = a.to_vec();
+        assert_eq!(fnv1a_64(a), fnv1a_64(&b.clone()), "identical payloads hash equal");
+        b[5] ^= 0x01;
+        assert_ne!(fnv1a_64(a), fnv1a_64(&b), "a one-bit change must change the hash");
+        assert_ne!(fnv1a_64(b""), fnv1a_64(a));
+    }
 
     fn base_off(ctx: u64) -> u64 {
         ctrl::CMD_RING_CFG + ctx * CMD_RING_STRIDE + ctrl::CMD_RING_BASE_LO
