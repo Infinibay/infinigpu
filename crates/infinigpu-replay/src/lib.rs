@@ -382,15 +382,15 @@ impl Drop for ConvertScratch<'_> {
 const MAX_CACHED_MODULES: usize = 512;
 const MAX_CACHED_PIPELINES: usize = 256;
 
-/// FNV-1a hash of SPIR-V words — a stable, fast content key for the shader/pipeline cache
-/// (Fix A). Not cryptographic: cache dedup only, never a security boundary.
-fn fnv1a_u32(data: &[u32]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+/// Content hash of SPIR-V words — a stable key for the shader/pipeline cache (Fix A). The whole
+/// blob is re-hashed on every submit (the ICD forwards the full SPIR-V each time — finding #4), so
+/// this is **word-wise** (one round per u32, ~4× fewer than byte-wise) to keep per-submit CPU work
+/// proportional to shader size but small. The length is folded into the seed so different-length
+/// blobs can't collide on a shared prefix. Not cryptographic: cache dedup only.
+fn hash_spirv(data: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ data.len() as u64;
     for &word in data {
-        for b in word.to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        h = (h ^ word as u64).wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
 }
@@ -794,8 +794,8 @@ impl HostGpu {
             return Ok((rp, pipe));
         }
 
-        let vs_hash = fnv1a_u32(draw.vertex_spirv);
-        let fs_hash = fnv1a_u32(draw.fragment_spirv);
+        let vs_hash = hash_spirv(draw.vertex_spirv);
+        let fs_hash = hash_spirv(draw.fragment_spirv);
         let key = PipelineKey {
             vs_hash,
             fs_hash,
