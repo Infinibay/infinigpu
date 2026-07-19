@@ -84,6 +84,36 @@ mkdir -p /etc/modprobe.d
 printf 'options infinigpu ring_drainer=1\n' > /etc/modprobe.d/infinigpu.conf
 log "[OK] /etc/modprobe.d/infinigpu.conf written (ring_drainer=1 → 3D submit enabled)"
 
+# 4c. Load the module AFTER DKMS has built it — closes a first-boot race.
+# On the FIRST boot into the DKMS-target kernel (the guest apt/dnf-upgrades the kernel
+# during install, so the GPU cold-boot lands on a kernel DKMS hasn't built for yet),
+# systemd-modules-load.service runs EARLY — before dkms.service compiles the .ko — so the
+# modules-load.d entry above silently no-ops and the guest boots with NO /dev/dri (blank
+# GPU console + a manual `modprobe` needed). This oneshot orders After=dkms.service, so the
+# .ko is guaranteed present, then modprobes it (ring_drainer=1 comes from modprobe.d).
+# Idempotent: a no-op on later boots where modules-load.d already loaded it.
+if command -v systemctl >/dev/null 2>&1; then
+  cat > /etc/systemd/system/infinigpu-load.service <<'UNIT'
+[Unit]
+Description=Load the infinigpu KMD (after DKMS builds it on first boot)
+After=dkms.service systemd-modules-load.service
+Wants=dkms.service
+ConditionPathExists=/sys/bus/pci/devices
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# ExitCode is intentionally ignored (|| true): if the PCI device is absent (a non-GPU
+# boot) modprobe still succeeds; a genuine build failure surfaces via dkms status.
+ExecStart=/sbin/modprobe infinigpu
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl enable infinigpu-load.service 2>/dev/null || true
+  log "[OK] infinigpu-load.service enabled (modprobe After=dkms.service — first-boot race fix)"
+fi
+
 # 5. Vulkan ICD (userspace driver): unlike the DKMS kernel module, the ICD is a
 #    compiled Mesa-tree artifact shipped PREBUILT in this bundle. Install the .so where
 #    the manifest's library_path points and drop the manifest in the loader search path.
