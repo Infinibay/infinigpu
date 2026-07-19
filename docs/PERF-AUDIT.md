@@ -165,6 +165,33 @@ one of the already-designed architectural fixes:
 for shell-*measurable* micro-opts; Fix D turned out to be shell-*validatable* (import a page-aligned host
 buffer standing in for guest RAM), so it got implemented and measured rather than just designed.
 
+## Post-audit fixes (multi-agent 3D-accel audit)
+
+A follow-up 5-lens audit (completeness / host correctness / micro-opts / guest / ABI) surfaced a **live**
+throttle that no `bench_forwarded` run could see (the bench drives `HostGpu` directly, bypassing the broker):
+
+- **Token-bucket throttle capped every production VM (fixed).** `GpuBroker::run_timed` debits the render's
+  **wall-clock** and refills only 200 ms of GPU-time per wall-second (`infinigpu-sched:185`), so a GPU-bound VM
+  was hard-capped at **~20% GPU duty** and slept up to 50 ms **on the vfio-user doorbell-drain thread** (parking
+  the vCPU). The bucket enforces *cross-tenant* share, but the shipped topology is **one device process per VM**,
+  so it only ever throttled the lone VM it was meant to protect — and under multi-VM it debited
+  contention-inflated wall-clock as "usage", amplifying the very tail this audit targets. Fixed: a new
+  `BrokerConfig.throttle_enabled` (default on for the shared broker + tests) is set **off** in the per-process
+  `broker_config_from_nvml`, so a single-tenant broker never back-pressures its VM (`throttle_disabled_never_blocks_a_lone_vm`).
+- **Fix B (`INFINIGPU_SCRATCH_CACHE`) promoted to default-on** — the audit's largest measured win; render
+  validated identical on the A5000 with it default-on and with `=0`.
+- **Zero-copy fallback + alignment (fixed).** `submit_vulkan` now falls back to the one-copy present (and latches
+  zero-copy off) if an import/zero-copy render fails, instead of dropping the frame forever; and
+  `supports_zerocopy_scanout` requires `minImportedHostPointerAlignment ≤ 4096` so an import can't reference a
+  page past the device-validated region.
+- **`memoryOffset` writeback landmine (interim fix).** The guest ICD now advertises `requiresDedicatedAllocation=true`
+  so images bind at offset 0 — the host writeback ignores `memoryOffset` while the read paths honor it, which
+  would silently corrupt any sub-allocated (VMA) image. Full fix (thread `memoryOffset` through the ioctl) tracked
+  in [`3D-COMPLETENESS-ROADMAP.md`](./3D-COMPLETENESS-ROADMAP.md).
+
+3D-accel **completeness** (vertex/index buffers, descriptors/UBO/textures, multi-draw, depth, formats) is a
+separate feature track — see [`3D-COMPLETENESS-ROADMAP.md`](./3D-COMPLETENESS-ROADMAP.md).
+
 ## Fix A (done)
 
 `HostGpu` owns a real `VkPipelineCache` + a SPIR-V-hash-keyed memo (`GpuObjCache`) of shader modules, render
@@ -196,7 +223,7 @@ state and the cache hit rate to approach 100%.
 | Flag | Fix | Effect |
 |------|-----|--------|
 | `INFINIGPU_PIPELINE_CACHE` (default **on**) | A | Cache pipelines/shaders across submits; `=0` restores per-submit compile |
-| `INFINIGPU_SCRATCH_CACHE=1` | B (host) | Reuse per-(w,h) image/memory/framebuffer/readback (persistent map); needs pipeline cache on |
+| `INFINIGPU_SCRATCH_CACHE` (default **on**) | B (host) | Reuse per-(w,h) image/memory/framebuffer/readback (persistent map); `=0` restores the per-frame-alloc path. Needs pipeline cache on |
 | `INFINIGPU_NUMA_NODE=<n>` (infinization) | E | Bind guest RAM + device-server CPU/mem to the GPU's NUMA node + prealloc |
 | `INFINIGPU_FENCE_SPIN_US=<n>` (default **0**) | — | Spin-poll the fence up to `n` µs before blocking; skips the sleep/wakeup for fast frames. 50–100µs on well-provisioned hosts; leave 0 if VMs > CPU cores |
 | `INFINIGPU_ZEROCOPY_SCANOUT=1` (default off) | D | GPU DMAs the frame straight into the imported guest scanout (`VK_EXT_external_memory_host`) — no CPU copy. Needs the scratch cache + a page-aligned mapped scanout; falls back to one-copy present otherwise. Core-validated on A5000; needs full-stack validation |
