@@ -182,14 +182,15 @@ impl Default for SharedGpu {
 
 /// Host-decoded, owning form of a `vk_op::FORWARDED` wire draw (see [`decode_forwarded`]). Owns the
 /// SPIR-V words + entry names so a borrowing [`ForwardedDraw`] can be built inside the GPU run
-/// closure (which must be `'static`).
-struct OwnedForwardedDraw {
-    vertex_spirv: Vec<u32>,
-    fragment_spirv: Vec<u32>,
-    vertex_entry: std::ffi::CString,
-    fragment_entry: std::ffi::CString,
-    vertex_count: u32,
-    topology: u32,
+/// closure (which must be `'static`). Public so the off-VM interop test can assert the guest C
+/// encoder's bytes round-trip through this decoder.
+pub struct OwnedForwardedDraw {
+    pub vertex_spirv: Vec<u32>,
+    pub fragment_spirv: Vec<u32>,
+    pub vertex_entry: std::ffi::CString,
+    pub fragment_entry: std::ffi::CString,
+    pub vertex_count: u32,
+    pub topology: u32,
 }
 
 impl OwnedForwardedDraw {
@@ -211,7 +212,8 @@ impl OwnedForwardedDraw {
 /// without overflow, each SPIR-V blob must be a non-empty multiple of 4 (Vulkan words) within
 /// `max_bytes`, and each entry name must be a NUL-terminated string in its declared span. Returns
 /// `None` on ANY violation, so the caller drops the submit and still retires the fence (fail-closed).
-fn decode_forwarded(payload: &[u8], max_bytes: usize) -> Option<OwnedForwardedDraw> {
+/// Public so the off-VM guest-conformance interop test can drive it with the C encoder's output.
+pub fn decode_forwarded(payload: &[u8], max_bytes: usize) -> Option<OwnedForwardedDraw> {
     use infinigpu_abi::wire::ForwardedDrawTail;
     use zerocopy::FromBytes;
 

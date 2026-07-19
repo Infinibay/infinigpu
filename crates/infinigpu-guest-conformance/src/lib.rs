@@ -31,6 +31,70 @@ unsafe extern "C" {
         stride: u32,
     ) -> u32;
     fn igpu_gref_flush(buf: *mut u8, res_id: u32, x: u32, y: u32, w: u32, h: u32) -> u32;
+
+    // The forwarded-draw encoder shared with the Mesa ICD (guest/icd/infinigpu_forwarded.c).
+    fn infinigpu_encode_forwarded(
+        out: *mut u8,
+        cap: usize,
+        width: u32,
+        height: u32,
+        bg: *const f32,
+        scanout_addr: u64,
+        vertex_count: u32,
+        topology: u32,
+        vspirv: *const u32,
+        vspirv_words: u32,
+        fspirv: *const u32,
+        fspirv_words: u32,
+        vertex_entry: *const std::os::raw::c_char,
+        fragment_entry: *const std::os::raw::c_char,
+    ) -> usize;
+}
+
+/// Build a `vk_op::FORWARDED` SUBMIT_CMD payload with the C encoder the guest ICD uses — the exact
+/// bytes `driver_submit` will emit. Returns the serialized payload (panics if the encoder rejects
+/// the geometry). `topology` is a `vk_topology` value; SPIR-V slices are u32 words.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_forwarded(
+    width: u32,
+    height: u32,
+    bg: [f32; 4],
+    scanout_addr: u64,
+    vertex_count: u32,
+    topology: u32,
+    vspirv: &[u32],
+    fspirv: &[u32],
+    vertex_entry: &std::ffi::CStr,
+    fragment_entry: &std::ffi::CStr,
+) -> Vec<u8> {
+    let cap = 64
+        + vspirv.len() * 4
+        + fspirv.len() * 4
+        + vertex_entry.to_bytes_with_nul().len()
+        + fragment_entry.to_bytes_with_nul().len()
+        + 16;
+    let mut out = vec![0u8; cap];
+    let n = unsafe {
+        infinigpu_encode_forwarded(
+            out.as_mut_ptr(),
+            out.len(),
+            width,
+            height,
+            bg.as_ptr(),
+            scanout_addr,
+            vertex_count,
+            topology,
+            vspirv.as_ptr(),
+            vspirv.len() as u32,
+            fspirv.as_ptr(),
+            fspirv.len() as u32,
+            vertex_entry.as_ptr(),
+            fragment_entry.as_ptr(),
+        )
+    };
+    assert!(n > 0, "C encoder returned 0 (payload did not fit the buffer)");
+    out.truncate(n);
+    out
 }
 
 /// Push one descriptor through the C SPSC producer. Returns the assigned seqno (0 if the ring is
