@@ -12,9 +12,11 @@
 //! real silicon without QEMU. Real command-stream replay layers on top of this.
 
 use ash::vk;
+use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::{c_char, CStr};
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::sync::Mutex;
 
 mod shaders;
 
@@ -147,6 +149,16 @@ pub struct HostGpu {
     /// True iff the device also advertises `VK_EXT_external_memory_dma_buf` (→ prefer a
     /// dma-buf handle over an opaque fd when exporting).
     dma_buf_supported: bool,
+    /// Fix A: persistent driver pipeline cache passed to `create_graphics_pipelines` (vs. a null
+    /// handle) so warm compiles are reused; `null` when caching is disabled.
+    pipeline_cache: vk::PipelineCache,
+    /// Fix A: memoize shader modules + pipelines across submits (env `INFINIGPU_PIPELINE_CACHE`,
+    /// default on). Off restores the per-submit compile path for a before/after measurement.
+    cache_enabled: bool,
+    /// Fix A: the compile-heavy Vulkan objects the 3D submit path would otherwise rebuild every
+    /// frame, memoized and reused. Guarded by a `Mutex` (near-uncontended: one submit thread per
+    /// device process) so `HostGpu` stays `Sync`.
+    obj_cache: Mutex<GpuObjCache>,
 }
 
 /// RAII cleanup for the per-render Vulkan objects of [`HostGpu::render_triangle_inner`]. Every
@@ -337,6 +349,72 @@ impl Drop for ConvertScratch<'_> {
     }
 }
 
+/// Fix A cache bounds — a guest flooding unique SPIR-V can't grow the memo without limit.
+const MAX_CACHED_MODULES: usize = 512;
+const MAX_CACHED_PIPELINES: usize = 256;
+
+/// FNV-1a hash of SPIR-V words — a stable, fast content key for the shader/pipeline cache
+/// (Fix A). Not cryptographic: cache dedup only, never a security boundary.
+fn fnv1a_u32(data: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &word in data {
+        for b in word.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Key for a reusable graphics pipeline: the two shader blobs (by hash), the primitive topology,
+/// and the color format. Resolution is deliberately absent — the pipeline uses dynamic
+/// viewport+scissor so one entry serves every frame size (Fix A).
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+struct PipelineKey {
+    vs_hash: u64,
+    fs_hash: u64,
+    topology: i32,
+    format: i32,
+}
+
+#[derive(Clone, Copy)]
+struct CachedPipeline {
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+}
+
+/// SPIR-V-keyed memo of the compile-heavy Vulkan objects the 3D submit path would otherwise
+/// rebuild every frame (Fix A). Bounded fail-closed: at the cap the whole cache is torn down and
+/// rebuilt on demand (a compile storm only under a hostile flood; in normal use a handful of
+/// pipelines recur). Lives for the process (one VM) lifetime.
+#[derive(Default)]
+struct GpuObjCache {
+    shader_modules: HashMap<u64, vk::ShaderModule>,
+    render_passes: HashMap<i32, vk::RenderPass>,
+    pipelines: HashMap<PipelineKey, CachedPipeline>,
+}
+
+impl GpuObjCache {
+    /// Destroy every cached object and empty the maps. Safe between submits: a completed submit
+    /// (fence already waited) holds no live reference into the cache.
+    ///
+    /// # Safety
+    /// `dev` must be the device the cached handles were created on, and no command buffer
+    /// referencing them may still be executing.
+    unsafe fn clear(&mut self, dev: &ash::Device) {
+        for (_, p) in self.pipelines.drain() {
+            dev.destroy_pipeline(p.pipeline, None);
+            dev.destroy_pipeline_layout(p.layout, None);
+        }
+        for (_, m) in self.shader_modules.drain() {
+            dev.destroy_shader_module(m, None);
+        }
+        for (_, rp) in self.render_passes.drain() {
+            dev.destroy_render_pass(rp, None);
+        }
+    }
+}
+
 impl HostGpu {
     pub fn device_name(&self) -> &str {
         &self.device_name
@@ -431,6 +509,21 @@ impl HostGpu {
         let external_fd =
             want_fd.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
 
+        // Fix A: pipeline/shader caching on by default; INFINIGPU_PIPELINE_CACHE=0/false restores
+        // the per-submit compile path so the owner can measure the tail before/after on one binary.
+        let cache_enabled = std::env::var("INFINIGPU_PIPELINE_CACHE")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let pipeline_cache = if cache_enabled {
+            unsafe {
+                device
+                    .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+                    .unwrap_or(vk::PipelineCache::null())
+            }
+        } else {
+            vk::PipelineCache::null()
+        };
+
         Ok(HostGpu {
             entry,
             instance,
@@ -444,12 +537,251 @@ impl HostGpu {
             driver_id,
             external_fd,
             dma_buf_supported: want_dma_buf,
+            pipeline_cache,
+            cache_enabled,
+            obj_cache: Mutex::new(GpuObjCache::default()),
         })
     }
 
     /// Whether this device can export rendered memory as an fd (dma-buf or opaque).
     pub fn can_export(&self) -> bool {
         self.external_fd.is_some()
+    }
+
+    /// Fix A: build the color render pass (CLEAR → STORE, ending TRANSFER_SRC) for `format`, with
+    /// an explicit external subpass dependency ordering the color write before the post-pass
+    /// transfer read (the image→buffer readback) — previously left to implicit sync (audit LOW).
+    fn build_render_pass(&self, format: vk::Format) -> R<vk::RenderPass> {
+        let attach = vk::AttachmentDescription::default()
+            .format(format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        let attachs = [attach];
+        let color_ref = [vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+        let subpass = [vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color_ref)];
+        let deps = [vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+        let rp = unsafe {
+            self.device.create_render_pass(
+                &vk::RenderPassCreateInfo::default()
+                    .attachments(&attachs)
+                    .subpasses(&subpass)
+                    .dependencies(&deps),
+                None,
+            )?
+        };
+        Ok(rp)
+    }
+
+    /// Fix A: build the graphics pipeline (+ its empty layout) from two shader modules, with
+    /// **dynamic** viewport+scissor so the pipeline is resolution-independent (set per-frame at
+    /// record time). `cache` is the driver pipeline cache (may be null). On pipeline-build failure
+    /// the layout is freed so it can't leak.
+    fn build_pipeline(
+        &self,
+        render_pass: vk::RenderPass,
+        draw: &ForwardedDraw,
+        topology: vk::PrimitiveTopology,
+        vs_module: vk::ShaderModule,
+        fs_module: vk::ShaderModule,
+        cache: vk::PipelineCache,
+    ) -> R<(vk::PipelineLayout, vk::Pipeline)> {
+        let dev = &self.device;
+        let layout =
+            unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)? };
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vs_module)
+                .name(draw.vertex_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fs_module)
+                .name(draw.fragment_entry),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let input_asm = vk::PipelineInputAssemblyStateCreateInfo::default().topology(topology);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let blend_attach = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(false)];
+        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attach);
+        let pipeline_ci = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_asm)
+            .viewport_state(&viewport_state)
+            .dynamic_state(&dynamic_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .color_blend_state(&blend)
+            .layout(layout)
+            .render_pass(render_pass)
+            .subpass(0);
+        let pipeline = unsafe { dev.create_graphics_pipelines(cache, &[pipeline_ci], None) };
+        match pipeline {
+            Ok(p) => Ok((layout, p[0])),
+            Err((_, e)) => {
+                unsafe { dev.destroy_pipeline_layout(layout, None) };
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Fix A: resolve the (render pass, pipeline) for `draw`. When caching is enabled the
+    /// compile-heavy objects are memoized on `self` and reused across submits (steady-state
+    /// submits skip all compilation); when disabled they are built fresh and registered into `sc`
+    /// for per-frame teardown (the pre-Fix-A path, for before/after measurement). In the cached
+    /// case the returned handles outlive the submit and must NOT be registered into `sc`.
+    fn pipeline_for(
+        &self,
+        sc: &mut RenderScratch,
+        draw: &ForwardedDraw,
+        format: vk::Format,
+    ) -> R<(vk::RenderPass, vk::Pipeline)> {
+        let dev = &self.device;
+        let topology = map_topology(draw.topology);
+
+        if !self.cache_enabled {
+            let rp = self.build_render_pass(format)?;
+            sc.render_pass = rp;
+            let vs = unsafe {
+                dev.create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(draw.vertex_spirv),
+                    None,
+                )?
+            };
+            sc.vs_module = vs;
+            let fs = unsafe {
+                dev.create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(draw.fragment_spirv),
+                    None,
+                )?
+            };
+            sc.fs_module = fs;
+            let (layout, pipe) =
+                self.build_pipeline(rp, draw, topology, vs, fs, vk::PipelineCache::null())?;
+            sc.layout = layout;
+            sc.pipeline = pipe;
+            return Ok((rp, pipe));
+        }
+
+        let vs_hash = fnv1a_u32(draw.vertex_spirv);
+        let fs_hash = fnv1a_u32(draw.fragment_spirv);
+        let key = PipelineKey {
+            vs_hash,
+            fs_hash,
+            topology: topology.as_raw(),
+            format: format.as_raw(),
+        };
+        let mut cache = self.obj_cache.lock().unwrap_or_else(|e| e.into_inner());
+        // Fail-closed bound before inserting anything new.
+        if cache.pipelines.len() >= MAX_CACHED_PIPELINES
+            || cache.shader_modules.len() >= MAX_CACHED_MODULES
+        {
+            eprintln!(
+                "infinigpu-replay: pipeline cache at cap — evicting all (a guest may be flooding unique shaders)"
+            );
+            unsafe { cache.clear(dev) };
+        }
+        let fmt_raw = format.as_raw();
+        let rp = match cache.render_passes.get(&fmt_raw) {
+            Some(&rp) => rp,
+            None => {
+                let rp = self.build_render_pass(format)?;
+                cache.render_passes.insert(fmt_raw, rp);
+                rp
+            }
+        };
+        if let Some(&CachedPipeline { pipeline, .. }) = cache.pipelines.get(&key) {
+            return Ok((rp, pipeline));
+        }
+        // Resolve shader modules, tracking which we create fresh so a failed pipeline build (e.g. a
+        // hostile bad entry point) caches nothing and frees exactly the modules we just made.
+        let (vs, vs_new) = match cache.shader_modules.get(&vs_hash) {
+            Some(&m) => (m, false),
+            None => (
+                unsafe {
+                    dev.create_shader_module(
+                        &vk::ShaderModuleCreateInfo::default().code(draw.vertex_spirv),
+                        None,
+                    )?
+                },
+                true,
+            ),
+        };
+        let (fs, fs_new) = if fs_hash == vs_hash {
+            (vs, false) // identical blob → one module serves both stages
+        } else {
+            match cache.shader_modules.get(&fs_hash) {
+                Some(&m) => (m, false),
+                None => match unsafe {
+                    dev.create_shader_module(
+                        &vk::ShaderModuleCreateInfo::default().code(draw.fragment_spirv),
+                        None,
+                    )
+                } {
+                    Ok(m) => (m, true),
+                    Err(e) => {
+                        if vs_new {
+                            unsafe { dev.destroy_shader_module(vs, None) };
+                        }
+                        return Err(e.into());
+                    }
+                },
+            }
+        };
+        match self.build_pipeline(rp, draw, topology, vs, fs, self.pipeline_cache) {
+            Ok((layout, pipe)) => {
+                if vs_new {
+                    cache.shader_modules.insert(vs_hash, vs);
+                }
+                if fs_new {
+                    cache.shader_modules.insert(fs_hash, fs);
+                }
+                cache.pipelines.insert(key, CachedPipeline { pipeline: pipe, layout });
+                Ok((rp, pipe))
+            }
+            Err(e) => {
+                // Cache nothing; free the modules we just created (cached ones stay). When both are
+                // fresh they are distinct objects (fs_hash != vs_hash), so there is no double-free.
+                unsafe {
+                    if vs_new {
+                        dev.destroy_shader_module(vs, None);
+                    }
+                    if fs_new {
+                        dev.destroy_shader_module(fs, None);
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     fn find_mem(&self, type_bits: u32, flags: vk::MemoryPropertyFlags) -> R<u32> {
@@ -1175,30 +1507,11 @@ impl HostGpu {
         };
         sc.view = view;
 
-        // ---- render pass (clear bg -> store -> TRANSFER_SRC) + framebuffer ----
-        let attach = vk::AttachmentDescription::default()
-            .format(FORMAT)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-        let attachs = [attach];
-        let color_ref = [vk::AttachmentReference::default()
-            .attachment(0)
-            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-        let subpass = [vk::SubpassDescription::default()
-            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&color_ref)];
-        let render_pass = unsafe {
-            dev.create_render_pass(
-                &vk::RenderPassCreateInfo::default().attachments(&attachs).subpasses(&subpass),
-                None,
-            )?
-        };
-        sc.render_pass = render_pass;
+        // ---- render pass + graphics pipeline (Fix A: memoized across submits when caching is
+        // enabled; the pipeline uses dynamic viewport+scissor so one entry serves every size) ----
+        let (render_pass, pipeline) = self.pipeline_for(&mut sc, draw, FORMAT)?;
+
+        // ---- framebuffer (per-frame; binds this frame's view to the render pass) ----
         let views = [view];
         let framebuffer = unsafe {
             dev.create_framebuffer(
@@ -1212,84 +1525,6 @@ impl HostGpu {
             )?
         };
         sc.framebuffer = framebuffer;
-
-        // ---- graphics pipeline (FORWARDED SPIR-V; no vertex buffers) ----
-        // Two modules even when both stages alias one blob (the combined builtin case) — a
-        // real app forwards separate vertex/fragment modules, and creating two from identical
-        // code is valid. The host driver compiles the vendor-neutral SPIR-V.
-        let vs_module = unsafe {
-            dev.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(draw.vertex_spirv),
-                None,
-            )?
-        };
-        sc.vs_module = vs_module;
-        let fs_module = unsafe {
-            dev.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(draw.fragment_spirv),
-                None,
-            )?
-        };
-        sc.fs_module = fs_module;
-        let layout = unsafe {
-            dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)?
-        };
-        sc.layout = layout;
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vs_module)
-                .name(draw.vertex_entry),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(fs_module)
-                .name(draw.fragment_entry),
-        ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
-        let input_asm = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(map_topology(draw.topology));
-        let viewports = [vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: width as f32,
-            height: height as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        }];
-        let scissors = [vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent: vk::Extent2D { width, height },
-        }];
-        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-            .viewports(&viewports)
-            .scissors(&scissors);
-        let raster = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-            .line_width(1.0);
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let blend_attach = [vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::RGBA)
-            .blend_enable(false)];
-        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attach);
-        let pipeline_ci = vk::GraphicsPipelineCreateInfo::default()
-            .stages(&stages)
-            .vertex_input_state(&vertex_input)
-            .input_assembly_state(&input_asm)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&raster)
-            .multisample_state(&multisample)
-            .color_blend_state(&blend)
-            .layout(layout)
-            .render_pass(render_pass)
-            .subpass(0);
-        let pipeline = unsafe {
-            dev.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
-                .map_err(|(_, e)| e)?[0]
-        };
-        sc.pipeline = pipeline;
 
         // ---- host-visible readback buffer ----
         let readback = unsafe {
@@ -1398,6 +1633,28 @@ impl HostGpu {
                 vk::SubpassContents::INLINE,
             );
             dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            // Dynamic viewport+scissor for this frame's size (Fix A: keeps the pipeline itself
+            // resolution-independent so it is reused across differently-sized submits).
+            dev.cmd_set_viewport(
+                cmd,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f32,
+                    height: height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            dev.cmd_set_scissor(
+                cmd,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D { width, height },
+                }],
+            );
             dev.cmd_draw(cmd, draw.vertex_count, 1, 0, 0); // no vertex buffer → SM execution
             dev.cmd_end_render_pass(cmd);
 
