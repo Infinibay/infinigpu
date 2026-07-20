@@ -6,13 +6,16 @@ fixes the correctness landmines (B1) they expose.
 
 ## Implementation status (updated as phases land)
 
-- **Phase 2b (A1 VBO/IBO + A3 multi-draw + A7 viewport) — DONE, A5000-verified.** `vk_op::FORWARDED_CMDLIST`
-  (ABI 0.8) carries a mesh: a vertex buffer, optional index buffer, a vertex-input layout, and an ordered
-  draw list with per-draw viewport. Host render (`infinigpu-replay`), device decode (`decode_forwarded_cmdlist`),
-  and the guest wire ENCODER (`infinigpu_encode_forwarded_cmdlist` + C↔Rust conformance) are all implemented and
-  tested. **Remaining guest piece (owner's Mesa build env):** the ICD *recording* — `CmdBindVertexBuffers` /
-  `CmdBindIndexBuffer` / `CmdDrawIndexed` / `CmdSetViewport` handlers + capturing the pipeline's vertex-input
-  layout + calling the encoder from `driver_submit`. The wire it targets is proven.
+- **Phase 2b (A1 VBO/IBO + A3 multi-draw + A7 viewport) — DONE end-to-end (host A5000-verified; guest ICD
+  recording compile-verified).** `vk_op::FORWARDED_CMDLIST` (ABI 0.8) carries a mesh: a vertex buffer, optional
+  index buffer, a vertex-input layout, and an ordered draw list with per-draw viewport. Host render
+  (`infinigpu-replay`), device decode (`decode_forwarded_cmdlist`), and the guest wire ENCODER
+  (`infinigpu_encode_forwarded_cmdlist` + C↔Rust conformance) all implemented and tested. **Guest ICD recording
+  now wired too** (`infinigpu_{pipeline,cmd_buffer,sync}.c`): captures the pipeline vertex-input layout + depth,
+  records `CmdBindVertexBuffers2`/`CmdBindIndexBuffer2`/`CmdDrawIndexed`/`CmdSetViewport`/`CmdPushConstants`, and
+  forwards real meshes via the encoder from `driver_submit`. Builds clean in the Mesa substrate; runtime
+  render-validation (a real app in a GPU VM) is the one owner-env step left. Textures/UBO descriptor RECORDING in
+  the ICD is the next guest piece (host+wire+device textures are already done — see Phase 2c below).
 - **Phase 2d depth (A4) — DONE, A5000-verified.** Optional depth attachment (D32) + depth test/write/compare,
   forwarded via the `ForwardedCmdListTail.depth_flags` bitfield. Host + ABI + device + guest wire + tests.
   (A5 static state — blend/cull/MSAA — is NOT yet done; see 2d below.)
@@ -136,8 +139,8 @@ paths. Do this whenever the ABI is bumped for Phase 2b anyway.
 | Phase | Findings | Effort | Risk | Unblocks | Status |
 |-------|----------|--------|------|----------|--------|
 | 2a | A6, A8 | S | low | correct colors; overlay passes | todo |
-| 2b | A1, A3, A7, A5-dyn | **L** | med | **any real mesh renders** | **DONE** (host/device/wire; guest ICD recording pending owner) |
-| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) | **push-const transform + textures DONE**; UBO/SSBO descriptors todo (**next**) |
+| 2b | A1, A3, A7, A5-dyn | **L** | med | **any real mesh renders** | **DONE** host/device/wire + guest ICD recording (compile-verified); runtime render-validation pending owner |
+| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) | **push-const transform + textures DONE** (host/wire/device); guest texture/UBO descriptor recording todo (**next**) |
 | 2d | A4, A5-static | M | med | depth-correct 3D, transparency, MSAA | **A4 depth DONE**; A5 static (blend/cull/MSAA) todo |
 | 2e | A9 | M | med | async frames (with Fix F) | todo |
 
