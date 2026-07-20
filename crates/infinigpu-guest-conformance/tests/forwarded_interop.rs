@@ -99,6 +99,7 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
         false,
         1, // vk_topology::TRIANGLE_STRIP
         df,
+        &[9u8, 8, 7, 6, 5, 4, 3, 2], // push-constant bytes (a stand-in transform block)
         &draws,
     );
 
@@ -124,4 +125,5 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
     let d = g.depth.expect("depth state decodes from depth_flags");
     assert!(d.test && d.write, "depth test+write survive the C→Rust round-trip");
     assert_eq!(d.compare, depth_compare::LESS_OR_EQUAL, "depth compare-op survives");
+    assert_eq!(g.push_constants, [9, 8, 7, 6, 5, 4, 3, 2], "push-constant bytes survive C→Rust");
 }

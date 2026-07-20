@@ -94,6 +94,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
     const uint8_t *vertex_data, uint32_t vertex_data_len,
     const uint8_t *index_data, uint32_t index_data_len, uint32_t index_type,
     uint32_t topology, uint32_t depth_flags,
+    const uint8_t *push_const, uint32_t push_const_len,
     const struct DrawCmdWire *draws, uint32_t draw_count);
 
 #endif /* INFINIGPU_FORWARDED_H */

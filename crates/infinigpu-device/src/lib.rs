@@ -314,6 +314,8 @@ pub struct OwnedGeometry {
     pub draws: Vec<DrawCmd>,
     /// Phase-2d depth-test state decoded from `ForwardedCmdListTail::depth_flags`; `None` ⇒ 2D path.
     pub depth: Option<DepthState>,
+    /// Phase-2c push-constant bytes (a transform block); empty ⇒ no push constants.
+    pub push_constants: Vec<u8>,
 }
 
 impl OwnedForwardedDraw {
@@ -333,6 +335,7 @@ impl OwnedForwardedDraw {
                 index_u32: g.index_u32,
                 draws: &g.draws,
                 depth: g.depth,
+                push_constants: &g.push_constants,
             }),
         }
     }
@@ -446,9 +449,11 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
     let draw_count = tail.draw_count as usize;
     let vdata_len = tail.vertex_data_len as usize;
     let idata_len = tail.index_data_len as usize;
+    let pc_len = tail.push_const_len as usize;
     let stride = tail.vertex_stride;
 
-    // Scalar bounds (cheap rejects before any arithmetic on attacker lengths).
+    // Scalar bounds (cheap rejects before any arithmetic on attacker lengths). Push constants are
+    // hardware-capped (256 B on every Vulkan implementation) — reject anything larger fail-closed.
     if vlen == 0
         || flen == 0
         || !vlen.is_multiple_of(4)
@@ -464,6 +469,7 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         || attr_count > 32
         || vdata_len > max_bytes
         || idata_len > max_bytes
+        || pc_len > 256
     {
         return None;
     }
@@ -473,9 +479,10 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         return None;
     }
 
-    // Total of the eight trailing sections, in wire order. All checked_* so a hostile length can't
-    // wrap. Sections 1–2 (fixed-size arrays) and 3–4 (SPIR-V) are 4-multiples; the byte blobs 5–8
-    // come last so their odd lengths never misalign a fixed array.
+    // Total of the nine trailing sections, in wire order. All checked_* so a hostile length can't
+    // wrap. Sections 1–2 (fixed-size arrays) and 3–4 (SPIR-V) are 4-multiples; the byte blobs 5–9
+    // (vertex/index data, two entry names, push constants) come last so their odd lengths never
+    // misalign a fixed array.
     let attrs_bytes = attr_count.checked_mul(size_of::<VertexAttrWire>())?;
     let draws_bytes = draw_count.checked_mul(size_of::<DrawCmdWire>())?;
     let total = attrs_bytes
@@ -485,7 +492,8 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         .checked_add(vdata_len)?
         .checked_add(idata_len)?
         .checked_add(velen)?
-        .checked_add(felen)?;
+        .checked_add(felen)?
+        .checked_add(pc_len)?;
     if total > rest.len() {
         return None;
     }
@@ -496,7 +504,8 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
     let (vdata_b, r) = r.split_at(vdata_len);
     let (idata_b, r) = r.split_at(idata_len);
     let (ventry_b, r) = r.split_at(velen);
-    let (fentry_b, _) = r.split_at(felen);
+    let (fentry_b, r) = r.split_at(felen);
+    let (pc_b, _) = r.split_at(pc_len);
 
     // Parse the attribute + draw arrays element-by-element (read_from_prefix copies, so the
     // byte-aligned payload needs no 4-alignment).
@@ -579,6 +588,7 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
             index_u32,
             draws,
             depth,
+            push_constants: pc_b.to_vec(),
         }),
     })
 }
@@ -3304,6 +3314,7 @@ mod tests {
         index_u32: bool,
         topology: u32,
         depth_flags: u32,
+        push_const: &[u8],
         draws: &[infinigpu_abi::wire::DrawCmdWire],
     ) -> Vec<u8> {
         use infinigpu_abi::wire::{index_type, vk_op, ForwardedCmdListTail, VulkanWorkload};
@@ -3334,6 +3345,7 @@ mod tests {
             draw_count: draws.len() as u32,
             topology,
             depth_flags,
+            push_const_len: push_const.len() as u32,
         };
         let mut p = Vec::new();
         p.extend_from_slice(wl.as_bytes());
@@ -3350,6 +3362,7 @@ mod tests {
         p.extend_from_slice(idata);
         p.extend_from_slice(ve);
         p.extend_from_slice(fe);
+        p.extend_from_slice(push_const);
         p
     }
 
@@ -3379,7 +3392,7 @@ mod tests {
         let df = depth_flags::pack(true, false, depth_compare::GREATER); // test on, write off
         let payload = encode_forwarded_cmdlist(
             32, 16, [0.1, 0.2, 0.3, 1.0], 0, &vspirv, &fspirv, c"vs", c"fs", 20, &attrs, &vdata,
-            &idata, false, 1, df, &draws,
+            &idata, false, 1, df, &[0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4], &draws,
         );
 
         let o = decode_forwarded_cmdlist(&payload, CAP).expect("valid cmdlist decodes");
@@ -3402,6 +3415,7 @@ mod tests {
         let d = g.depth.expect("depth_flags decodes to a DepthState");
         assert!(d.test && !d.write, "depth test-on/write-off round-trips");
         assert_eq!(d.compare, depth_compare::GREATER, "depth compare-op round-trips");
+        assert_eq!(g.push_constants, [0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4], "push-const bytes round-trip");
 
         // Hostile → None (fail-closed):
         assert!(decode_forwarded_cmdlist(&payload[..44], CAP).is_none(), "truncated before tail rejected");
@@ -3414,9 +3428,9 @@ mod tests {
         let mut no_draws = payload.clone();
         no_draws[40 + 36..40 + 40].copy_from_slice(&0u32.to_le_bytes());
         assert!(decode_forwarded_cmdlist(&no_draws, CAP).is_none(), "zero draw_count rejected");
-        // bad vertex SPIR-V magic (first vSPIR-V word sits after tail(48)+attrs(24)+draws(64) = 136,
-        // plus the VulkanWorkload(40) = payload offset 176).
-        let vspv_off = 40 + 48 + attrs.len() * 12 + draws.len() * 32;
+        // bad vertex SPIR-V magic (first vSPIR-V word sits after the VulkanWorkload(40) + tail(52) +
+        // attrs + draws arrays).
+        let vspv_off = 40 + 52 + attrs.len() * 12 + draws.len() * 32;
         let mut bad_magic = payload.clone();
         bad_magic[vspv_off] = bad_magic[vspv_off].wrapping_add(1);
         assert!(decode_forwarded_cmdlist(&bad_magic, CAP).is_none(), "non-SPIR-V vertex blob rejected");
@@ -3489,7 +3503,7 @@ mod tests {
         let scanout_addr = GUEST_BASE + SCAN_OFF as u64;
         let payload = encode_forwarded_cmdlist(
             w, h, bg, scanout_addr, &vs, &fs, c"main", c"main", 20, &attrs, &vdata, &[], false, 0, 0,
-            &draws,
+            &[], &draws,
         );
         let sc = infinigpu_abi::wire::SubmitCmd {
             ctx_id: 0,

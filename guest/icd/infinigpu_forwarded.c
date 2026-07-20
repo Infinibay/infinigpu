@@ -16,8 +16,9 @@
 _Static_assert(sizeof(struct VulkanWorkload) == 40, "VulkanWorkload is 40 bytes");
 _Static_assert(sizeof(struct ForwardedDrawTail) == 24, "ForwardedDrawTail is 24 bytes");
 _Static_assert(offsetof(struct VulkanWorkload, scanout_addr) == 32, "scanout_addr@32");
-/* Phase-2b command-list structs — the cmdlist encoder copies these; drift is a compile error. */
-_Static_assert(sizeof(struct ForwardedCmdListTail) == 48, "ForwardedCmdListTail is 48 bytes");
+/* Phase-2b command-list structs — the cmdlist encoder copies these; drift is a compile error.
+ * The tail grew to 52 B in ABI 0.9 (push_const_len). */
+_Static_assert(sizeof(struct ForwardedCmdListTail) == 52, "ForwardedCmdListTail is 52 bytes");
 _Static_assert(sizeof(struct VertexAttrWire) == 12, "VertexAttrWire is 12 bytes");
 _Static_assert(sizeof(struct DrawCmdWire) == 32, "DrawCmdWire is 32 bytes");
 
@@ -85,6 +86,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
     const uint8_t *vertex_data, uint32_t vertex_data_len,
     const uint8_t *index_data, uint32_t index_data_len, uint32_t index_type,
     uint32_t topology, uint32_t depth_flags,
+    const uint8_t *push_const, uint32_t push_const_len,
     const struct DrawCmdWire *draws, uint32_t draw_count)
 {
 	const size_t vbytes = (size_t)vspirv_words * 4u;
@@ -101,7 +103,8 @@ size_t infinigpu_encode_forwarded_cmdlist(
 
 	const size_t total = sizeof(struct VulkanWorkload) + sizeof(struct ForwardedCmdListTail) +
 	                     attrs_bytes + draws_bytes + vbytes + fbytes +
-	                     (size_t)vertex_data_len + (size_t)index_data_len + velen + felen;
+	                     (size_t)vertex_data_len + (size_t)index_data_len + velen + felen +
+	                     (size_t)push_const_len;
 	if (out == NULL || total > cap)
 		return 0;
 
@@ -131,6 +134,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	tail.draw_count = draw_count;
 	tail.topology = topology;
 	tail.depth_flags = depth_flags;
+	tail.push_const_len = push_const_len;
 	memcpy(out + o, &tail, sizeof tail);
 	o += sizeof tail;
 
@@ -159,6 +163,10 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	o += velen;
 	memcpy(out + o, fragment_entry, felen);
 	o += felen;
+	if (push_const_len) {
+		memcpy(out + o, push_const, push_const_len);
+		o += push_const_len;
+	}
 
 	return o;
 }

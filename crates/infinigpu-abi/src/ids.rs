@@ -44,8 +44,11 @@ pub const ABI_MAJOR: u16 = 0;
 /// + `ForwardedCmdListTail` + `VertexAttrWire`/`DrawCmdWire` + `vk_vformat`/`index_type` — a real mesh
 /// with a vertex buffer, optional index buffer, vertex-input layout, and multi-draw; the op that lets
 /// any vertex-buffered app render. A guest gates on `negotiated_minor >= 8` before sending it, since an
-/// older host would fall through to the clear default).
-pub const ABI_MINOR: u16 = 8;
+/// older host would fall through to the clear default). v9 grew `ForwardedCmdListTail` by
+/// `push_const_len` (48→52 B) — a push-constant transform block (an MVP matrix) applied before the
+/// draws (Phase-2c). Since the tail size changed, a v9 guest must not send a command list to a pre-v9
+/// host (it would misparse the trailing sections); gate on `negotiated_minor >= 9` for push constants.
+pub const ABI_MINOR: u16 = 9;
 
 /// Packed `ABI_VERSION` register value (`major << 16 | minor`).
 pub const fn abi_version() -> u32 {

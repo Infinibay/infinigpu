@@ -73,10 +73,12 @@ mod layout_asserts {
     // entry-name strings follow it in the payload (variable length).
     const _: () = assert!(size_of::<ForwardedDrawTail>() == 24);
     const _: () = assert!(align_of::<ForwardedDrawTail>() == 4);
-    // ForwardedCmdListTail (vk_op::FORWARDED_CMDLIST): 12×u32 = 48, 4-byte aligned. Its trailing
-    // VertexAttrWire[] / DrawCmdWire[] arrays are 4-multiples so they stay 4-aligned after the tail.
-    const _: () = assert!(size_of::<ForwardedCmdListTail>() == 48);
+    // ForwardedCmdListTail (vk_op::FORWARDED_CMDLIST): 13×u32 = 52, 4-byte aligned (ABI 0.9 added
+    // push_const_len). Its trailing VertexAttrWire[]/DrawCmdWire[] arrays are 4-multiples so they
+    // stay 4-aligned after the tail.
+    const _: () = assert!(size_of::<ForwardedCmdListTail>() == 52);
     const _: () = assert!(align_of::<ForwardedCmdListTail>() == 4);
+    const _: () = assert!(offset_of!(ForwardedCmdListTail, push_const_len) == 48);
     const _: () = assert!(size_of::<VertexAttrWire>() == 12);
     const _: () = assert!(align_of::<VertexAttrWire>() == 4);
     const _: () = assert!(size_of::<DrawCmdWire>() == 32);
@@ -119,7 +121,7 @@ mod tests {
             abi_version(),
             (u32::from(ABI_MAJOR) << 16) | u32::from(ABI_MINOR)
         );
-        assert_eq!(abi_version(), 0x0000_0008);
+        assert_eq!(abi_version(), 0x0000_0009);
     }
 
     #[test]

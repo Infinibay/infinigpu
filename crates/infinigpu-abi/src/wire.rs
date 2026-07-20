@@ -490,13 +490,15 @@ pub struct ForwardedDrawTail {
 ///   7. vertex entry-point name — `vertex_entry_len` bytes (incl. trailing NUL),
 ///   8. fragment entry-point name — `fragment_entry_len` bytes (incl. trailing NUL).
 /// Sections 1–4 are all 4-byte-multiples so each stays 4-aligned relative to the tail (the tail is
-/// 12×u32 = 48 B); the arbitrary-length byte blobs (5–8) come last, read as raw bytes so their odd
-/// lengths never misalign a fixed-layout array. Every length is guest-controlled and MUST be
-/// bounds-checked against the actual payload length before use (fail-closed).
+/// 13×u32 = 52 B); the arbitrary-length byte blobs (5–9) come last, read as raw bytes so their odd
+/// lengths never misalign a fixed-layout array. Section 9 is `push_const_len` bytes of push-constant
+/// data (a transform block, ABI 0.9), appended after the two entry names. Every length is
+/// guest-controlled and MUST be bounds-checked against the actual payload length before use
+/// (fail-closed).
 ///
 /// `vertex_stride == 0` means "no vertex buffer" (bufferless, like [`ForwardedDrawTail`] — the
 /// shader synthesizes geometry); otherwise binding 0 has that stride and the `attr_count`
-/// attributes describe it. 48 bytes, 4-byte aligned.
+/// attributes describe it. 52 bytes, 4-byte aligned.
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct ForwardedCmdListTail {
@@ -527,6 +529,12 @@ pub struct ForwardedCmdListTail {
     /// this field was zero-`_reserved` in ABI 0.8's first cut). A host adds a depth attachment iff
     /// `TEST | WRITE` is set.
     pub depth_flags: u32,
+    /// Byte length of the push-constant block (ABI 0.9) — section 9, appended after the fragment
+    /// entry name. `0` ⇒ no push constants. The host builds a pipeline-layout push-constant range
+    /// (VERTEX|FRAGMENT, offset 0, this size) and `cmd_push_constants` these bytes before the draws.
+    /// Carries a shader's transform block (an MVP matrix); bounded ≤ the device's
+    /// `maxPushConstantsSize` host-side.
+    pub push_const_len: u32,
 }
 
 /// One vertex attribute in a [`ForwardedCmdListTail`] (follows the tail). Describes one input the

@@ -77,6 +77,8 @@ unsafe extern "C" {
         index_type: u32,
         topology: u32,
         depth_flags: u32,
+        push_const: *const u8,
+        push_const_len: u32,
         draws: *const u8,
         draw_count: u32,
     ) -> usize;
@@ -103,6 +105,7 @@ pub fn encode_forwarded_cmdlist(
     index_u32: bool,
     topology: u32,
     depth_flags: u32,
+    push_const: &[u8],
     draws: &[infinigpu_abi::wire::DrawCmdWire],
 ) -> Vec<u8> {
     let cap = 128
@@ -112,6 +115,7 @@ pub fn encode_forwarded_cmdlist(
         + draws.len() * 32
         + vertex_data.len()
         + index_data.len()
+        + push_const.len()
         + vertex_entry.to_bytes_with_nul().len()
         + fragment_entry.to_bytes_with_nul().len();
     let mut out = vec![0u8; cap];
@@ -139,6 +143,8 @@ pub fn encode_forwarded_cmdlist(
             if index_u32 { 1 } else { 0 },
             topology,
             depth_flags,
+            push_const.as_ptr(),
+            push_const.len() as u32,
             draws.as_ptr() as *const u8,
             draws.len() as u32,
         )

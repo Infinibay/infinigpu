@@ -167,6 +167,10 @@ pub struct Geometry<'a> {
     pub draws: &'a [DrawCmd],
     /// Depth-test state (Phase-2d); `None` ⇒ no depth buffer (2D / painter's order).
     pub depth: Option<DepthState>,
+    /// Push-constant bytes (Phase-2c) — a transform block (e.g. an MVP `mat4`) the shaders read via
+    /// `var<push_constant>` / `layout(push_constant)`. Empty ⇒ an empty pipeline layout (no
+    /// transform, raw NDC). Applied to the VERTEX|FRAGMENT stages at offset 0 before the draws.
+    pub push_constants: &'a [u8],
 }
 
 /// Wire `vk_topology` u32 → `VkPrimitiveTopology`. Unknown values fall back to a triangle list
@@ -593,6 +597,9 @@ struct PipelineKey {
     /// Phase-2d depth-stencil state packed as `attachment | test<<1 | write<<2 | compare<<4`; `0`
     /// (no depth attachment) for the built-in / 2D paths, so their key is unchanged.
     depth_key: u32,
+    /// Phase-2c push-constant block size (bytes); `0` ⇒ an empty pipeline layout. The layout (hence
+    /// the pipeline) differs by this, so it is part of the key.
+    pc_size: u32,
 }
 
 /// Pack a `ForwardedDraw`'s depth state into the [`PipelineKey`] `depth_key` field. Returns
@@ -605,6 +612,15 @@ fn depth_key_of(draw: &ForwardedDraw) -> (bool, u32) {
         }
         _ => (false, 0),
     }
+}
+
+/// Byte size of a draw's push-constant block (Phase-2c); `0` when there are none. The pipeline layout
+/// carries a matching push-constant range, so this is part of the [`PipelineKey`].
+fn push_const_size_of(draw: &ForwardedDraw) -> u32 {
+    draw.geometry
+        .as_ref()
+        .map(|g| g.push_constants.len() as u32)
+        .unwrap_or(0)
 }
 
 /// Content hash of a [`ForwardedDraw`]'s vertex-input layout (binding stride + attributes), folded
@@ -1127,8 +1143,18 @@ impl HostGpu {
         cache: vk::PipelineCache,
     ) -> R<(vk::PipelineLayout, vk::Pipeline)> {
         let dev = &self.device;
-        let layout =
-            unsafe { dev.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)? };
+        // Phase-2c: a push-constant range (VERTEX|FRAGMENT, offset 0) when the mesh carries a
+        // transform block, else an empty layout (the built-in / no-transform path, unchanged).
+        let pc_size = push_const_size_of(draw);
+        let pc_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(pc_size)];
+        let mut layout_ci = vk::PipelineLayoutCreateInfo::default();
+        if pc_size > 0 {
+            layout_ci = layout_ci.push_constant_ranges(&pc_ranges);
+        }
+        let layout = unsafe { dev.create_pipeline_layout(&layout_ci, None)? };
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -1235,7 +1261,7 @@ impl HostGpu {
         sc: &mut RenderScratch,
         draw: &ForwardedDraw,
         format: vk::Format,
-    ) -> R<(vk::RenderPass, vk::Pipeline)> {
+    ) -> R<(vk::RenderPass, vk::Pipeline, vk::PipelineLayout)> {
         let dev = &self.device;
         let topology = map_topology(draw.topology);
         let (with_depth, depth_key) = depth_key_of(draw);
@@ -1261,7 +1287,7 @@ impl HostGpu {
                 self.build_pipeline(rp, draw, topology, vs, fs, vk::PipelineCache::null())?;
             sc.layout = layout;
             sc.pipeline = pipe;
-            return Ok((rp, pipe));
+            return Ok((rp, pipe, layout));
         }
 
         let vs_hash = hash_spirv(draw.vertex_spirv);
@@ -1273,6 +1299,7 @@ impl HostGpu {
             format: format.as_raw(),
             vinput_hash: hash_vinput(draw),
             depth_key,
+            pc_size: push_const_size_of(draw),
         };
         let mut cache = self.obj_cache.lock().unwrap_or_else(|e| e.into_inner());
         // Fail-closed bound before inserting anything new.
@@ -1295,7 +1322,7 @@ impl HostGpu {
         };
         if let Some(cp) = cache.pipelines.get(&key).copied() {
             cache.hits += 1;
-            return Ok((rp, cp.pipeline));
+            return Ok((rp, cp.pipeline, cp.layout));
         }
         // Resolve shader modules, tracking which we create fresh so a failed pipeline build (e.g. a
         // hostile bad entry point) caches nothing and frees exactly the modules we just made.
@@ -1342,7 +1369,7 @@ impl HostGpu {
                 }
                 cache.misses += 1;
                 cache.pipelines.insert(key, CachedPipeline { pipeline: pipe, layout });
-                Ok((rp, pipe))
+                Ok((rp, pipe, layout))
             }
             Err(e) => {
                 // Cache nothing; free the modules we just created (cached ones stay). When both are
@@ -2068,7 +2095,7 @@ impl HostGpu {
         let bd = self.breakdown.as_ref();
         let t0 = bd.map(|_| Instant::now());
         let mut throwaway = RenderScratch::new(dev);
-        let (render_pass, pipeline) = self.pipeline_for(&mut throwaway, draw, FORMAT)?;
+        let (render_pass, pipeline, layout) = self.pipeline_for(&mut throwaway, draw, FORMAT)?;
         // Phase-2d: a depth-testing mesh needs a scratch whose framebuffer has a depth attachment
         // matching the render pass. Key the scratch by depth so the two variants never collide.
         let (with_depth, _) = depth_key_of(draw);
@@ -2103,6 +2130,7 @@ impl HostGpu {
             ss,
             render_pass,
             pipeline,
+            layout,
             width,
             height,
             bg,
@@ -2272,6 +2300,7 @@ impl HostGpu {
         ss: &SizedScratch,
         render_pass: vk::RenderPass,
         pipeline: vk::Pipeline,
+        layout: vk::PipelineLayout,
         width: u32,
         height: u32,
         bg: [f32; 4],
@@ -2309,6 +2338,18 @@ impl HostGpu {
                 vk::SubpassContents::INLINE,
             );
             dev.cmd_bind_pipeline(ss.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            // Phase-2c: push the transform block (if any) before the draws. The layout's push-const
+            // range (built in build_pipeline) matches these bytes at offset 0, VERTEX|FRAGMENT.
+            let pc = draw.geometry.as_ref().map(|g| g.push_constants).unwrap_or(&[]);
+            if !pc.is_empty() {
+                dev.cmd_push_constants(
+                    ss.cmd,
+                    layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    pc,
+                );
+            }
             // Scissor is full-frame for every draw; the per-draw viewport (below) is what places
             // geometry, and a full-frame scissor never clips it (geometry stays inside its viewport).
             dev.cmd_set_scissor(
@@ -2501,7 +2542,7 @@ impl HostGpu {
         let key = (guest_ptr as usize, size);
 
         let mut throwaway = RenderScratch::new(&self.device);
-        let (render_pass, pipeline) = self.pipeline_for(&mut throwaway, draw, FORMAT)?;
+        let (render_pass, pipeline, layout) = self.pipeline_for(&mut throwaway, draw, FORMAT)?;
 
         // Import (cached) — do it first so a failure returns before we touch the render scratch.
         let dst = {
@@ -2532,7 +2573,7 @@ impl HostGpu {
         }
         let ss = cache.get(&sk).expect("just inserted above");
 
-        self.record_forwarded_frame(ss, render_pass, pipeline, width, height, bg, draw, None, dst)?;
+        self.record_forwarded_frame(ss, render_pass, pipeline, layout, width, height, bg, draw, None, dst)?;
         self.device.reset_fences(&[ss.fence])?;
         let cmds = [ss.cmd];
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
@@ -2820,7 +2861,7 @@ impl HostGpu {
 
         // ---- render pass + graphics pipeline (Fix A: memoized across submits when caching is
         // enabled; the pipeline uses dynamic viewport+scissor so one entry serves every size) ----
-        let (render_pass, pipeline) = self.pipeline_for(&mut sc, draw, FORMAT)?;
+        let (render_pass, pipeline, _layout) = self.pipeline_for(&mut sc, draw, FORMAT)?;
 
         // ---- framebuffer (per-frame; binds this frame's view to the render pass) ----
         let views = [view];
@@ -3458,7 +3499,9 @@ mod tests {
         let module = naga::front::wgsl::parse_str(src).expect("wgsl parse");
         let info = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::empty(),
+            // IMMEDIATES = naga's name for push constants (`var<immediate>`); harmless for shaders
+            // that don't use them, required for the Phase-2c transform test.
+            naga::valid::Capabilities::IMMEDIATES,
         )
         .validate(&module)
         .expect("wgsl validate");
@@ -3554,6 +3597,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 index_u32: false,
                 draws: &draws,
                 depth: None,
+                push_constants: &[],
             }),
         };
         let (w, h) = (256u32, 256u32);
@@ -3667,6 +3711,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 index_u32: false,
                 draws: &draws,
                 depth: None,
+                push_constants: &[],
             }),
         };
         let bg = [0.0, 0.0, 0.0, 1.0];
@@ -3752,6 +3797,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     index_u32: false,
                     draws: &draws,
                     depth,
+                    push_constants: &[],
                 }),
             };
             gpu.render_forwarded(w, h, bg, &draw).expect("depth render").pixel(w / 2, h / 2)
@@ -3774,5 +3820,121 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
             "with depth the nearer triangle must win (red), got {with_depth:?}"
         );
         eprintln!("forwarded_depth_test_resolves_occlusion: OK (no_depth={no_depth:?} with_depth={with_depth:?})");
+    }
+
+    /// Phase-2c: a push-constant transform (an MVP `mat4`) actually moves geometry. A small triangle
+    /// sits at the NDC origin; the vertex shader multiplies its position by a push-constant matrix.
+    /// With the IDENTITY matrix it renders at the centre; with a translation `(+0.5, +0.5)` it moves
+    /// to the lower-right quadrant. Asserting the lit region FOLLOWS the matrix (centre lit ↔ quadrant
+    /// bg, and vice-versa) proves the pipeline-layout push-const range, `cmd_push_constants`, and the
+    /// column-major `mat4` layout all work — the gate that lets a real app use a camera/model transform
+    /// instead of raw NDC.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_push_constant_transform_moves_geometry() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        // Vertex shader transforms pos(vec2) by a push-constant mat4 (naga: var<immediate>).
+        let vs = compile_wgsl(
+            "struct PC { mvp: mat4x4<f32> };\n\
+             var<immediate> pc: PC;\n\
+             struct VOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };\n\
+             @vertex fn main(@location(0) p: vec2<f32>, @location(1) c: vec3<f32>) -> VOut {\n\
+               return VOut(pc.mvp * vec4<f32>(p, 0.0, 1.0), c);\n}",
+            naga::ShaderStage::Vertex,
+        );
+        let fs = compile_wgsl(MESH_FS, naga::ShaderStage::Fragment);
+        // Small triangle around the origin (spans ~±0.25), pure white so any lit pixel is easy to find.
+        let verts = pack_verts(&[
+            [-0.25, 0.25, 1.0, 1.0, 1.0],
+            [0.25, 0.25, 1.0, 1.0, 1.0],
+            [0.0, -0.25, 1.0, 1.0, 1.0],
+        ]);
+        let attrs = mesh_attrs();
+        let draws = [DrawCmd { count: 3, instance_count: 1, first: 0, vertex_offset: 0, viewport: [0.0; 4] }];
+        // Column-major mat4: columns are contiguous. Translation puts (tx,ty,tz) in the 4th column.
+        let mat = |tx: f32, ty: f32| -> [u8; 64] {
+            let m: [f32; 16] = [
+                1.0, 0.0, 0.0, 0.0, // col 0
+                0.0, 1.0, 0.0, 0.0, // col 1
+                0.0, 0.0, 1.0, 0.0, // col 2
+                tx, ty, 0.0, 1.0, // col 3 (translation)
+            ];
+            let mut b = [0u8; 64];
+            for (i, f) in m.iter().enumerate() {
+                b[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+            }
+            b
+        };
+        let (w, h) = (128u32, 128u32);
+        let bg = [0.0, 0.0, 0.0, 1.0];
+        // Centroid (mean x, mean y) of the lit pixels + the lit count — orientation-agnostic (x is
+        // unambiguous; the y-axis handedness of the readback is not, so we assert x precisely and only
+        // that y moved by roughly the expected magnitude).
+        let centroid = |f: &Frame| -> (f32, f32, u32) {
+            let (mut sx, mut sy, mut n) = (0u64, 0u64, 0u32);
+            for y in 0..h {
+                for x in 0..w {
+                    let p = f.pixel(x, y);
+                    if p[0] as u16 + p[1] as u16 + p[2] as u16 > 200 {
+                        sx += x as u64;
+                        sy += y as u64;
+                        n += 1;
+                    }
+                }
+            }
+            assert!(n > 30, "transform render must produce a visible triangle (lit={n})");
+            (sx as f32 / n as f32, sy as f32 / n as f32, n)
+        };
+        let render = |m: &[u8]| {
+            let draw = ForwardedDraw {
+                vertex_spirv: &vs,
+                vertex_entry: c"main",
+                fragment_spirv: &fs,
+                fragment_entry: c"main",
+                vertex_count: 0,
+                topology: 0,
+                geometry: Some(Geometry {
+                    vertex_data: &verts,
+                    vertex_stride: 20,
+                    attrs: &attrs,
+                    index_data: &[],
+                    index_u32: false,
+                    draws: &draws,
+                    depth: None,
+                    push_constants: m,
+                }),
+            };
+            gpu.render_forwarded(w, h, bg, &draw).expect("transform render")
+        };
+
+        // Identity: the triangle sits at the centre of the frame.
+        let (ix, iy, _) = centroid(&render(&mat(0.0, 0.0)));
+        assert!(
+            (ix - w as f32 / 2.0).abs() < 8.0 && (iy - h as f32 / 2.0).abs() < 8.0,
+            "identity transform must render at the centre, got ({ix:.1},{iy:.1})"
+        );
+        // Translate (+0.5,+0.5): NDC x=0.5 → pixel 0.75·w. The centroid must shift right by ~0.25·w,
+        // and y must move by a comparable magnitude (direction depends on readback handedness).
+        let (tx, ty, _) = centroid(&render(&mat(0.5, 0.5)));
+        let dx = tx - ix;
+        let dy = (ty - iy).abs();
+        assert!(
+            (dx - w as f32 * 0.25).abs() < 12.0,
+            "translation must shift the triangle right by ~0.25·w ({} px), got dx={dx:.1}",
+            w as f32 * 0.25
+        );
+        assert!(
+            (dy - h as f32 * 0.25).abs() < 12.0,
+            "translation must shift the triangle vertically by ~0.25·h, got dy={dy:.1}"
+        );
+        eprintln!(
+            "forwarded_push_constant_transform_moves_geometry: OK (identity@({ix:.0},{iy:.0}) → translate shifted dx={dx:.0} dy={dy:.0})"
+        );
     }
 }
