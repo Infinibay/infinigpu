@@ -314,6 +314,25 @@ infinigpu_format_supported(VkFormat format)
    }
 }
 
+/* Formats usable as a vertex-buffer attribute (the wire's `vk_vformat` set). An app / validation
+ * layer checks bufferFeatures & VERTEX_BUFFER_BIT before building a vertex-input state, so these
+ * must be advertised or a real mesh pipeline is rejected. */
+static bool
+infinigpu_vertex_format_supported(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_R32_SFLOAT:
+   case VK_FORMAT_R32G32_SFLOAT:
+   case VK_FORMAT_R32G32B32_SFLOAT:
+   case VK_FORMAT_R32G32B32A32_SFLOAT:
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R32_UINT:
+      return true;
+   default:
+      return false;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 infinigpu_GetPhysicalDeviceFormatProperties2(
    VkPhysicalDevice physicalDevice,
@@ -325,7 +344,7 @@ infinigpu_GetPhysicalDeviceFormatProperties2(
 
    if (infinigpu_format_supported(format)) {
       /* A linear image is both the render target (host DMA-writes it) and the
-       * copy/readback source. */
+       * copy/readback/sampled source. */
       const VkFormatFeatureFlags feats =
          VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
          VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
@@ -336,6 +355,8 @@ infinigpu_GetPhysicalDeviceFormatProperties2(
       p->linearTilingFeatures = feats;
       p->optimalTilingFeatures = feats;
    }
+   if (infinigpu_vertex_format_supported(format))
+      p->bufferFeatures |= VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

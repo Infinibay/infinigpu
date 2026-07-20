@@ -155,10 +155,36 @@ infinigpu_run_copy(const struct infinigpu_pending_copy *pc)
              src + (uint64_t)y * img->row_pitch, (size_t)w * bpp);
 }
 
-/* Phase-2b: forward a real mesh (bound vertex/index buffers + multi-draw) via the command-list
+/* Execute one deferred buffer->image copy (texture upload) — the mirror of infinigpu_run_copy. Both
+ * memories are host-mapped, so this is a CPU blit into the image's LINEAR-packed rows. */
+static void
+infinigpu_run_upload(const struct infinigpu_pending_upload *pu)
+{
+   struct infinigpu_buffer *buf = pu->src;
+   struct infinigpu_image *img = pu->dst;
+
+   if (!buf || !buf->mem || !buf->mem->map || !img || !img->mem || !img->mem->map)
+      return;
+
+   const uint32_t bpp = vk_format_get_blocksize(img->vk.format);
+   const uint32_t rows = pu->image_extent.height;
+   const uint32_t w = pu->image_extent.width;
+   const uint32_t src_row_texels = pu->buffer_row_length ? pu->buffer_row_length : w;
+
+   const char *src = (const char *)buf->mem->map + buf->offset + pu->buffer_offset;
+   char *dst = (char *)img->mem->map + img->mem_offset +
+               (uint64_t)pu->image_offset.y * img->row_pitch +
+               (uint64_t)pu->image_offset.x * bpp;
+
+   for (uint32_t y = 0; y < rows; y++)
+      memcpy(dst + (uint64_t)y * img->row_pitch,
+             src + (uint64_t)y * src_row_texels * bpp, (size_t)w * bpp);
+}
+
+/* Phase-2b/2c: forward a real mesh (bound vertex/index buffers + multi-draw) via the command-list
  * encoder. The bound pipeline captured a non-zero vertex stride, so the app reads a vertex buffer;
  * we read its host-mapped bytes (whole vertices from the bound offset to the buffer end), build the
- * attr/draw wire arrays, and encode. Textures/UBO descriptors are a follow-up (passed empty). */
+ * attr/draw wire arrays, and encode — plus a bound descriptor set's sampled texture (Phase-2c). */
 static VkResult
 infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buffer *cmd,
                          struct infinigpu_pipeline *p,
@@ -230,11 +256,43 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       draws[i].vp_h = cmd->draws[i].viewport[3];
    }
 
+   /* Phase-2c texture: if a descriptor set with a sampled image is bound, forward its RGBA8 pixels.
+    * The ICD's images are LINEAR + tightly packed (row_pitch == width*bpp), so the pixels read
+    * contiguously from the image's host-mapped memory. Only 4-bpp (RGBA8-class) images are
+    * forwarded — the host samples them as R8G8B8A8; other formats are skipped fail-safe (untextured
+    * rather than colour-scrambled). */
+   struct TextureDescWire texdesc;
+   const uint8_t *texpix = NULL;
+   uint32_t texpix_len = 0;
+   uint32_t tex_count = 0;
+   if (cmd->bound_desc_set && cmd->bound_desc_set->image) {
+      struct infinigpu_image *ti = cmd->bound_desc_set->image->image;
+      if (ti && ti->mem && ti->mem->map && ti->row_pitch == ti->vk.extent.width * 4u) {
+         uint32_t tw = ti->vk.extent.width;
+         uint32_t th = ti->vk.extent.height;
+         texpix = (const uint8_t *)ti->mem->map + ti->mem_offset;
+         texpix_len = tw * th * 4u;
+         texdesc.width = tw;
+         texdesc.height = th;
+         texdesc.data_len = texpix_len;
+         texdesc.sampler_flags = 0;
+         struct infinigpu_sampler *smp = cmd->bound_desc_set->sampler;
+         if (smp) {
+            if (smp->linear)
+               texdesc.sampler_flags |= INFINIGPU_SAMPLER_LINEAR;
+            if (smp->repeat)
+               texdesc.sampler_flags |= INFINIGPU_SAMPLER_REPEAT;
+         }
+         tex_count = 1;
+      }
+   }
+
    const size_t cap = 256 + vs->spirv_size + fs->spirv_size +
                       strlen(vs->entrypoint) + 1 + strlen(fs->entrypoint) + 1 +
                       (size_t)p->attr_count * sizeof(struct VertexAttrWire) +
                       (size_t)cmd->draw_count * sizeof(struct DrawCmdWire) +
-                      vlen + ilen + cmd->push_const_len;
+                      (size_t)tex_count * sizeof(struct TextureDescWire) +
+                      vlen + ilen + cmd->push_const_len + texpix_len;
    uint8_t *payload = malloc(cap);
    if (!payload) {
       free(draws);
@@ -251,7 +309,7 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       topo, p->depth_flags,
       cmd->push_const, cmd->push_const_len,
       draws, cmd->draw_count,
-      NULL, 0, NULL, 0);
+      tex_count ? &texdesc : NULL, tex_count, texpix, texpix_len);
    free(draws);
    if (n == 0) {
       free(payload);
@@ -273,6 +331,11 @@ infinigpu_replay_cmd_buffer(struct infinigpu_device *dev,
                             struct infinigpu_cmd_buffer *cmd)
 {
    int drm_fd = dev->physical_device->drm_fd;
+
+   /* Texture uploads first, so a staged sampled texture is in the image's memory before any draw
+    * (in this or a later command buffer) reads it. */
+   for (uint32_t u = 0; u < cmd->upload_count; u++)
+      infinigpu_run_upload(&cmd->uploads[u]);
 
    if (cmd->draw_count > 0 && cmd->color_att && cmd->bound_pipeline) {
       struct infinigpu_pipeline *p = cmd->bound_pipeline;

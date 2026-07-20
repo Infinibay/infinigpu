@@ -34,6 +34,8 @@ infinigpu_cmd_reset_state(struct infinigpu_cmd_buffer *cmd)
    cmd->index_type = INFINIGPU_INDEX_TYPE_U16;
    cmd->has_dyn_viewport = false;
    cmd->push_const_len = 0;
+   cmd->bound_desc_set = NULL;
+   cmd->upload_count = 0;
    cmd->copy_count = 0;
 }
 
@@ -251,6 +253,26 @@ infinigpu_CmdSetViewportWithCount(VkCommandBuffer commandBuffer, uint32_t viewpo
 }
 
 VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
+                               VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout,
+                               uint32_t firstSet, uint32_t descriptorSetCount,
+                               const VkDescriptorSet *pDescriptorSets,
+                               uint32_t dynamicOffsetCount, const uint32_t *pDynamicOffsets)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   if (pipelineBindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS)
+      return;
+   /* The wire forwards a single texture, so record the first bound set that carries a sampled
+    * image. Later sets with an image override earlier ones (last-bound wins, like a real driver). */
+   for (uint32_t i = 0; i < descriptorSetCount; i++) {
+      struct infinigpu_descriptor_set *set =
+         infinigpu_descriptor_set_from_handle(pDescriptorSets[i]);
+      if (set && set->image)
+         cmd->bound_desc_set = set;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
 infinigpu_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
                            VkShaderStageFlags stageFlags, uint32_t offset, uint32_t size,
                            const void *pValues)
@@ -299,5 +321,31 @@ infinigpu_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
       pc->buffer_row_length = r->bufferRowLength;
       pc->image_offset = r->imageOffset;
       pc->image_extent = r->imageExtent;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
+                               const VkCopyBufferToImageInfo2 *pInfo)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   struct infinigpu_buffer *src = infinigpu_buffer_from_handle(pInfo->srcBuffer);
+   struct infinigpu_image *dst = infinigpu_image_from_handle(pInfo->dstImage);
+
+   /* Defer each region to submit; uploads run BEFORE the forwarded draw so a staged texture is in
+    * the image's LINEAR-packed memory when the draw samples it. */
+   for (uint32_t i = 0; i < pInfo->regionCount; i++) {
+      if (cmd->upload_count >= INFINIGPU_MAX_UPLOADS) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return;
+      }
+      const VkBufferImageCopy2 *r = &pInfo->pRegions[i];
+      struct infinigpu_pending_upload *pu = &cmd->uploads[cmd->upload_count++];
+      pu->src = src;
+      pu->dst = dst;
+      pu->buffer_offset = r->bufferOffset;
+      pu->buffer_row_length = r->bufferRowLength;
+      pu->image_offset = r->imageOffset;
+      pu->image_extent = r->imageExtent;
    }
 }

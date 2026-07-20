@@ -18,10 +18,12 @@
 #include <stdint.h>
 
 #include "c11/threads.h"
+#include "util/list.h"
 
 #include "vk_buffer.h"
 #include "vk_command_buffer.h"
 #include "vk_command_pool.h"
+#include "vk_descriptor_set_layout.h"
 #include "vk_device.h"
 #include "vk_device_memory.h"
 #include "vk_image.h"
@@ -29,6 +31,7 @@
 #include "vk_physical_device.h"
 #include "vk_pipeline_layout.h"
 #include "vk_queue.h"
+#include "vk_sampler.h"
 #include "vk_shader_module.h"
 #include "vk_sync.h"
 #include "vk_sync_timeline.h"
@@ -149,12 +152,54 @@ struct infinigpu_pipeline_cache {
    struct vk_object_base base;
 };
 
+/* ---- Descriptors (Phase-2c textures/UBO) — the guest half of forwarded textures ----
+ * The ICD doesn't run shaders, so a descriptor set is just a capture of the resources bound to it
+ * (a sampled image + sampler for now). At submit, the bound set's image RGBA8 pixels are read from
+ * its host-mapped memory and forwarded in the command list; the host binds them through its own
+ * descriptor set. Descriptor-set LAYOUTs (runtime `vk_descriptor_set_layout`) and samplers carry no
+ * driver state beyond the sampler's filter/address mode. */
+struct infinigpu_sampler {
+   struct vk_sampler vk;   /* MUST be first (runtime base) */
+   bool linear;            /* magFilter == VK_FILTER_LINEAR */
+   bool repeat;            /* addressModeU == VK_SAMPLER_ADDRESS_MODE_REPEAT */
+};
+
+struct infinigpu_descriptor_set_layout {
+   struct vk_descriptor_set_layout vk;  /* MUST be first (runtime base, ref-counted) */
+};
+
+struct infinigpu_descriptor_pool {
+   struct vk_object_base base;
+   struct list_head sets;   /* infinigpu_descriptor_set::link — freed on reset/destroy */
+};
+
+struct infinigpu_descriptor_set {
+   struct vk_object_base base;
+   struct list_head link;                 /* in its pool's `sets` list */
+   struct infinigpu_descriptor_pool *pool;
+   struct infinigpu_image_view *image;    /* sampled image bound here (NULL ⇒ none) */
+   struct infinigpu_sampler *sampler;     /* sampler bound here (NULL ⇒ none) */
+};
+
 /* A deferred image->buffer copy, executed at submit AFTER the draw so the host
  * writeback is already in the image's memory. Supports the common readback case. */
 #define INFINIGPU_MAX_COPIES 4
 struct infinigpu_pending_copy {
    struct infinigpu_image *src;
    struct infinigpu_buffer *dst;
+   uint64_t buffer_offset;
+   uint32_t buffer_row_length;  /* in texels; 0 => tightly packed (== image width) */
+   VkOffset3D image_offset;
+   VkExtent3D image_extent;
+};
+
+/* A deferred buffer->image copy (texture UPLOAD), executed at submit BEFORE the draw so a sampled
+ * texture staged in a buffer is present in the image's (LINEAR-packed) memory when the forwarded
+ * draw reads it. The mirror of infinigpu_pending_copy. */
+#define INFINIGPU_MAX_UPLOADS 8
+struct infinigpu_pending_upload {
+   struct infinigpu_buffer *src;
+   struct infinigpu_image *dst;
    uint64_t buffer_offset;
    uint32_t buffer_row_length;  /* in texels; 0 => tightly packed (== image width) */
    VkOffset3D image_offset;
@@ -197,6 +242,13 @@ struct infinigpu_cmd_buffer {
    uint32_t push_const_len;                      /* highest push-constant byte written */
    uint8_t push_const[INFINIGPU_MAX_PUSH_CONST]; /* CmdPushConstants payload (offset-placed) */
 
+   /* Phase-2c: the bound descriptor set carrying a sampled texture (first one with an image). */
+   struct infinigpu_descriptor_set *bound_desc_set;
+
+   /* Texture uploads (buffer->image), run BEFORE the forwarded draw. */
+   struct infinigpu_pending_upload uploads[INFINIGPU_MAX_UPLOADS];
+   uint32_t upload_count;
+
    struct infinigpu_pending_copy copies[INFINIGPU_MAX_COPIES];
    uint32_t copy_count;
 };
@@ -233,6 +285,12 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(infinigpu_pipeline, base, VkPipeline,
                                VK_OBJECT_TYPE_PIPELINE)
 VK_DEFINE_NONDISP_HANDLE_CASTS(infinigpu_pipeline_cache, base, VkPipelineCache,
                                VK_OBJECT_TYPE_PIPELINE_CACHE)
+VK_DEFINE_NONDISP_HANDLE_CASTS(infinigpu_sampler, vk.base, VkSampler,
+                               VK_OBJECT_TYPE_SAMPLER)
+VK_DEFINE_NONDISP_HANDLE_CASTS(infinigpu_descriptor_pool, base, VkDescriptorPool,
+                               VK_OBJECT_TYPE_DESCRIPTOR_POOL)
+VK_DEFINE_NONDISP_HANDLE_CASTS(infinigpu_descriptor_set, base, VkDescriptorSet,
+                               VK_OBJECT_TYPE_DESCRIPTOR_SET)
 
 static inline struct infinigpu_sync *
 infinigpu_sync_as(struct vk_sync *sync)
