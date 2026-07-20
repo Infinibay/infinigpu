@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 Infinibay
+ * Copyright 2026 Infinibay
  * SPDX-License-Identifier: MIT
  *
  * Descriptors + samplers (Phase-2c textures/UBO, guest half). The ICD never runs
