@@ -117,9 +117,26 @@ fixes the correctness landmines (B1) they expose.
   in a real guest (KMS page-flip / an in-guest compositor) is owner-validated.** Follow-up: a render-target-
   format field so a BGRA/sRGB swapchain presents with correct channel order / gamma (today the host renders
   R8G8B8A8; the recon found this is the #3 gap).
-- **Next up:** SSBO (storage buffers) + multiple descriptor sets; MSAA
-  (2d-A5 multisample); Phase 2a (format A6 / loadOp A8) — now doubly relevant since a swapchain is BGRA/sRGB;
-  EDS3 dynamic blend + per-draw state if a real game needs them. Then the owner runtime render-validation in a
+- **Phase-2c SSBO (read-only storage buffer) — DONE end-to-end, A5000-verified.** The #2 game gate after WSI:
+  a DXVK-translated shader that reads a storage buffer (a D3D structured/raw SRV, a skinning-matrix palette,
+  per-instance data) now gets real bytes — the guest ICD used to silently DROP `STORAGE_BUFFER` descriptor
+  writes. Forwarded via two new `ForwardedCmdListTail` fields (ABI 0.13, tail 72→80 B): `ssbo_len` +
+  `ssbo_binding`, with the SSBO byte blob AFTER the UBO bytes and BEFORE the terminal texture pixels. The
+  host binds a `STORAGE_BUFFER` (VERTEX|FRAGMENT) composing with the UBO + textures in ONE dynamic set-0
+  layout; cap `MAX_SSBO_BYTES` = 16 MiB (not the UBO's 64 KiB — `maxStorageBufferRange` ≥ 128 MiB). Device
+  decode is fail-closed (bounds + a THREE-way binding-overlap reject vs the texture range AND the UBO). An
+  exact clone of the UBO thread. **Scope (deliberate):** READ-ONLY (no writeback — the forwarded path has no
+  compute stage, and producer/consumer replay against the same host buffer), SINGLE SSBO (last-write-wins,
+  like single-UBO; a shader with ≥2 SSBOs fails pipeline creation — a clean failure, not garbage), non-dynamic
+  (STORAGE_BUFFER_DYNAMIC dropped). GPU tests on the A5000: `forwarded_storage_only_offsets_geometry` (a
+  `var<storage>` reaches the vertex stage) + `forwarded_uniform_and_storage_compose` (a UNIFORM_BUFFER and a
+  STORAGE_BUFFER — two different descriptor types — coexist in one set). Adversarially reviewed (4 lenses +
+  verify): 0 product defects. DXVK is single-set so this is its actual model; VKD3D-Proton (D3D12) needs
+  bindless/descriptor-indexing — a separate large project, still out of scope.
+- **Next up:** N-SSBO + multiple descriptor SETS (single-SSBO/single-set is the DXVK model; N-SSBO is the
+  8-texture-array clone; multi-set/bindless is the VKD3D tier); MSAA (2d-A5 multisample); Phase 2a (format A6
+  / loadOp A8) — now doubly relevant since a swapchain is BGRA/sRGB (the WSI follow-up); EDS3 dynamic blend +
+  per-draw state if a real game needs them. Then the owner runtime render-validation in a
   real GPU VM (below) — the one link not yet exercised end-to-end.
 
 The rest of this doc is the original design; the per-phase wire/host/test shape it describes is what the landed
@@ -228,7 +245,7 @@ paths. Do this whenever the ABI is bumped for Phase 2b anyway.
 |-------|----------|--------|------|----------|--------|
 | 2a | A6, A8 | S | low | correct colors; overlay passes | todo |
 | 2b | A1, A3, A7, A5-dyn | **L** | med | **any real mesh renders** | **DONE** host/device/wire + guest ICD recording (compile-verified); runtime render-validation pending owner |
-| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) | **push-const + textures + UBO + MULTI-texture DONE end-to-end** (host/wire/device + guest ICD; A5000-verified); SSBO / multi-descriptor-set todo (**next**) |
+| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex/SSBO) | **push-const + textures + UBO + MULTI-texture + SSBO DONE end-to-end** (host/wire/device + guest ICD; A5000-verified); N-SSBO / multi-descriptor-set todo (**next**) |
 | 2d | A4, A5-static | M | med | depth-correct 3D, transparency, MSAA | **A4 depth DONE**; **A5 cull/front-face/blend DONE** (A5000-verified); MSAA todo |
 | 2e | A9 | M | med | async frames (with Fix F) | todo |
 
