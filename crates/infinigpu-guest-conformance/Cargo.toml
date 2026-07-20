@@ -14,6 +14,7 @@ doctest = false
 
 [dependencies]
 infinigpu-device = { path = "../infinigpu-device" }
+infinigpu-abi = { path = "../infinigpu-abi" }
 
 [build-dependencies]
 cc = "1"

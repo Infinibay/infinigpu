@@ -425,3 +425,135 @@ struct ForwardedDrawTail {
    */
   uint32_t fragment_entry_len;
 };
+
+/**
+ * Trailing header for a [`vk_op::FORWARDED_CMDLIST`] draw (Phase-2b command list). Sits
+ * immediately after the fixed [`VulkanWorkload`] and is followed, **in this exact order**, by:
+ *   1. `attr_count` × [`VertexAttrWire`]  (12 B each, 4-aligned),
+ *   2. `draw_count` × [`DrawCmdWire`]     (32 B each, 4-aligned),
+ *   3. vertex-stage SPIR-V — `vertex_spirv_len` bytes (multiple of 4),
+ *   4. fragment-stage SPIR-V — `fragment_spirv_len` bytes,
+ *   5. vertex-buffer data — `vertex_data_len` bytes (arbitrary length),
+ *   6. index-buffer data — `index_data_len` bytes (0 ⇒ non-indexed draws),
+ *   7. vertex entry-point name — `vertex_entry_len` bytes (incl. trailing NUL),
+ *   8. fragment entry-point name — `fragment_entry_len` bytes (incl. trailing NUL).
+ * Sections 1–4 are all 4-byte-multiples so each stays 4-aligned relative to the tail (the tail is
+ * 12×u32 = 48 B); the arbitrary-length byte blobs (5–8) come last, read as raw bytes so their odd
+ * lengths never misalign a fixed-layout array. Every length is guest-controlled and MUST be
+ * bounds-checked against the actual payload length before use (fail-closed).
+ *
+ * `vertex_stride == 0` means "no vertex buffer" (bufferless, like [`ForwardedDrawTail`] — the
+ * shader synthesizes geometry); otherwise binding 0 has that stride and the `attr_count`
+ * attributes describe it. 48 bytes, 4-byte aligned.
+ */
+struct ForwardedCmdListTail {
+  /**
+   * Byte length of the vertex-stage SPIR-V blob.
+   */
+  uint32_t vertex_spirv_len;
+  /**
+   * Byte length of the fragment-stage SPIR-V blob.
+   */
+  uint32_t fragment_spirv_len;
+  /**
+   * Byte length of the vertex entry-point name (incl. trailing NUL).
+   */
+  uint32_t vertex_entry_len;
+  /**
+   * Byte length of the fragment entry-point name (incl. trailing NUL).
+   */
+  uint32_t fragment_entry_len;
+  /**
+   * Bytes per vertex (binding 0 stride); `0` ⇒ bufferless (no vertex buffer bound).
+   */
+  uint32_t vertex_stride;
+  /**
+   * Number of [`VertexAttrWire`]s that follow (0 when bufferless).
+   */
+  uint32_t attr_count;
+  /**
+   * Byte length of the vertex-buffer data blob.
+   */
+  uint32_t vertex_data_len;
+  /**
+   * Byte length of the index-buffer data blob; `0` ⇒ non-indexed draws.
+   */
+  uint32_t index_data_len;
+  /**
+   * [`index_type`] (ignored when `index_data_len == 0`).
+   */
+  uint32_t index_type;
+  /**
+   * Number of [`DrawCmdWire`]s that follow (≥ 1 for anything to render).
+   */
+  uint32_t draw_count;
+  /**
+   * [`vk_topology`] for every draw in the list.
+   */
+  uint32_t topology;
+  /**
+   * Additive headroom (0 today) — carved into future fields with the min(len, size_of) zero-fill
+   * rule, so an older host reads a newer guest's tail without breaking.
+   */
+  uint32_t _reserved;
+};
+
+/**
+ * One vertex attribute in a [`ForwardedCmdListTail`] (follows the tail). Describes one input the
+ * vertex shader reads from binding 0. 12 bytes, 4-aligned.
+ */
+struct VertexAttrWire {
+  /**
+   * `layout(location = N)` in the vertex shader.
+   */
+  uint32_t location;
+  /**
+   * [`vk_vformat`].
+   */
+  uint32_t format;
+  /**
+   * Byte offset of this attribute within one vertex.
+   */
+  uint32_t offset;
+};
+
+/**
+ * One draw command in a [`ForwardedCmdListTail`] (follows the attribute array). Mirrors a guest
+ * `vkCmdDraw`/`vkCmdDrawIndexed`. Whether it is indexed is decided list-wide by
+ * `index_data_len != 0` (a single index buffer serves the list — the common "one mesh, many draws"
+ * shape). 32 bytes, 4-aligned.
+ */
+struct DrawCmdWire {
+  /**
+   * `vertex_count` (non-indexed) or `index_count` (indexed).
+   */
+  uint32_t count;
+  /**
+   * Instance count (`0` is treated as `1` host-side).
+   */
+  uint32_t instance_count;
+  /**
+   * `first_vertex` (non-indexed) or `first_index` (indexed).
+   */
+  uint32_t first;
+  /**
+   * Value added to every index before fetching a vertex (indexed only). **Signed.**
+   */
+  int32_t vertex_offset;
+  /**
+   * Viewport x (pixels).
+   */
+  float vp_x;
+  /**
+   * Viewport y (pixels).
+   */
+  float vp_y;
+  /**
+   * Viewport width (pixels); `0` ⇒ use the full render target.
+   */
+  float vp_w;
+  /**
+   * Viewport height (pixels).
+   */
+  float vp_h;
+};

@@ -49,6 +49,100 @@ unsafe extern "C" {
         vertex_entry: *const std::os::raw::c_char,
         fragment_entry: *const std::os::raw::c_char,
     ) -> usize;
+
+    // The Phase-2b forwarded command-list encoder (a real mesh) — same source file, shared with the
+    // Mesa ICD. attrs/draws are passed as raw bytes (repr(C) wire structs) to avoid re-declaring the
+    // C structs in Rust; the C reads them as VertexAttrWire[]/DrawCmdWire[].
+    #[allow(clippy::too_many_arguments)]
+    fn infinigpu_encode_forwarded_cmdlist(
+        out: *mut u8,
+        cap: usize,
+        width: u32,
+        height: u32,
+        bg: *const f32,
+        scanout_addr: u64,
+        vspirv: *const u32,
+        vspirv_words: u32,
+        fspirv: *const u32,
+        fspirv_words: u32,
+        vertex_entry: *const std::os::raw::c_char,
+        fragment_entry: *const std::os::raw::c_char,
+        vertex_stride: u32,
+        attrs: *const u8,
+        attr_count: u32,
+        vertex_data: *const u8,
+        vertex_data_len: u32,
+        index_data: *const u8,
+        index_data_len: u32,
+        index_type: u32,
+        topology: u32,
+        draws: *const u8,
+        draw_count: u32,
+    ) -> usize;
+}
+
+/// Build a `vk_op::FORWARDED_CMDLIST` SUBMIT_CMD payload (a real mesh) with the exact C encoder the
+/// guest ICD's `driver_submit` uses — proving the Phase-2b guest↔host wire byte-for-byte. `attrs`
+/// and `draws` are the wire structs from `infinigpu_abi`; SPIR-V slices are u32 words; index data
+/// empty ⇒ non-indexed. Panics if the encoder rejects the geometry (degenerate / doesn't fit).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_forwarded_cmdlist(
+    width: u32,
+    height: u32,
+    bg: [f32; 4],
+    scanout_addr: u64,
+    vspirv: &[u32],
+    fspirv: &[u32],
+    vertex_entry: &std::ffi::CStr,
+    fragment_entry: &std::ffi::CStr,
+    vertex_stride: u32,
+    attrs: &[infinigpu_abi::wire::VertexAttrWire],
+    vertex_data: &[u8],
+    index_data: &[u8],
+    index_u32: bool,
+    topology: u32,
+    draws: &[infinigpu_abi::wire::DrawCmdWire],
+) -> Vec<u8> {
+    let cap = 128
+        + vspirv.len() * 4
+        + fspirv.len() * 4
+        + attrs.len() * 12
+        + draws.len() * 32
+        + vertex_data.len()
+        + index_data.len()
+        + vertex_entry.to_bytes_with_nul().len()
+        + fragment_entry.to_bytes_with_nul().len();
+    let mut out = vec![0u8; cap];
+    let n = unsafe {
+        infinigpu_encode_forwarded_cmdlist(
+            out.as_mut_ptr(),
+            out.len(),
+            width,
+            height,
+            bg.as_ptr(),
+            scanout_addr,
+            vspirv.as_ptr(),
+            vspirv.len() as u32,
+            fspirv.as_ptr(),
+            fspirv.len() as u32,
+            vertex_entry.as_ptr(),
+            fragment_entry.as_ptr(),
+            vertex_stride,
+            attrs.as_ptr() as *const u8,
+            attrs.len() as u32,
+            vertex_data.as_ptr(),
+            vertex_data.len() as u32,
+            index_data.as_ptr(),
+            index_data.len() as u32,
+            if index_u32 { 1 } else { 0 },
+            topology,
+            draws.as_ptr() as *const u8,
+            draws.len() as u32,
+        )
+    };
+    assert!(n > 0, "C cmdlist encoder returned 0 (degenerate geometry or did not fit)");
+    out.truncate(n);
+    out
 }
 
 /// Build a `vk_op::FORWARDED` SUBMIT_CMD payload with the C encoder the guest ICD uses — the exact

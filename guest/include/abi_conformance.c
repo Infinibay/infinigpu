@@ -51,4 +51,16 @@ _Static_assert(sizeof(struct VulkanWorkload) == 40, "VulkanWorkload size");
 _Static_assert(offsetof(struct VulkanWorkload, bg) == 16, "VulkanWorkload.bg offset");
 _Static_assert(offsetof(struct VulkanWorkload, scanout_addr) == 32, "VulkanWorkload.scanout_addr offset");
 
+/* ForwardedDrawTail — Phase-1 own-ICD bufferless forwarded draw (ABI 0.6). */
+_Static_assert(sizeof(struct ForwardedDrawTail) == 24, "ForwardedDrawTail size");
+
+/* Phase-2b forwarded command list — real mesh (ABI 0.8). The encoder in infinigpu_forwarded.c
+ * depends on these exact sizes so the trailing sections land where the host decoder reads them. */
+_Static_assert(sizeof(struct ForwardedCmdListTail) == 48, "ForwardedCmdListTail size");
+_Static_assert(offsetof(struct ForwardedCmdListTail, vertex_stride) == 16, "ForwardedCmdListTail.vertex_stride offset");
+_Static_assert(offsetof(struct ForwardedCmdListTail, draw_count) == 36, "ForwardedCmdListTail.draw_count offset");
+_Static_assert(sizeof(struct VertexAttrWire) == 12, "VertexAttrWire size");
+_Static_assert(sizeof(struct DrawCmdWire) == 32, "DrawCmdWire size");
+_Static_assert(offsetof(struct DrawCmdWire, vp_x) == 16, "DrawCmdWire.vp_x offset");
+
 int main(void) { return 0; }

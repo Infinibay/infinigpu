@@ -779,6 +779,7 @@ name = "infinigpu-guest-conformance"
 version = "0.0.0"
 dependencies = [
  "cc",
+ "infinigpu-abi",
  "infinigpu-device",
 ]
 

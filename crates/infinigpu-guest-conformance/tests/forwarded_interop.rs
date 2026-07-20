@@ -6,7 +6,7 @@
 //! fields. Proving it here verifies the guest half of the forwarded wire off-hardware — no guest VM,
 //! before a line of the full Mesa ICD is written. Mirrors the PR4 ring interop (`interop.rs`).
 
-use infinigpu_device::decode_forwarded;
+use infinigpu_device::{decode_forwarded, decode_forwarded_cmdlist};
 use infinigpu_guest_conformance as guest;
 
 const CAP: usize = 64 * 1024 * 1024;
@@ -51,4 +51,70 @@ fn c_encoder_length_prefix_is_exact() {
     // 40 (VulkanWorkload) + 24 (ForwardedDrawTail) + 8 + 8 + 2 ("a\0") + 3 ("bb\0") = 85.
     assert_eq!(payload.len(), 40 + 24 + 8 + 8 + 2 + 3);
     assert!(decode_forwarded(&payload, CAP).is_some(), "exact-length payload decodes");
+}
+
+/// Phase-2b: the **guest** serializes a real mesh (`vk_op::FORWARDED_CMDLIST`) with the C encoder the
+/// Mesa ICD's `driver_submit` uses (`infinigpu_encode_forwarded_cmdlist`); the **host** decodes it
+/// with the tested `decode_forwarded_cmdlist`. Proves the command-list wire — the vertex-input
+/// attributes, the multi-draw array with per-draw viewport + vertex_offset, the vertex/index buffers,
+/// and both SPIR-V blobs — agrees byte-for-byte across C↔Rust, off-hardware, before the Mesa ICD
+/// recording is wired up. A single-byte disagreement in field order or section placement would drop
+/// the decode or scramble a field.
+#[test]
+fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
+    use infinigpu_abi::wire::{vk_vformat, DrawCmdWire, VertexAttrWire};
+
+    let vspirv: [u32; 4] = [SPIRV_MAGIC, 0x1111_1111, 0x2222_2222, 0x3333_3333];
+    let fspirv: [u32; 3] = [SPIRV_MAGIC, 0xAAAA_AAAA, 0xBBBB_BBBB];
+    let attrs = [
+        VertexAttrWire { location: 0, format: vk_vformat::R32G32_SFLOAT, offset: 0 },
+        VertexAttrWire { location: 1, format: vk_vformat::R32G32B32_SFLOAT, offset: 8 },
+    ];
+    // 3 vertices × stride 20; a u16 index buffer with a non-trivial pattern.
+    let vertex_data: Vec<u8> = (0u8..60).collect();
+    let indices: [u16; 3] = [2, 0, 1];
+    let index_data: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+    // Two draws with distinct fields so a swap/mis-placement surfaces (per-draw viewport + offset).
+    let draws = [
+        DrawCmdWire { count: 3, instance_count: 1, first: 0, vertex_offset: 0, vp_x: 0.0, vp_y: 0.0, vp_w: 0.0, vp_h: 0.0 },
+        DrawCmdWire { count: 3, instance_count: 4, first: 1, vertex_offset: -2, vp_x: 5.0, vp_y: 6.0, vp_w: 7.0, vp_h: 8.0 },
+    ];
+
+    let payload = guest::encode_forwarded_cmdlist(
+        640,
+        480,
+        [0.1, 0.2, 0.3, 1.0],
+        0xCAFE_0000,
+        &vspirv,
+        &fspirv,
+        c"vmain",
+        c"fmain",
+        20,
+        &attrs,
+        &vertex_data,
+        &index_data,
+        false,
+        1, // vk_topology::TRIANGLE_STRIP
+        &draws,
+    );
+
+    let o = decode_forwarded_cmdlist(&payload, CAP).expect("C-encoded cmdlist must decode");
+    assert_eq!(o.vertex_spirv, vspirv, "vertex SPIR-V survives C→Rust");
+    assert_eq!(o.fragment_spirv, fspirv, "fragment SPIR-V survives (not swapped)");
+    assert_eq!(o.vertex_entry.as_c_str(), c"vmain");
+    assert_eq!(o.fragment_entry.as_c_str(), c"fmain");
+    assert_eq!(o.topology, 1);
+    let g = o.geometry.expect("cmdlist carries geometry");
+    assert_eq!(g.vertex_stride, 20);
+    assert_eq!(g.vertex_data, vertex_data, "vertex buffer round-trips");
+    assert_eq!(g.index_data, index_data, "index buffer round-trips");
+    assert!(!g.index_u32);
+    assert_eq!(g.attrs.len(), 2);
+    assert_eq!((g.attrs[0].location, g.attrs[0].format, g.attrs[0].offset), (0, vk_vformat::R32G32_SFLOAT, 0));
+    assert_eq!((g.attrs[1].location, g.attrs[1].format, g.attrs[1].offset), (1, vk_vformat::R32G32B32_SFLOAT, 8));
+    assert_eq!(g.draws.len(), 2, "multi-draw round-trips");
+    assert_eq!(g.draws[1].instance_count, 4);
+    assert_eq!(g.draws[1].first, 1);
+    assert_eq!(g.draws[1].vertex_offset, -2, "signed vertex_offset survives");
+    assert_eq!(g.draws[1].viewport, [5.0, 6.0, 7.0, 8.0], "per-draw viewport survives");
 }
