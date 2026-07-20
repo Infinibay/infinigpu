@@ -20,8 +20,17 @@
   .stats { margin-left: auto; display: flex; gap: 18px; color: #8b90a3; }
   .stats b { color: #e6e8ef; font-weight: 600; }
   main { display: grid; place-items: center; padding: 16px; min-height: 0; }
-  canvas { max-width: 100%; max-height: 100%; background: #000;
-    border: 1px solid #1c2030; border-radius: 6px; }
+  /* The stage shrink-wraps the video canvas; the cursor overlay is absolutely
+     positioned to fill the same box, so it always tracks the video's displayed
+     size (and distorts identically if the video does) — alignment is automatic. */
+  .stage { position: relative; display: inline-block; line-height: 0;
+    max-width: 100%; max-height: 100%; background: #000;
+    border: 1px solid #1c2030; border-radius: 6px; overflow: hidden; }
+  #view { display: block; max-width: 100%; max-height: 100%; }
+  /* Purely visual — pointer-events:none lets the browser cursor + clicks pass
+     through to the page (this is a view-only client). */
+  #cursor { position: absolute; inset: 0; width: 100%; height: 100%;
+    pointer-events: none; }
   .msg { color: #8b90a3; text-align: center; }
   .msg code { color: #5ad1c8; }
 </style>
@@ -39,7 +48,10 @@
   </div>
 </header>
 <main>
-  <canvas id="view" width="960" height="540"></canvas>
+  <div class="stage">
+    <canvas id="view" width="960" height="540"></canvas>
+    <canvas id="cursor" width="960" height="540"></canvas>
+  </div>
   <div class="msg" id="msg" hidden></div>
 </main>
 <script type="module">
@@ -47,8 +59,12 @@
 // decode H.264 access units with WebCodecs (low-latency) onto a canvas.
 const MAGIC = 0x49504958, HDR = 32;
 // Plane-sideband magic ("XIPL"): cursor / future media on the same socket. Not a video frame —
-// dropped here so its bytes never reach WebCodecs (the client-side overlay lands in PR-C4).
-const PLANE_MAGIC = 0x4c504958;
+// routed to the cursor overlay below (never to WebCodecs). 36-byte header mirrors
+// `crates/infinigpu-pixel/src/lib.rs` PlaneHeader.
+const PLANE_MAGIC = 0x4c504958, PLANE_HDR = 36;
+const P_OP = { DEFINE: 1, MOVE: 2, DATA: 3, DESTROY: 4 };
+const P_KIND_CURSOR = 1;
+const P_FLAG = { VISIBLE: 1, PREMULTIPLIED: 2 };
 const q = new URLSearchParams(location.search);
 const port = q.get('port') || '8090';
 const host = q.get('host') || location.hostname || '127.0.0.1';
@@ -56,9 +72,94 @@ const host = q.get('host') || location.hostname || '127.0.0.1';
 const dot = document.getElementById('dot');
 const canvas = document.getElementById('view');
 const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+const cursorCanvas = document.getElementById('cursor');
+const cctx = cursorCanvas.getContext('2d');
 const msg = document.getElementById('msg');
 const el = (id) => document.getElementById(id);
 const show = (html) => { msg.hidden = false; msg.innerHTML = html; };
+
+// ---- cursor plane overlay (XIPL) --------------------------------------------
+// This is a VIEW-ONLY client (it never forwards input), so the browser user's
+// pointer is unrelated to the guest cursor. We draw the guest cursor at the
+// SERVER-authoritative position the device puts in every MOVE/DEFINE header
+// (pos_x/pos_y, guest-pixel space) — the field the wire carries for exactly this
+// multi-client case. A *driving* client (one that forwards input, like the native
+// viewer) would instead draw at its own local pointer for zero lag. The overlay
+// canvas shares the video canvas's backing dims and is CSS-stretched over the same
+// box, so the cursor scales and stays aligned with the video.
+//
+// Note: when this is the ONLY viewer and no one is driving, the device suppresses
+// routine MOVEs (a lone driving viewer needs none), so the cursor holds its last
+// DEFINE position — expected, since nothing is moving the guest cursor then.
+// The hotspot (hot_x/hot_y) is deliberately NOT tracked: pos_x/pos_y is already the sprite
+// top-left (guest crtc origin = pointer − hotspot), so the view-only client blits there directly.
+let cur = null; // { sprite:<canvas>, posX, posY, visible }
+
+// Keep the overlay's backing store equal to the video's (guest pixels). Returns
+// whether a resize happened (a resize clears the canvas → caller must redraw).
+function syncCursorCanvasSize() {
+  let resized = false;
+  if (cursorCanvas.width !== canvas.width) { cursorCanvas.width = canvas.width; resized = true; }
+  if (cursorCanvas.height !== canvas.height) { cursorCanvas.height = canvas.height; resized = true; }
+  return resized;
+}
+
+function drawCursor() {
+  cctx.clearRect(0, 0, cursorCanvas.width, cursorCanvas.height);
+  if (!cur || !cur.visible || !cur.sprite) return;
+  // pos_x/pos_y is the guest crtc origin — already the sprite TOP-LEFT (= pointer − hotspot),
+  // so blit there directly. Do NOT subtract the hotspot again (that is what the native viewer
+  // does to convert its OWN local pointer *tip* into a top-left; here the guest already did it).
+  cctx.drawImage(cur.sprite, cur.posX, cur.posY);
+}
+
+// Turn the wire's BGRA (premultiplied-by-default, DRM ARGB8888) sprite body into a
+// straight-alpha RGBA canvas, so the browser composites it source-over with correct
+// colors. Fail-closed: reject implausible dims or a body shorter than width*height*4.
+function buildSprite(u8, off, w, h, premultiplied) {
+  const need = w * h * 4;
+  if (w <= 0 || h <= 0 || w > 1024 || h > 1024 || u8.length - off < need) return null;
+  const img = new ImageData(w, h);
+  const d = img.data;
+  for (let i = 0; i < w * h; i++) {
+    const s = off + i * 4;
+    const b = u8[s], g = u8[s + 1], r = u8[s + 2], a = u8[s + 3];
+    const o = i * 4;
+    if (premultiplied && a !== 0 && a !== 255) {
+      d[o]     = Math.min(255, Math.round(r * 255 / a));
+      d[o + 1] = Math.min(255, Math.round(g * 255 / a));
+      d[o + 2] = Math.min(255, Math.round(b * 255 / a));
+    } else {
+      d[o] = r; d[o + 1] = g; d[o + 2] = b;
+    }
+    d[o + 3] = a;
+  }
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d').putImageData(img, 0, 0);
+  return c;
+}
+
+function handlePlane(dv, u8) {
+  if (u8.length < PLANE_HDR) return;
+  const op = u8[5], kind = u8[6], flags = u8[7];
+  if (kind !== P_KIND_CURSOR) return;            // video plane (DATA) not handled here
+  const visible = (flags & P_FLAG.VISIBLE) !== 0;
+  const posX = dv.getInt32(24, true), posY = dv.getInt32(28, true);
+  if (op === P_OP.DEFINE) {
+    const w = dv.getUint16(16, true), h = dv.getUint16(18, true);
+    const sprite = buildSprite(u8, PLANE_HDR, w, h, (flags & P_FLAG.PREMULTIPLIED) !== 0);
+    if (sprite) cur = { sprite, posX, posY, visible };
+  } else if (op === P_OP.MOVE) {
+    if (cur) { cur.posX = posX; cur.posY = posY; cur.visible = visible; }
+  } else if (op === P_OP.DESTROY) {
+    if (cur) cur.visible = false;
+  } else {
+    return; // DATA / unknown — nothing to draw
+  }
+  syncCursorCanvasSize();
+  drawCursor();
+}
 
 if (!('VideoDecoder' in window)) {
   dot.className = 'dot err';
@@ -90,6 +191,8 @@ function ensureDecoder(codecString) {
       if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
       ctx.drawImage(frame, 0, 0);
       frame.close();
+      // Keep the cursor overlay sized to the video; a resize clears it, so redraw.
+      if (syncCursorCanvasSize()) drawCursor();
       decoded++;
     },
     error: (e) => { dot.className = 'dot err'; show('Decoder error: ' + e.message); },
@@ -107,7 +210,7 @@ ws.onerror = () => { dot.className = 'dot err'; show('Cannot reach <code>ws://' 
 ws.onmessage = (ev) => {
   const dv = new DataView(ev.data), u8 = new Uint8Array(ev.data);
   const magic = dv.getUint32(0, true);
-  if (magic === PLANE_MAGIC) return;   // plane sideband — handled by the PR-C4 overlay, never decoded
+  if (magic === PLANE_MAGIC) { handlePlane(dv, u8); return; }   // cursor sideband — never decoded
   if (magic !== MAGIC) return;         // defense in depth: never offset-parse a non-XIPI message
 
   const flags = u8[5];

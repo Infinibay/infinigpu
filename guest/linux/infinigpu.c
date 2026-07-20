@@ -320,9 +320,15 @@ static u32 igpu_submit_scanout_damaged(struct igpu_device *idev, dma_addr_t fb,
 	return igpu_ring_submit(idev, ENC_DISPLAY_SCANOUT_DAMAGE, &p, sizeof(p));
 }
 
+/* Forward decl: the ring-drainer producer is defined below, but the cursor submit (Phase-0 by
+ * default) delegates to it in ring_drainer mode. */
+static u32 igpu_ring2_push(struct igpu_device *idev, u32 msg_type,
+			   const void *payload, u32 payload_len);
+
 /* Emit a CURSOR_UPDATE (msg_type 0x0042, no SUBMIT_CMD wrapper): the body sits directly after
  * the descriptor at data_offset = sizeof(descriptor). The host forwards it to a client-side
- * cursor overlay, so the cursor leaves the primary framebuffer entirely. */
+ * cursor overlay, so the cursor leaves the primary framebuffer entirely. In ring_drainer mode
+ * it rides the real ring instead (see below). */
 static u32 igpu_submit_cursor(struct igpu_device *idev, const struct igpu_cursor_update *cu)
 {
 	struct igpu_descriptor *d = idev->ring;
@@ -331,6 +337,20 @@ static u32 igpu_submit_cursor(struct igpu_device *idev, const struct igpu_cursor
 	u64 seq;
 
 	mutex_lock(&idev->ring_lock);
+
+	/* In ring_drainer mode the cursor rides the real ring like every other submission
+	 * (igpu_flush does the same for display). The legacy path below reprograms
+	 * CMD_RING_BASE, which the display path is careful never to do here because it would
+	 * corrupt the real ring's base — and the host routes every DOORBELL_CMD0 to the ring
+	 * drainer, so a cursor published outside ring2 is never drained (drain_ctx sees the
+	 * unadvanced ring2 tail and pops nothing). The 48-byte body fits a ring2 payload slot
+	 * (IGPU_RING2_PSTRIDE). */
+	if (idev->ring_drainer) {
+		retired = igpu_ring2_push(idev, MSG_CURSOR_UPDATE, cu, sizeof(*cu));
+		mutex_unlock(&idev->ring_lock);
+		return retired;
+	}
+
 	seq = ++idev->seqno;
 
 	d->msg_type = MSG_CURSOR_UPDATE;

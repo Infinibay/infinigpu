@@ -945,6 +945,12 @@ pub struct InfinigpuBackend {
     last_forwarded_hash: HashMap<u64, u64>,
     /// Count of frames skipped by [`Self::elide_unchanged`] (logged periodically).
     frames_elided: u64,
+    /// Count of `CURSOR_UPDATE` descriptors dispatched to [`Self::handle_cursor_update`] (incremented
+    /// at entry, before the pixel/admission early-return). Test observability for the fix that routes
+    /// cursor-plane updates through the production SPSC ring drainer (`execute_descriptor`) — a
+    /// 3D-forwarding VM drives the real ring, where the Phase-0 `process_ring` dispatch never runs, so
+    /// without the drainer branch every cursor move is silently dropped. Reset on device reset.
+    cursor_updates: u64,
 }
 
 impl Default for InfinigpuBackend {
@@ -1080,6 +1086,7 @@ impl InfinigpuBackend {
                 .unwrap_or(false),
             last_forwarded_hash: HashMap::new(),
             frames_elided: 0,
+            cursor_updates: 0,
         }
     }
 
@@ -1172,6 +1179,7 @@ impl InfinigpuBackend {
         // Guest RAM is being remapped/re-set — any cached forwarded-frame hash is now meaningless.
         self.last_forwarded_hash.clear();
         self.frames_elided = 0;
+        self.cursor_updates = 0;
         // The VRAM true-up re-runs on the next present after a reset (fresh mode negotiation).
         self.scanout_vram_dims = None;
         if let Some(p) = &self.pixel {
@@ -1533,6 +1541,27 @@ impl InfinigpuBackend {
         } else {
             self.ring_base[ctx] + desc.data_offset as u64
         };
+        // Cursor-plane sideband (a control message, not a resource op or a command submission). Decode
+        // the fixed `CursorUpdate` body and forward it to the plane sideband, exactly as the Phase-0
+        // `process_ring` path does. This is the LIVE receiver in ring_drainer mode: the guest publishes
+        // the cursor on the real ring there (`igpu_submit_cursor` -> `igpu_ring2_push(MSG_CURSOR_UPDATE)`,
+        // matching how `igpu_flush` routes display through ring2), because the host routes every
+        // `DOORBELL_CMD0` to `drain_ctx` and the legacy Phase-0 cursor path would reprogram the ring's
+        // base. WITHOUT this branch the drainer routes the descriptor to `execute_resource`, gets
+        // `NotResource`, and DROPS it — so a 3D VM (`ring_index[ctx] != 0`) would silently lose every
+        // cursor move while the plane is enabled. `len == 0` means "the whole struct" (the guest
+        // convention). Retirement is the batch's job (drain_ctx Phase 3 publishes the highest seqno),
+        // so this returns without an inline retire, matching the resource/submit paths here.
+        if desc.msg_type == infinigpu_abi::wire::msg_type::CURSOR_UPDATE {
+            use zerocopy::FromBytes;
+            let mut cb = [0u8; core::mem::size_of::<infinigpu_abi::wire::CursorUpdate>()];
+            let n = if len == 0 { cb.len() } else { len.min(cb.len()) };
+            if self.dma.read(payload_addr, &mut cb[..n]) {
+                let cu = infinigpu_abi::wire::CursorUpdate::read_from_bytes(&cb).unwrap();
+                self.handle_cursor_update(&cu);
+            }
+            return;
+        }
         let mut payload = vec![0u8; len];
         if len > 0 && !self.dma.read(payload_addr, &mut payload) {
             log::error!("drain ctx={ctx}: payload {payload_addr:#x} ({len} B) not mapped");
@@ -2185,6 +2214,10 @@ impl InfinigpuBackend {
     fn handle_cursor_update(&mut self, cu: &infinigpu_abi::wire::CursorUpdate) {
         use infinigpu_abi::wire::{cursor_flags, format};
         use infinigpu_pixel::{proto::plane, PlaneHeader};
+
+        // Count the dispatch at entry (before any early-return) so a test can prove the production ring
+        // drainer routed this CURSOR_UPDATE here, independent of whether a PixelStreamer is attached.
+        self.cursor_updates = self.cursor_updates.wrapping_add(1);
 
         if !self.ensure_admitted() || self.pixel.is_none() {
             return;
@@ -3024,6 +3057,88 @@ mod tests {
 
         assert_eq!(b.vulkan_submits, 1, "3D submit reached submit_vulkan via the ring drainer");
         assert_eq!(b.ring_retired[CTX], 1, "the 3D fence retired");
+
+        unsafe { libc::munmap(ram as *mut libc::c_void, SIZE) };
+    }
+
+    /// A `CURSOR_UPDATE` published on the **real ring** must reach `handle_cursor_update`. This drives
+    /// the exact production flow of a 3D VM in ring_drainer mode: the guest pushes the cursor onto
+    /// ring2 via `igpu_ring2_push(MSG_CURSOR_UPDATE, ..)` — an inline-payload descriptor whose tail it
+    /// advances (mirrored here by `Ring::push`) — and the host drains it through
+    /// `drain_ctx`/`execute_descriptor`, the only path a real-ring VM ever takes. Without the
+    /// CURSOR_UPDATE branch in `execute_descriptor` the descriptor routes to
+    /// `execute_resource → NotResource` and is silently DROPPED. `cursor_updates` (bumped at
+    /// `handle_cursor_update` entry, before the pixel/admission early-return) is the observable that
+    /// distinguishes the fix: it is `1` here and would be `0` with the branch removed. The batch still
+    /// retires the seqno (the branch returns without an inline retire), so `ring_retired == 1` proves
+    /// the fence is published by `drain_ctx` Phase 3, not skipped.
+    #[test]
+    fn cursor_update_flows_through_the_ring_drainer() {
+        use infinigpu_abi::wire::{cursor_flags, msg_type, CursorUpdate, Descriptor};
+        use zerocopy::IntoBytes;
+
+        const GUEST_BASE: u64 = 0x9000_0000;
+        const SIZE: usize = 0x1000;
+        const IDX_OFF: usize = 0x0;
+        const DESC_OFF: usize = 0x40;
+        const PAY_OFF: usize = 0x200;
+        const CAP: usize = 4;
+        const CTX: usize = 0;
+
+        // A pure move (MOVE_ONLY | VISIBLE): no sprite, so no shape backing store is needed — the
+        // dispatch is what's under test, not the sprite path.
+        let cu = CursorUpdate {
+            scanout_id: 0,
+            flags: cursor_flags::MOVE_ONLY | cursor_flags::VISIBLE,
+            pos_x: 42,
+            pos_y: 17,
+            hot_x: 0,
+            hot_y: 0,
+            width: 0,
+            height: 0,
+            pitch: 0,
+            format: 0,
+            shape_ref: 0,
+            _reserved: 0,
+        };
+
+        let fd = unsafe { libc::memfd_create(c"curram".as_ptr(), 0) };
+        assert!(fd >= 0);
+        assert_eq!(unsafe { libc::ftruncate(fd, SIZE as libc::off_t) }, 0);
+        let ram = unsafe {
+            libc::mmap(std::ptr::null_mut(), SIZE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
+        } as *mut u8;
+        assert_ne!(ram as *mut libc::c_void, libc::MAP_FAILED);
+        unsafe {
+            std::ptr::copy_nonoverlapping(cu.as_bytes().as_ptr(), ram.add(PAY_OFF), cu.as_bytes().len());
+        };
+
+        let mut b = InfinigpuBackend::new();
+        let file = unsafe { <std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(fd) };
+        b.dma.map(GUEST_BASE, 0, SIZE as u64, file).unwrap();
+        b.ring_base[CTX] = GUEST_BASE + DESC_OFF as u64;
+        b.ring_cap[CTX] = CAP as u32;
+        b.ring_index[CTX] = GUEST_BASE + IDX_OFF as u64;
+
+        {
+            let ring = unsafe { drain::ring_over_shared(ram.add(IDX_OFF), ram.add(DESC_OFF), CAP) }.unwrap();
+            // len == 0 exercises the guest's "the whole struct" convention (read min(len_or_full, size)).
+            ring.push(Descriptor {
+                msg_type: msg_type::CURSOR_UPDATE,
+                flags: 0,
+                len: 0,
+                data_offset: (PAY_OFF - DESC_OFF) as u32,
+                seqno: 1,
+                payload_addr: 0,
+            })
+            .unwrap();
+        }
+
+        b.process_ring(CTX);
+
+        assert_eq!(b.cursor_updates, 1, "the cursor update reached handle_cursor_update via the ring drainer");
+        assert_eq!(b.vulkan_submits, 0, "a cursor update is not a 3D submit");
+        assert_eq!(b.ring_retired[CTX], 1, "the batch retired the seqno even though the branch adds no inline retire");
 
         unsafe { libc::munmap(ram as *mut libc::c_void, SIZE) };
     }
