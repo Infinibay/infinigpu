@@ -148,6 +148,11 @@ struct infinigpu_pipeline {
    /* Phase-2d-A5 static rasterization+blend state, pre-packed as a ForwardedCmdListTail.raster_flags
     * bitfield (cull mode | front-face-CW? | blend?); 0 ⇒ cull NONE / CCW / blend off (the default). */
    uint32_t raster_flags;
+   /* Extended-dynamic-state (EDS1, core Vulkan 1.3) mask: which of the states this driver forwards the
+    * pipeline declared DYNAMIC via pDynamicState (INFINIGPU_DYN_*). For each set bit the static field
+    * above is IGNORED per spec and the app supplies the value with a vkCmdSet* — resolved at submit from
+    * the command buffer's dynamic values (infinigpu_sync.c). 0 ⇒ everything is static (the common path). */
+   uint32_t dynamic_mask;
 };
 
 /* A dummy pipeline cache (we never cache — SPIR-V is forwarded, not compiled). */
@@ -248,6 +253,18 @@ struct infinigpu_cmd_buffer {
    uint32_t index_type;                         /* INFINIGPU_INDEX_TYPE_U16 / _U32 */
    bool has_dyn_viewport;
    float dyn_viewport[4];                       /* last CmdSetViewport viewport 0 (x,y,w,h) */
+
+   /* Extended-dynamic-state values the app set via vkCmdSet* (EDS1, core 1.3). `dyn_set_mask` is which
+    * (INFINIGPU_DYN_*) have been set on this recording; the values are consulted at submit ONLY for the
+    * states the bound pipeline declared dynamic (pipeline->dynamic_mask). Reset in CmdBufferBegin. */
+   uint32_t dyn_set_mask;
+   uint32_t dyn_cull_mode;                      /* VkCullModeFlags from vkCmdSetCullMode */
+   VkFrontFace dyn_front_face;                  /* vkCmdSetFrontFace */
+   VkBool32 dyn_depth_test;                     /* vkCmdSetDepthTestEnable */
+   VkBool32 dyn_depth_write;                    /* vkCmdSetDepthWriteEnable */
+   VkCompareOp dyn_depth_compare;               /* vkCmdSetDepthCompareOp */
+   VkPrimitiveTopology dyn_topology;            /* vkCmdSetPrimitiveTopology */
+
    struct infinigpu_draw draws[INFINIGPU_MAX_DRAWS];
    uint32_t push_const_len;                      /* highest push-constant byte written */
    uint8_t push_const[INFINIGPU_MAX_PUSH_CONST]; /* CmdPushConstants payload (offset-placed) */

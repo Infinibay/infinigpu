@@ -91,6 +91,66 @@ unsafe extern "C" {
         texpix_len: u32,
         raster_flags: u32,
     ) -> usize;
+
+    // The EDS1 static-vs-dynamic state resolver the ICD's driver_submit uses to fold the app's
+    // vkCmdSet* values into the forwarded raster_flags/depth_flags/topology (guest/icd/infinigpu_forwarded.c).
+    #[allow(clippy::too_many_arguments)]
+    fn infinigpu_resolve_forwarded_state(
+        static_raster: u32,
+        static_depth: u32,
+        static_topo: u32,
+        dynamic_mask: u32,
+        set_mask: u32,
+        dyn_cull: u32,
+        dyn_front_cw: u32,
+        dyn_depth_test: u32,
+        dyn_depth_write: u32,
+        dyn_depth_compare: u32,
+        dyn_topo: u32,
+        out_raster: *mut u32,
+        out_depth: *mut u32,
+        out_topo: *mut u32,
+    );
+}
+
+/// The resolved `(raster_flags, depth_flags, topology)` from a pipeline's static capture + a command
+/// buffer's dynamic values (EDS1), computed by the exact C resolver the ICD's `driver_submit` uses.
+/// `dynamic_mask`/`set_mask` are `INFINIGPU_DYN_*` bitfields; a state is overridden only where both are
+/// set. Inputs are already wire-normalized (see the C prototype). Proves the resolve logic off-hardware.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_forwarded_state(
+    static_raster: u32,
+    static_depth: u32,
+    static_topo: u32,
+    dynamic_mask: u32,
+    set_mask: u32,
+    dyn_cull: u32,
+    dyn_front_cw: u32,
+    dyn_depth_test: u32,
+    dyn_depth_write: u32,
+    dyn_depth_compare: u32,
+    dyn_topo: u32,
+) -> (u32, u32, u32) {
+    let (mut r, mut d, mut t) = (0u32, 0u32, 0u32);
+    unsafe {
+        infinigpu_resolve_forwarded_state(
+            static_raster,
+            static_depth,
+            static_topo,
+            dynamic_mask,
+            set_mask,
+            dyn_cull,
+            dyn_front_cw,
+            dyn_depth_test,
+            dyn_depth_write,
+            dyn_depth_compare,
+            dyn_topo,
+            &mut r,
+            &mut d,
+            &mut t,
+        );
+    }
+    (r, d, t)
 }
 
 /// Build a `vk_op::FORWARDED_CMDLIST` SUBMIT_CMD payload (a real mesh) with the exact C encoder the

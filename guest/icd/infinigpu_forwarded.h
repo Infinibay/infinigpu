@@ -65,6 +65,18 @@
 #define INFINIGPU_CULL_BACK 2u
 #define INFINIGPU_CULL_FRONT_AND_BACK 3u
 
+/* Extended-dynamic-state (EDS1, core Vulkan 1.3) bits — an ICD-internal concept (NOT on the wire):
+ * shared by infinigpu_pipeline::dynamic_mask (which states the pipeline declared dynamic) and
+ * infinigpu_cmd_buffer::dyn_set_mask (which the app actually set via vkCmdSet*). The submit resolver
+ * (infinigpu_resolve_forwarded_state) overrides a state only where both bits are set. DXVK/VKD3D
+ * drive cull/front-face/depth/topology this way, leaving the static pipeline fields at defaults. */
+#define INFINIGPU_DYN_CULL_MODE (1u << 0)
+#define INFINIGPU_DYN_FRONT_FACE (1u << 1)
+#define INFINIGPU_DYN_DEPTH_TEST (1u << 2)
+#define INFINIGPU_DYN_DEPTH_WRITE (1u << 3)
+#define INFINIGPU_DYN_DEPTH_COMPARE (1u << 4)
+#define INFINIGPU_DYN_TOPOLOGY (1u << 5)
+
 /* Wire structs whose bytes this encoder copies (defined in the generated infinigpu_abi.h). Only
  * pointers appear in the prototype, so a forward declaration keeps this header light. */
 struct VertexAttrWire;
@@ -126,5 +138,24 @@ size_t infinigpu_encode_forwarded_cmdlist(
     const struct DrawCmdWire *draws, uint32_t draw_count,
     const struct TextureDescWire *texs, uint32_t tex_count, uint32_t tex_binding,
     const uint8_t *texpix, uint32_t texpix_len, uint32_t raster_flags);
+
+/*
+ * Resolve the forwarded raster_flags / depth_flags / topology from the bound pipeline's STATIC capture
+ * and the command buffer's DYNAMIC values (EDS1, core Vulkan 1.3). For each state a bit in
+ * `dynamic_mask & set_mask` (INFINIGPU_DYN_*) selects the dynamic value; otherwise the static one
+ * stands. raster_flags/depth_flags are rebuilt from components (cull+front-face share raster_flags;
+ * test/write/compare share depth_flags), and depth compare is packed only when test or write is on (so
+ * a lone compare-op set can't force a depth buffer). Inputs are already normalized to wire form:
+ * `dyn_cull` is a 0..3 cull value, `dyn_front_cw`/`dyn_depth_test`/`dyn_depth_write` are booleans (0/1),
+ * `dyn_depth_compare` is a 0..7 compare value, `dyn_topo` is a wire topology. Pure (no Vulkan headers) so
+ * the off-VM conformance test can pin the resolve logic. Outputs must be non-NULL.
+ */
+void infinigpu_resolve_forwarded_state(
+    uint32_t static_raster, uint32_t static_depth, uint32_t static_topo,
+    uint32_t dynamic_mask, uint32_t set_mask,
+    uint32_t dyn_cull, uint32_t dyn_front_cw,
+    uint32_t dyn_depth_test, uint32_t dyn_depth_write, uint32_t dyn_depth_compare,
+    uint32_t dyn_topo,
+    uint32_t *out_raster, uint32_t *out_depth, uint32_t *out_topo);
 
 #endif /* INFINIGPU_FORWARDED_H */

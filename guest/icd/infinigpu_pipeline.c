@@ -164,15 +164,21 @@ infinigpu_graphics_pipeline_init(struct infinigpu_device *dev,
    }
 
    /* Phase-2d: pack the depth-test state into a ForwardedCmdListTail.depth_flags bitfield. VkCompareOp
-    * values (0..7) match INFINIGPU_DEPTH_CMP_* exactly. Ignored on the bufferless path (stride 0). */
+    * values (0..7) match INFINIGPU_DEPTH_CMP_* exactly. Ignored on the bufferless path (stride 0).
+    * Capture whenever a depth-stencil state is present (NOT gated on test||write): with EDS1 an app can
+    * declare test/write DYNAMIC — their create-info booleans are then spec-ignored placeholders (usually
+    * VK_FALSE) — while leaving compareOp STATIC. The submit resolver reads each sub-field the app did NOT
+    * make dynamic straight out of p->depth_flags, so the static compareOp MUST be recorded here or a
+    * dynamically-enabled depth test would forward compare=NEVER and cull every fragment. Packing compare
+    * with test/write off is harmless: the host adds a depth attachment iff TEST|WRITE. */
    const VkPipelineDepthStencilStateCreateInfo *ds = ci->pDepthStencilState;
-   if (ds && (ds->depthTestEnable || ds->depthWriteEnable)) {
+   if (ds) {
       uint32_t df = 0;
       if (ds->depthTestEnable)
          df |= INFINIGPU_DEPTH_TEST;
       if (ds->depthWriteEnable)
          df |= INFINIGPU_DEPTH_WRITE;
-      df |= ((uint32_t)ds->depthCompareOp) << INFINIGPU_DEPTH_COMPARE_SHIFT;
+      df |= ((uint32_t)ds->depthCompareOp & 0x7u) << INFINIGPU_DEPTH_COMPARE_SHIFT;
       p->depth_flags = df;
    }
 
@@ -193,6 +199,38 @@ infinigpu_graphics_pipeline_init(struct infinigpu_device *dev,
        cb->pAttachments[0].blendEnable)
       rf |= INFINIGPU_RASTER_BLEND;
    p->raster_flags = rf;
+
+   /* Extended-dynamic-state (EDS1, core Vulkan 1.3): note which of the states we forward the app
+    * declared DYNAMIC. For those the static fields above are placeholders — the real value arrives via a
+    * vkCmdSet* and is resolved at submit (infinigpu_sync.c). DXVK/VKD3D set cull/front-face/depth/topology
+    * this way, so without this a whole class of real apps would forward the (default) static state. */
+   const VkPipelineDynamicStateCreateInfo *dyn = ci->pDynamicState;
+   if (dyn) {
+      for (uint32_t i = 0; i < dyn->dynamicStateCount; i++) {
+         switch (dyn->pDynamicStates[i]) {
+         case VK_DYNAMIC_STATE_CULL_MODE:
+            p->dynamic_mask |= INFINIGPU_DYN_CULL_MODE;
+            break;
+         case VK_DYNAMIC_STATE_FRONT_FACE:
+            p->dynamic_mask |= INFINIGPU_DYN_FRONT_FACE;
+            break;
+         case VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE:
+            p->dynamic_mask |= INFINIGPU_DYN_DEPTH_TEST;
+            break;
+         case VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE:
+            p->dynamic_mask |= INFINIGPU_DYN_DEPTH_WRITE;
+            break;
+         case VK_DYNAMIC_STATE_DEPTH_COMPARE_OP:
+            p->dynamic_mask |= INFINIGPU_DYN_DEPTH_COMPARE;
+            break;
+         case VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY:
+            p->dynamic_mask |= INFINIGPU_DYN_TOPOLOGY;
+            break;
+         default:
+            break; /* viewport/scissor/others handled elsewhere or ignored (full-frame) */
+         }
+      }
+   }
 
    for (uint32_t i = 0; i < ci->stageCount; i++) {
       VkResult r = infinigpu_pipeline_add_stage(dev, p, &ci->pStages[i]);

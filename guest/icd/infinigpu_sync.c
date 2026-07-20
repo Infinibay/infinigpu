@@ -328,6 +328,25 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
+   /* EDS1 (core Vulkan 1.3): for each state the bound pipeline declared DYNAMIC *and* the app set via a
+    * vkCmdSet*, override the pipeline's static capture with the command buffer's dynamic value. DXVK/
+    * VKD3D leave the static pipeline fields at defaults and drive cull/front-face/depth/topology this
+    * way, so this resolve is what makes their real state reach the host. Normalize the Vk enums to wire
+    * form here; the pure resolver (tested in the conformance crate) does the mask-select + repack. */
+   uint32_t raster_flags = 0, depth_flags = 0, topo_final = 0;
+   infinigpu_resolve_forwarded_state(
+      p->raster_flags, p->depth_flags, topo,
+      p->dynamic_mask, cmd->dyn_set_mask,
+      cmd->dyn_cull_mode & INFINIGPU_CULL_MASK,
+      cmd->dyn_front_face == VK_FRONT_FACE_CLOCKWISE ? 1u : 0u,
+      cmd->dyn_depth_test != VK_FALSE ? 1u : 0u,
+      cmd->dyn_depth_write != VK_FALSE ? 1u : 0u,
+      (uint32_t)cmd->dyn_depth_compare & 0x7u,
+      cmd->dyn_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+         ? INFINIGPU_VK_TOPOLOGY_TRIANGLE_STRIP
+         : INFINIGPU_VK_TOPOLOGY_TRIANGLE_LIST,
+      &raster_flags, &depth_flags, &topo_final);
+
    /* scanout_addr=0: the KMD overwrites it with the target BO's dma_addr. */
    const size_t n = infinigpu_encode_forwarded_cmdlist(
       payload, cap, width, height, bg, 0,
@@ -335,12 +354,12 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       vs->entrypoint, fs->entrypoint,
       p->vertex_stride, attrs, p->attr_count,
       vdata, vlen, idata, ilen, cmd->index_type,
-      topo, p->depth_flags,
+      topo_final, depth_flags,
       cmd->push_const, cmd->push_const_len,
       ubo, ubo_len, ubo_binding,
       draws, cmd->draw_count,
       tex_count ? &texdesc : NULL, tex_count, tex_binding, texpix, texpix_len,
-      p->raster_flags);
+      raster_flags);
    free(draws);
    if (n == 0) {
       free(payload);

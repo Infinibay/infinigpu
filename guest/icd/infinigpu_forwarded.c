@@ -196,3 +196,66 @@ size_t infinigpu_encode_forwarded_cmdlist(
 
 	return o;
 }
+
+void infinigpu_resolve_forwarded_state(
+    uint32_t static_raster, uint32_t static_depth, uint32_t static_topo,
+    uint32_t dynamic_mask, uint32_t set_mask,
+    uint32_t dyn_cull, uint32_t dyn_front_cw,
+    uint32_t dyn_depth_test, uint32_t dyn_depth_write, uint32_t dyn_depth_compare,
+    uint32_t dyn_topo,
+    uint32_t *out_raster, uint32_t *out_depth, uint32_t *out_topo)
+{
+	/* Override each state ONLY where the pipeline declared it dynamic AND the app actually set it
+	 * (dynamic_mask & set_mask); everywhere else the pipeline's static capture stands. Rebuild
+	 * raster_flags/depth_flags from components because several sub-fields share one word. This is the
+	 * EDS1 resolve for DXVK/VKD3D; kept as a pure function so the conformance crate can test it. */
+	const uint32_t dm = dynamic_mask & set_mask;
+
+	uint32_t raster = static_raster;
+	if (dm & (INFINIGPU_DYN_CULL_MODE | INFINIGPU_DYN_FRONT_FACE)) {
+		uint32_t cull = (static_raster >> INFINIGPU_CULL_SHIFT) & INFINIGPU_CULL_MASK;
+		uint32_t front_cw = (static_raster & INFINIGPU_RASTER_FRONT_FACE_CW) ? 1u : 0u;
+		uint32_t blend = (static_raster & INFINIGPU_RASTER_BLEND) ? 1u : 0u;
+		if (dm & INFINIGPU_DYN_CULL_MODE)
+			cull = dyn_cull & INFINIGPU_CULL_MASK;
+		if (dm & INFINIGPU_DYN_FRONT_FACE)
+			front_cw = dyn_front_cw ? 1u : 0u;
+		raster = (cull << INFINIGPU_CULL_SHIFT) |
+		         (front_cw ? INFINIGPU_RASTER_FRONT_FACE_CW : 0u) |
+		         (blend ? INFINIGPU_RASTER_BLEND : 0u);
+	}
+
+	uint32_t depth = static_depth;
+	if (dm & (INFINIGPU_DYN_DEPTH_TEST | INFINIGPU_DYN_DEPTH_WRITE | INFINIGPU_DYN_DEPTH_COMPARE)) {
+		uint32_t dtest = (static_depth & INFINIGPU_DEPTH_TEST) ? 1u : 0u;
+		uint32_t dwrite = (static_depth & INFINIGPU_DEPTH_WRITE) ? 1u : 0u;
+		uint32_t dcmp = (static_depth >> INFINIGPU_DEPTH_COMPARE_SHIFT) & 0x7u;
+		if (dm & INFINIGPU_DYN_DEPTH_TEST)
+			dtest = dyn_depth_test ? 1u : 0u;
+		if (dm & INFINIGPU_DYN_DEPTH_WRITE)
+			dwrite = dyn_depth_write ? 1u : 0u;
+		if (dm & INFINIGPU_DYN_DEPTH_COMPARE)
+			dcmp = dyn_depth_compare & 0x7u;
+		depth = 0;
+		if (dtest)
+			depth |= INFINIGPU_DEPTH_TEST;
+		if (dwrite)
+			depth |= INFINIGPU_DEPTH_WRITE;
+		depth |= (dcmp << INFINIGPU_DEPTH_COMPARE_SHIFT);
+	}
+	/* Normalize: the host adds a depth attachment iff TEST|WRITE, so strip a lone compare-op. This
+	 * makes the forwarded depth_flags nonzero iff depth is actually active for BOTH the dynamic rebuild
+	 * above AND a static pass-through — e.g. a pipeline that carries a depth-stencil state with depth
+	 * disabled but a non-default compareOp (which the capture now records so a dynamically-enabled test
+	 * can read it) forwards as 0, exactly as a no-depth pipeline did before EDS1. */
+	if (!(depth & (INFINIGPU_DEPTH_TEST | INFINIGPU_DEPTH_WRITE)))
+		depth = 0;
+
+	uint32_t topo = static_topo;
+	if (dm & INFINIGPU_DYN_TOPOLOGY)
+		topo = dyn_topo;
+
+	*out_raster = raster;
+	*out_depth = depth;
+	*out_topo = topo;
+}

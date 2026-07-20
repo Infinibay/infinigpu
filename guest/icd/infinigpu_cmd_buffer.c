@@ -33,6 +33,7 @@ infinigpu_cmd_reset_state(struct infinigpu_cmd_buffer *cmd)
    cmd->ibuf_offset = 0;
    cmd->index_type = INFINIGPU_INDEX_TYPE_U16;
    cmd->has_dyn_viewport = false;
+   cmd->dyn_set_mask = 0; /* EDS1 dynamic-state values are per-recording; drop them on reset */
    cmd->push_const_len = 0;
    cmd->bound_desc_set = NULL;
    cmd->upload_count = 0;
@@ -250,6 +251,58 @@ infinigpu_CmdSetViewportWithCount(VkCommandBuffer commandBuffer, uint32_t viewpo
       cmd->dyn_viewport[3] = pViewports[0].height;
       cmd->has_dyn_viewport = true;
    }
+}
+
+/* Extended-dynamic-state (EDS1, core Vulkan 1.3) setters. Each records the value + marks it set in
+ * dyn_set_mask; at submit the resolver (infinigpu_sync.c) consults these ONLY for the states the bound
+ * pipeline declared dynamic. DXVK/VKD3D drive real cull/front-face/depth/topology through these — the
+ * pipelines leave the static fields at defaults, so without these the forwarded state would be wrong. */
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetCullMode(VkCommandBuffer commandBuffer, VkCullModeFlags cullMode)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   cmd->dyn_cull_mode = cullMode;
+   cmd->dyn_set_mask |= INFINIGPU_DYN_CULL_MODE;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetFrontFace(VkCommandBuffer commandBuffer, VkFrontFace frontFace)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   cmd->dyn_front_face = frontFace;
+   cmd->dyn_set_mask |= INFINIGPU_DYN_FRONT_FACE;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetDepthTestEnable(VkCommandBuffer commandBuffer, VkBool32 depthTestEnable)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   cmd->dyn_depth_test = depthTestEnable;
+   cmd->dyn_set_mask |= INFINIGPU_DYN_DEPTH_TEST;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetDepthWriteEnable(VkCommandBuffer commandBuffer, VkBool32 depthWriteEnable)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   cmd->dyn_depth_write = depthWriteEnable;
+   cmd->dyn_set_mask |= INFINIGPU_DYN_DEPTH_WRITE;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetDepthCompareOp(VkCommandBuffer commandBuffer, VkCompareOp depthCompareOp)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   cmd->dyn_depth_compare = depthCompareOp;
+   cmd->dyn_set_mask |= INFINIGPU_DYN_DEPTH_COMPARE;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetPrimitiveTopology(VkCommandBuffer commandBuffer, VkPrimitiveTopology primitiveTopology)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   cmd->dyn_topology = primitiveTopology;
+   cmd->dyn_set_mask |= INFINIGPU_DYN_TOPOLOGY;
 }
 
 VKAPI_ATTR void VKAPI_CALL
