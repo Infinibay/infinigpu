@@ -24,8 +24,8 @@ pub mod resource;
 use dma::DmaTable;
 use infinigpu_abi::regs;
 use infinigpu_replay::{
-    DepthState, DrawCmd, ForwardedDraw, Frame, Geometry, HostGpu, PresentStats, SamplerCfg, Texture,
-    UniformBlock, VertexAttr,
+    DepthState, DrawCmd, ForwardedDraw, Frame, Geometry, HostGpu, PresentStats, SamplerCfg,
+    StorageBlock, Texture, UniformBlock, VertexAttr,
 };
 use infinigpu_sched::{BrokerConfig, GpuBroker, VmConfig, VmTicket};
 use log::info;
@@ -324,6 +324,9 @@ pub struct OwnedGeometry {
     pub tex_binding: u32,
     /// Phase-2c uniform buffer (binding + bytes); `None` ⇒ no UBO. Composes with `texture`.
     pub uniform: Option<OwnedUniform>,
+    /// Phase-2c read-only storage buffer (binding + bytes); `None` ⇒ no SSBO. Composes with the UBO +
+    /// textures in the same set. Never written back.
+    pub storage: Option<OwnedStorage>,
     /// Phase-2d-A5 static rasterization+blend state (`ForwardedCmdListTail::raster_flags`); `0` ⇒
     /// cull NONE / front-face CCW / blend off (the pre-0.12 default).
     pub raster_flags: u32,
@@ -340,6 +343,12 @@ pub struct OwnedTexture {
 
 /// Owning form of a decoded Phase-2c uniform buffer: the descriptor-set-0 binding + the raw bytes.
 pub struct OwnedUniform {
+    pub binding: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Owning form of a decoded Phase-2c read-only storage buffer (SSBO): the descriptor-set-0 binding + bytes.
+pub struct OwnedStorage {
     pub binding: u32,
     pub bytes: Vec<u8>,
 }
@@ -386,6 +395,10 @@ impl OwnedForwardedDraw {
                 uniform: g.uniform.as_ref().map(|u| UniformBlock {
                     binding: u.binding,
                     bytes: &u.bytes,
+                }),
+                storage: g.storage.as_ref().map(|s| StorageBlock {
+                    binding: s.binding,
+                    bytes: &s.bytes,
                 }),
                 raster_flags: g.raster_flags,
             }),
@@ -505,6 +518,8 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
     let tex_count = tail.tex_count as usize;
     let ubo_len = tail.ubo_len as usize;
     let ubo_binding = tail.ubo_binding;
+    let ssbo_len = tail.ssbo_len as usize;
+    let ssbo_binding = tail.ssbo_binding;
     let tex_binding = tail.tex_binding;
     let stride = tail.vertex_stride;
 
@@ -533,17 +548,27 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         || tex_binding > 65535
         || ubo_binding > 65535
         || ubo_len > 65536
+        // The SSBO's guaranteed range (`maxStorageBufferRange` ≥ 128 MiB) is far above the UBO's, so it
+        // gets a much larger cap (`MAX_SSBO_BYTES`); `ssbo_len == 0` is valid (no SSBO). Bound its binding
+        // like the others. `ssbo_len` is separately bounded ≤ `max_bytes` by the payload-total check below.
+        || ssbo_binding > 65535
+        || ssbo_len > infinigpu_replay::MAX_SSBO_BYTES
     {
         return None;
     }
-    // A UBO and a texture share one descriptor set 0; their bindings must not collide (a well-formed
-    // guest emits distinct bindings, e.g. UBO@0, image@1, sampler@2). Reject an overlap fail-closed.
-    if ubo_len > 0 && tex_count > 0 {
-        let tex_lo = tex_binding;
-        let tex_hi = tex_binding.saturating_add(2 * tex_count as u32); // exclusive
-        if ubo_binding >= tex_lo && ubo_binding < tex_hi {
-            return None;
-        }
+    // The UBO, the SSBO, and the textures share one descriptor set 0; their bindings must not collide (a
+    // well-formed guest emits distinct bindings, e.g. UBO@0, image@1, sampler@2, SSBO@3). Reject overlap
+    // fail-closed. `in_tex_range` is the half-open texture span `[tex_binding .. tex_binding + 2*tex_count)`.
+    let in_tex_range = |b: u32| {
+        tex_count > 0 && b >= tex_binding && b < tex_binding.saturating_add(2 * tex_count as u32)
+    };
+    if ubo_len > 0 && in_tex_range(ubo_binding) {
+        return None;
+    }
+    if ssbo_len > 0
+        && (in_tex_range(ssbo_binding) || (ubo_len > 0 && ssbo_binding == ubo_binding))
+    {
+        return None;
     }
     // A command list is the geometry path: it must carry a vertex buffer with a real stride, and the
     // stride must span every attribute. A bufferless draw belongs on the `vk_op::FORWARDED` path.
@@ -571,7 +596,8 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         .checked_add(velen)?
         .checked_add(felen)?
         .checked_add(pc_len)?
-        .checked_add(ubo_len)?;
+        .checked_add(ubo_len)?
+        .checked_add(ssbo_len)?;
     if total > rest.len() {
         return None;
     }
@@ -586,6 +612,9 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
     let (fentry_b, r) = r.split_at(felen);
     let (pc_b, r) = r.split_at(pc_len);
     let (ubo_b, r) = r.split_at(ubo_len);
+    // The SSBO blob is fixed-length (`ssbo_len` from the tail), so it carves here — AFTER the UBO bytes
+    // and BEFORE the trailing texture pixels (which the texture loop consumes from the remaining `r`).
+    let (ssbo_b, r) = r.split_at(ssbo_len);
 
     // Parse the attribute + draw arrays element-by-element (read_from_prefix copies, so the
     // byte-aligned payload needs no 4-alignment).
@@ -697,6 +726,14 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         None
     };
 
+    // Phase-2c SSBO: the read-only storage buffer, if any (`ssbo_len == 0` ⇒ none). `ssbo_b` was carved
+    // as a fixed-length blob (bounds already enforced above), so this is a pure copy.
+    let storage = if ssbo_len > 0 {
+        Some(OwnedStorage { binding: ssbo_binding, bytes: ssbo_b.to_vec() })
+    } else {
+        None
+    };
+
     Some(OwnedForwardedDraw {
         vertex_spirv,
         fragment_spirv,
@@ -716,6 +753,7 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
             textures,
             tex_binding,
             uniform,
+            storage,
             raster_flags: tail.raster_flags,
         }),
     })
@@ -3454,6 +3492,8 @@ mod tests {
         ubo_binding: u32,
         tex_binding: u32,
         raster_flags: u32,
+        ssbo: &[u8],
+        ssbo_binding: u32,
     ) -> Vec<u8> {
         use infinigpu_abi::wire::{index_type, vk_op, ForwardedCmdListTail, VulkanWorkload};
         use zerocopy::IntoBytes;
@@ -3489,6 +3529,8 @@ mod tests {
             ubo_binding,
             tex_binding,
             raster_flags,
+            ssbo_len: ssbo.len() as u32,
+            ssbo_binding,
         };
         let mut p = Vec::new();
         p.extend_from_slice(wl.as_bytes());
@@ -3510,6 +3552,7 @@ mod tests {
         p.extend_from_slice(fe);
         p.extend_from_slice(push_const);
         p.extend_from_slice(ubo);
+        p.extend_from_slice(ssbo);
         p.extend_from_slice(texpix);
         p
     }
@@ -3555,10 +3598,14 @@ mod tests {
         // Static raster state: cull BACK, front-face CW, blend on — a non-zero bitfield so a decode
         // that dropped or mis-placed the field surfaces.
         let rf = raster_flags::pack(cull_mode::BACK, true, true);
+        // A 48-byte read-only SSBO at binding 3 (distinct from UBO@0 and the texture's image@1/sampler@2),
+        // so the SSBO composes in set 0 without overlapping — and its blob sits between the UBO bytes and
+        // the trailing texture pixels, exercising the exact carve order.
+        let ssbo: Vec<u8> = (100u8..148).collect();
         let payload = encode_forwarded_cmdlist(
             32, 16, [0.1, 0.2, 0.3, 1.0], 0, &vspirv, &fspirv, c"vs", c"fs", 20, &attrs, &vdata,
             &idata, false, 1, df, &[0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4], &draws, &texs, &texpix,
-            &ubo, 0, 1, rf,
+            &ubo, 0, 1, rf, &ssbo, 3,
         );
 
         let o = decode_forwarded_cmdlist(&payload, CAP).expect("valid cmdlist decodes");
@@ -3591,6 +3638,9 @@ mod tests {
         let u = g.uniform.expect("ubo bytes decode to a uniform");
         assert_eq!(u.binding, 0, "ubo binding round-trips");
         assert_eq!(u.bytes, ubo, "ubo bytes round-trip (after push-const, before texpix)");
+        let s = g.storage.expect("ssbo bytes decode to a storage buffer");
+        assert_eq!(s.binding, 3, "ssbo binding round-trips");
+        assert_eq!(s.bytes, ssbo, "ssbo bytes round-trip (after ubo, before texpix)");
         assert_eq!(g.raster_flags, rf, "raster_flags round-trips (cull BACK / CW / blend)");
 
         // Hostile → None (fail-closed):
@@ -3613,14 +3663,14 @@ mod tests {
         overlap[40 + 60..40 + 64].copy_from_slice(&1u32.to_le_bytes()); // 1 collides with image@1
         assert!(decode_forwarded_cmdlist(&overlap, CAP).is_none(), "ubo/texture binding overlap rejected");
         // A texture whose data_len doesn't match width*height*4 is rejected. The single texdesc's
-        // data_len is its 3rd u32; the texdescs sit after VulkanWorkload(40) + tail(72) + attrs + draws.
-        let tex_off = 40 + 72 + attrs.len() * 12 + draws.len() * 32;
+        // data_len is its 3rd u32; the texdescs sit after VulkanWorkload(40) + tail(80) + attrs + draws.
+        let tex_off = 40 + 80 + attrs.len() * 12 + draws.len() * 32;
         let mut bad_texlen = payload.clone();
         bad_texlen[tex_off + 8..tex_off + 12].copy_from_slice(&99u32.to_le_bytes());
         assert!(decode_forwarded_cmdlist(&bad_texlen, CAP).is_none(), "texture data_len mismatch rejected");
-        // bad vertex SPIR-V magic (first vSPIR-V word sits after the VulkanWorkload(40) + tail(72) +
+        // bad vertex SPIR-V magic (first vSPIR-V word sits after the VulkanWorkload(40) + tail(80) +
         // attrs + draws + texdesc arrays).
-        let vspv_off = 40 + 72 + attrs.len() * 12 + draws.len() * 32 + texs.len() * 16;
+        let vspv_off = 40 + 80 + attrs.len() * 12 + draws.len() * 32 + texs.len() * 16;
         let mut bad_magic = payload.clone();
         bad_magic[vspv_off] = bad_magic[vspv_off].wrapping_add(1);
         assert!(decode_forwarded_cmdlist(&bad_magic, CAP).is_none(), "non-SPIR-V vertex blob rejected");
@@ -3652,7 +3702,7 @@ mod tests {
         ];
         let payload = encode_forwarded_cmdlist(
             8, 8, [0.0; 4], 0, &vspirv, &fspirv, c"m", c"m", 8, &attrs, &vdata, &[], false, 0, 0, &[],
-            &draws, &texs, &texpix, &[], 0, /*tex_binding*/ 0, 0,
+            &draws, &texs, &texpix, &[], 0, /*tex_binding*/ 0, 0, /*ssbo*/ &[], 0,
         );
         let o = decode_forwarded_cmdlist(&payload, CAP).expect("two-texture cmdlist decodes");
         let g = o.geometry.expect("geometry");
@@ -3738,7 +3788,7 @@ mod tests {
         let scanout_addr = GUEST_BASE + SCAN_OFF as u64;
         let payload = encode_forwarded_cmdlist(
             w, h, bg, scanout_addr, &vs, &fs, c"main", c"main", 20, &attrs, &vdata, &[], false, 0, 0,
-            &[], &draws, &[], &[], &[], 0, 0, 0,
+            &[], &draws, &[], &[], &[], 0, 0, 0, /*ssbo*/ &[], 0,
         );
         let sc = infinigpu_abi::wire::SubmitCmd {
             ctx_id: 0,

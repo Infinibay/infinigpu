@@ -82,6 +82,9 @@ unsafe extern "C" {
         ubo: *const u8,
         ubo_len: u32,
         ubo_binding: u32,
+        ssbo: *const u8,
+        ssbo_len: u32,
+        ssbo_binding: u32,
         draws: *const u8,
         draw_count: u32,
         texs: *const u8,
@@ -180,6 +183,8 @@ pub fn encode_forwarded_cmdlist(
     texpix: &[u8],
     ubo: &[u8],
     ubo_binding: u32,
+    ssbo: &[u8],
+    ssbo_binding: u32,
     tex_binding: u32,
     raster_flags: u32,
 ) -> Vec<u8> {
@@ -193,6 +198,7 @@ pub fn encode_forwarded_cmdlist(
         + index_data.len()
         + push_const.len()
         + ubo.len()
+        + ssbo.len()
         + texpix.len()
         + vertex_entry.to_bytes_with_nul().len()
         + fragment_entry.to_bytes_with_nul().len();
@@ -226,6 +232,9 @@ pub fn encode_forwarded_cmdlist(
             ubo.as_ptr(),
             ubo.len() as u32,
             ubo_binding,
+            ssbo.as_ptr(),
+            ssbo.len() as u32,
+            ssbo_binding,
             draws.as_ptr() as *const u8,
             draws.len() as u32,
             texs.as_ptr() as *const u8,

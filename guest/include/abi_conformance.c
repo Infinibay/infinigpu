@@ -55,10 +55,11 @@ _Static_assert(offsetof(struct VulkanWorkload, scanout_addr) == 32, "VulkanWorkl
 _Static_assert(sizeof(struct ForwardedDrawTail) == 24, "ForwardedDrawTail size");
 
 /* Phase-2b forwarded command list — real mesh (ABI 0.8; grew to 52 B in 0.9 with push_const_len,
- * to 56 B in 0.10 with tex_count, then to 68 B in 0.11 with ubo_len/ubo_binding/tex_binding). The
- * encoder in infinigpu_forwarded.c depends on these exact sizes so the trailing sections land where
- * the host decoder reads them. */
-_Static_assert(sizeof(struct ForwardedCmdListTail) == 72, "ForwardedCmdListTail size");
+ * to 56 B in 0.10 with tex_count, to 68 B in 0.11 with ubo_len/ubo_binding/tex_binding, to 72 B in
+ * 0.12 with raster_flags, then to 80 B in 0.13 with ssbo_len/ssbo_binding). The encoder in
+ * infinigpu_forwarded.c depends on these exact sizes so the trailing sections land where the host
+ * decoder reads them. */
+_Static_assert(sizeof(struct ForwardedCmdListTail) == 80, "ForwardedCmdListTail size");
 _Static_assert(offsetof(struct ForwardedCmdListTail, vertex_stride) == 16, "ForwardedCmdListTail.vertex_stride offset");
 _Static_assert(offsetof(struct ForwardedCmdListTail, draw_count) == 36, "ForwardedCmdListTail.draw_count offset");
 _Static_assert(offsetof(struct ForwardedCmdListTail, push_const_len) == 48, "ForwardedCmdListTail.push_const_len offset");
@@ -67,6 +68,8 @@ _Static_assert(offsetof(struct ForwardedCmdListTail, ubo_len) == 56, "ForwardedC
 _Static_assert(offsetof(struct ForwardedCmdListTail, ubo_binding) == 60, "ForwardedCmdListTail.ubo_binding offset");
 _Static_assert(offsetof(struct ForwardedCmdListTail, tex_binding) == 64, "ForwardedCmdListTail.tex_binding offset");
 _Static_assert(offsetof(struct ForwardedCmdListTail, raster_flags) == 68, "ForwardedCmdListTail.raster_flags offset");
+_Static_assert(offsetof(struct ForwardedCmdListTail, ssbo_len) == 72, "ForwardedCmdListTail.ssbo_len offset");
+_Static_assert(offsetof(struct ForwardedCmdListTail, ssbo_binding) == 76, "ForwardedCmdListTail.ssbo_binding offset");
 _Static_assert(sizeof(struct VertexAttrWire) == 12, "VertexAttrWire size");
 _Static_assert(sizeof(struct DrawCmdWire) == 32, "DrawCmdWire size");
 _Static_assert(offsetof(struct DrawCmdWire, vp_x) == 16, "DrawCmdWire.vp_x offset");

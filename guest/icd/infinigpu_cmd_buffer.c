@@ -321,7 +321,7 @@ infinigpu_CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
    for (uint32_t i = 0; i < descriptorSetCount; i++) {
       struct infinigpu_descriptor_set *set =
          infinigpu_descriptor_set_from_handle(pDescriptorSets[i]);
-      if (set && (set->texture_count > 0 || set->ubo_buffer))
+      if (set && (set->texture_count > 0 || set->ubo_buffer || set->ssbo_buffer))
          cmd->bound_desc_set = set;
    }
 }

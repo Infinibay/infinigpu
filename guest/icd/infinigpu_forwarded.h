@@ -115,8 +115,11 @@ size_t infinigpu_encode_forwarded(uint8_t *out, size_t cap,
  * (VERTEX|FRAGMENT). `tex_binding` is the sampled image's binding (sampler at `tex_binding+1`); it lets
  * a UBO and a texture share set 0 at distinct bindings (e.g. UBO@0, image@1, sampler@2). Full section
  * order: attrs · draws · texdescs · vSPIR-V · fSPIR-V · vertex data · index data · vertex entry ·
- * fragment entry · push constants · UBO bytes · texture pixels. `index_data_len == 0` ⇒ non-indexed;
- * `tex_count == 0` ⇒ untextured; `ubo_len == 0` ⇒ no UBO. `raster_flags` (Phase-2d-A5) is the static
+ * fragment entry · push constants · UBO bytes · SSBO bytes · texture pixels. The SSBO bytes (`ssbo`,
+ * `ssbo_len`) are a fixed-length blob after the UBO bytes and before `texpix`; the host uploads them into
+ * a STORAGE_BUFFER at binding `ssbo_binding` (VERTEX|FRAGMENT), read-only. `index_data_len == 0` ⇒
+ * non-indexed; `tex_count == 0` ⇒ untextured; `ubo_len == 0` ⇒ no UBO; `ssbo_len == 0` ⇒ no SSBO.
+ * `raster_flags` (Phase-2d-A5) is the static
  * fixed-function state bitfield (cull/front-face/blend); 0 ⇒ the pre-0.12 default (cull NONE / CCW /
  * blend off). Returns the total byte length, or 0 if it would not fit `cap` (or the geometry is
  * degenerate). The caller wraps the result in a SUBMIT_CMD (encoding VULKAN_VENUSLIKE), the same as
@@ -135,6 +138,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
     uint32_t topology, uint32_t depth_flags,
     const uint8_t *push_const, uint32_t push_const_len,
     const uint8_t *ubo, uint32_t ubo_len, uint32_t ubo_binding,
+    const uint8_t *ssbo, uint32_t ssbo_len, uint32_t ssbo_binding,
     const struct DrawCmdWire *draws, uint32_t draw_count,
     const struct TextureDescWire *texs, uint32_t tex_count, uint32_t tex_binding,
     const uint8_t *texpix, uint32_t texpix_len, uint32_t raster_flags);

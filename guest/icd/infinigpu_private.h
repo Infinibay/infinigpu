@@ -220,6 +220,12 @@ struct infinigpu_descriptor_set {
    uint64_t ubo_offset;
    uint64_t ubo_range;
    uint32_t ubo_binding;                  /* dstBinding the UBO was written at */
+   /* Phase-2c read-only storage buffer bound here (NULL ⇒ none). Composes with the UBO + textures in the
+    * same set at a distinct binding. Same clamp/resolve rules as the UBO; forwarded as bytes (no writeback). */
+   struct infinigpu_buffer *ssbo_buffer;
+   uint64_t ssbo_offset;
+   uint64_t ssbo_range;
+   uint32_t ssbo_binding;                 /* dstBinding the SSBO was written at */
 };
 
 /* A deferred image->buffer copy, executed at submit AFTER the draw so the host

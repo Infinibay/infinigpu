@@ -61,7 +61,16 @@ pub const ABI_MAJOR: u16 = 0;
 /// pre-v12 command list (no such field) is unaffected; but since the tail size changed, a v12 guest
 /// must gate on `negotiated_minor >= 12` before sending a command list (an older host would misparse
 /// the trailing sections). Fixes back-face overdraw and opaque transparency in real 3D scenes.
-pub const ABI_MINOR: u16 = 12;
+/// v13 grew the tail by `ssbo_len` + `ssbo_binding` (72→80 B) + a fixed-length SSBO byte blob (after the
+/// UBO bytes, before the trailing texture pixels) — a READ-ONLY storage buffer bound VERTEX|FRAGMENT in
+/// descriptor set 0, so a DXVK-translated structured/raw SRV (or a skinning-matrix palette / per-instance
+/// data) reads real bytes instead of the previously-dropped binding. The host uploads the bytes into a
+/// `STORAGE_BUFFER` at `ssbo_binding` (composing with the UBO + textures in the same set); it is never
+/// written back (a shader write is discarded). Bounded ≤ `MAX_SSBO_BYTES` (16 MiB), a far larger cap than
+/// the UBO's since `maxStorageBufferRange` ≥ 128 MiB. Since the tail size changed, gate on
+/// `negotiated_minor >= 13` before sending an SSBO command list (an older host would misparse the
+/// trailing sections). Single-SSBO only in v13 (last-write-wins); N-SSBO is a later additive step.
+pub const ABI_MINOR: u16 = 13;
 
 /// Packed `ABI_VERSION` register value (`major << 16 | minor`).
 pub const fn abi_version() -> u32 {

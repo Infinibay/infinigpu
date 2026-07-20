@@ -372,12 +372,32 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       }
    }
 
+   /* Phase-2c storage buffer (SSBO): identical to the UBO capture but STORAGE_BUFFER and a far larger
+    * cap (matches host MAX_SSBO_BYTES = 16 MiB; maxStorageBufferRange is >= 128 MiB). Read-only — the
+    * host never writes it back. Same OOB-read clamp as the UBO (an app's explicit range may overrun). */
+   const uint8_t *ssbo = NULL;
+   uint32_t ssbo_len = 0;
+   uint32_t ssbo_binding = 0;
+   if (ds) {
+      if (ds->ssbo_buffer && ds->ssbo_buffer->map && ds->ssbo_offset < ds->ssbo_buffer->total_size) {
+         uint64_t savail = ds->ssbo_buffer->total_size - ds->ssbo_offset;
+         uint64_t range = (ds->ssbo_range == VK_WHOLE_SIZE) ? savail : ds->ssbo_range;
+         if (range > savail)
+            range = savail;
+         if (range > 0 && range <= (16u * 1024u * 1024u)) {
+            ssbo = (const uint8_t *)ds->ssbo_buffer->map + ds->ssbo_offset;
+            ssbo_len = (uint32_t)range;
+            ssbo_binding = ds->ssbo_binding;
+         }
+      }
+   }
+
    const size_t cap = 256 + vs->spirv_size + fs->spirv_size +
                       strlen(vs->entrypoint) + 1 + strlen(fs->entrypoint) + 1 +
                       (size_t)p->attr_count * sizeof(struct VertexAttrWire) +
                       (size_t)cmd->draw_count * sizeof(struct DrawCmdWire) +
                       (size_t)tex_count * sizeof(struct TextureDescWire) +
-                      vlen + ilen + cmd->push_const_len + ubo_len + texpix_len;
+                      vlen + ilen + cmd->push_const_len + ubo_len + ssbo_len + texpix_len;
    uint8_t *payload = malloc(cap);
    if (!payload) {
       free(draws);
@@ -414,6 +434,7 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       topo_final, depth_flags,
       cmd->push_const, cmd->push_const_len,
       ubo, ubo_len, ubo_binding,
+      ssbo, ssbo_len, ssbo_binding,
       draws, cmd->draw_count,
       tex_count ? texs : NULL, tex_count, tex_binding, texpix, texpix_len,
       raster_flags);

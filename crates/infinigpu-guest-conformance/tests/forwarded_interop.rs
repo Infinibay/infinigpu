@@ -96,6 +96,9 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
     // A UBO at binding 0 composing with the texture at image@1 / sampler@2 (tex_binding=1) — exercises
     // the Phase-2c UBO byte blob (after push-const, before texpix) + the binding-composition fields.
     let ubo: Vec<u8> = (100u8..140).collect(); // 40 recognizable bytes
+    // A read-only SSBO at binding 3 (distinct from UBO@0 and image@1/sampler@2) — exercises the Phase-2c
+    // SSBO byte blob (after the UBO bytes, before texpix) + the binding-composition through the C encoder.
+    let ssbo: Vec<u8> = (200u8..240).collect(); // 40 recognizable bytes
     let payload = guest::encode_forwarded_cmdlist(
         640,
         480,
@@ -118,6 +121,8 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
         &texpix,
         &ubo,
         0, // ubo_binding
+        &ssbo,
+        3, // ssbo_binding
         1, // tex_binding (image@1, sampler@2)
         infinigpu_abi::wire::raster_flags::pack(infinigpu_abi::wire::cull_mode::BACK, true, true),
     );
@@ -154,6 +159,9 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
     let u = g.uniform.expect("ubo bytes decode to a uniform");
     assert_eq!(u.binding, 0, "ubo binding survives C→Rust");
     assert_eq!(u.bytes, ubo, "ubo bytes survive C→Rust (blob after push-const, before texpix)");
+    let s = g.storage.expect("ssbo bytes decode to a storage buffer");
+    assert_eq!(s.binding, 3, "ssbo binding survives C→Rust");
+    assert_eq!(s.bytes, ssbo, "ssbo bytes survive C→Rust (blob after ubo, before texpix)");
     assert_eq!(
         g.raster_flags,
         infinigpu_abi::wire::raster_flags::pack(infinigpu_abi::wire::cull_mode::BACK, true, true),
@@ -187,7 +195,7 @@ fn c_cmdlist_encoder_two_textures_decode() {
     ];
     let payload = guest::encode_forwarded_cmdlist(
         64, 64, [0.0; 4], 0, &vspirv, &fspirv, c"m", c"m", 8, &attrs, &vertex_data, &[], false, 0, 0,
-        &[], &draws, &texs, &texpix, &[], 0, /*tex_binding*/ 0, 0,
+        &[], &draws, &texs, &texpix, &[], 0, /*ssbo*/ &[], 0, /*tex_binding*/ 0, 0,
     );
     let o = decode_forwarded_cmdlist(&payload, CAP).expect("C two-texture cmdlist must decode");
     let g = o.geometry.expect("geometry");

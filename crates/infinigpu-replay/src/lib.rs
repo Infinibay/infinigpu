@@ -184,6 +184,11 @@ pub struct Geometry<'a> {
     /// (VERTEX|FRAGMENT), for a shader's `var<uniform>` block (e.g. per-frame matrices). `None` ⇒ no
     /// UBO. Composes with `texture` in the same set at a distinct binding.
     pub uniform: Option<UniformBlock<'a>>,
+    /// One READ-ONLY storage buffer (Phase-2c SSBO) bound at descriptor set 0 binding `storage.binding`
+    /// (VERTEX|FRAGMENT), for a shader's `var<storage>` block (a DXVK structured/raw SRV, a skinning
+    /// palette, per-instance data). `None` ⇒ no SSBO. Composes with the UBO + textures in the same set
+    /// at a distinct binding. Never written back (a shader write is discarded — read-only scope).
+    pub storage: Option<StorageBlock<'a>>,
     /// Static fixed-function rasterization + blend state (Phase-2d-A5) as an
     /// [`infinigpu_abi::wire::raster_flags`] bitfield: cull mode, front-face winding, alpha-blend
     /// enable. `0` ⇒ cull NONE / front-face CCW / blend off — the state `build_pipeline` hardcoded
@@ -197,6 +202,13 @@ pub struct Geometry<'a> {
 /// common case. The device decode enforces the same cap fail-closed.
 pub const MAX_TEXTURES: usize = 8;
 
+/// Max bytes a single forwarded storage buffer (SSBO) may carry. Deliberately far larger than the UBO's
+/// 64 KiB cap — Vulkan guarantees `maxStorageBufferRange` ≥ 128 MiB, and real SSBO content (skinning
+/// palettes, per-instance arrays, DXVK structured buffers) routinely exceeds 64 KiB. 16 MiB comfortably
+/// covers that while staying under the whole-payload ceiling (`MAX_CMD_BYTES`). Enforced identically at
+/// the device decode, this host reject, and the guest clamp.
+pub const MAX_SSBO_BYTES: usize = 16 * 1024 * 1024;
+
 /// A forwarded uniform buffer (Phase-2c): a declared descriptor-set-0 binding + the raw bytes the host
 /// uploads into a `UNIFORM_BUFFER` for the shader's `var<uniform>` block to read (VERTEX|FRAGMENT).
 #[derive(Clone, Copy)]
@@ -204,6 +216,18 @@ pub struct UniformBlock<'a> {
     /// Descriptor-set-0 binding this UBO occupies (must differ from the texture's image/sampler bindings).
     pub binding: u32,
     /// The uniform bytes (host uploads verbatim; std140 layout is the shader author's concern).
+    pub bytes: &'a [u8],
+}
+
+/// A forwarded READ-ONLY storage buffer (Phase-2c SSBO): a declared descriptor-set-0 binding + the raw
+/// bytes the host uploads into a `STORAGE_BUFFER` for the shader's `var<storage>` block to read
+/// (VERTEX|FRAGMENT). std430 layout is the shader author's concern (opaque bytes host-side); never
+/// written back.
+#[derive(Clone, Copy)]
+pub struct StorageBlock<'a> {
+    /// Descriptor-set-0 binding this SSBO occupies (must differ from the UBO + texture bindings).
+    pub binding: u32,
+    /// The storage bytes (host uploads verbatim).
     pub bytes: &'a [u8],
 }
 
@@ -692,20 +716,23 @@ struct DescriptorSig {
     tex_binding: Option<u32>,
     /// Number of sampled textures (each an image+sampler pair). `0` ⇒ none.
     tex_count: u32,
+    /// Binding of the read-only storage buffer (SSBO); `None` ⇒ no SSBO. Present iff the draw has one.
+    ssbo_binding: Option<u32>,
 }
 
 /// The descriptor-set signature a draw needs, or `None` if it binds no descriptor resources (Phase-2c).
 /// Textures bind image+sampler pairs from `tex_binding` (texture `i` at `+2i`/`+2i+1`); a UBO at its
-/// `binding`.
+/// `binding`; an SSBO at its `binding`.
 fn desc_sig_of(draw: &ForwardedDraw) -> Option<DescriptorSig> {
     let g = draw.geometry.as_ref()?;
     let ubo_binding = g.uniform.as_ref().map(|u| u.binding);
+    let ssbo_binding = g.storage.as_ref().map(|s| s.binding);
     let tex_count = g.textures.len() as u32;
     let tex_binding = (tex_count > 0).then_some(g.tex_binding);
-    if ubo_binding.is_none() && tex_binding.is_none() {
+    if ubo_binding.is_none() && tex_binding.is_none() && ssbo_binding.is_none() {
         None
     } else {
-        Some(DescriptorSig { ubo_binding, tex_binding, tex_count })
+        Some(DescriptorSig { ubo_binding, tex_binding, tex_count, ssbo_binding })
     }
 }
 
@@ -908,14 +935,32 @@ impl UniformGpu {
     }
 }
 
+/// Phase-2c SSBO: the guest's storage buffer uploaded to a host-visible+coherent `STORAGE_BUFFER` for
+/// **one** submit — the forwarded bytes memcpy straight in (read-only, no writeback). Freed after the
+/// submit fence. Same shape as [`UniformGpu`]; distinct type so the descriptor write can't confuse them.
+struct StorageGpu {
+    buffer: vk::Buffer,
+    mem: vk::DeviceMemory,
+}
+
+impl StorageGpu {
+    /// # Safety
+    /// `dev` must be the owning device and no submit referencing the buffer may still be in flight.
+    unsafe fn destroy(&self, dev: &ash::Device) {
+        dev.destroy_buffer(self.buffer, None);
+        dev.free_memory(self.mem, None);
+    }
+}
+
 /// Phase-2c: descriptor set 0 for **one** submit — a pool, the single set allocated from it, and the
-/// resources written into that set (a UBO and/or a texture at their declared bindings). Composing both
-/// into one set is what lets a real app use per-frame uniforms AND a texture at once. Destroyed after
-/// the submit fence (the pool frees the set; the buffer/image objects are freed too).
+/// resources written into that set (a UBO, an SSBO, and/or textures at their declared bindings). Composing
+/// them into one set is what lets a real app use per-frame uniforms AND a storage buffer AND a texture at
+/// once. Destroyed after the submit fence (the pool frees the set; the buffer/image objects are freed too).
 struct FrameDescriptors {
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
     ubo: Option<UniformGpu>,
+    ssbo: Option<StorageGpu>,
     tex: Vec<TextureGpu>,
 }
 
@@ -928,6 +973,9 @@ impl FrameDescriptors {
         }
         if let Some(u) = &self.ubo {
             u.destroy(dev);
+        }
+        if let Some(s) = &self.ssbo {
+            s.destroy(dev);
         }
         for t in &self.tex {
             t.destroy(dev);
@@ -2348,7 +2396,7 @@ impl HostGpu {
                 let g = draw.geometry.as_ref().expect("desc_sig_of ⇒ geometry present");
                 let built = self
                     .desc_set_layout(sig)
-                    .and_then(|sl| self.build_frame_descriptors(g.uniform.as_ref(), g.textures, g.tex_binding, sl));
+                    .and_then(|sl| self.build_frame_descriptors(g.uniform.as_ref(), g.storage.as_ref(), g.textures, g.tex_binding, sl));
                 match built {
                     Ok(d) => Some(d),
                     Err(e) => {
@@ -2570,6 +2618,15 @@ impl HostGpu {
                     .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
             );
         }
+        if let Some(b) = sig.ssbo_binding {
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            );
+        }
         if let Some(base) = sig.tex_binding {
             // Texture i: sampled image @ base+2i, sampler @ base+2i+1 (FRAGMENT).
             for i in 0..sig.tex_count {
@@ -2752,6 +2809,7 @@ impl HostGpu {
     fn build_frame_descriptors(
         &self,
         uniform: Option<&UniformBlock>,
+        storage: Option<&StorageBlock>,
         textures: &[Texture],
         tex_base: u32,
         set_layout: vk::DescriptorSetLayout,
@@ -2763,12 +2821,20 @@ impl HostGpu {
                 return Err(format!("bad uniform block ({} bytes)", u.bytes.len()).into());
             }
         }
+        // Same for the SSBO, but with the far-larger storage cap (mirrors the device decode).
+        if let Some(s) = storage {
+            if s.bytes.is_empty() || s.bytes.len() > MAX_SSBO_BYTES {
+                return Err(format!("bad storage block ({} bytes)", s.bytes.len()).into());
+            }
+        }
         if textures.len() > MAX_TEXTURES {
             return Err(format!("too many textures ({} > {MAX_TEXTURES})", textures.len()).into());
         }
         let mut pool = vk::DescriptorPool::null();
         let mut ubo_buf = vk::Buffer::null();
         let mut ubo_mem = vk::DeviceMemory::null();
+        let mut ssbo_buf = vk::Buffer::null();
+        let mut ssbo_mem = vk::DeviceMemory::null();
         let mut build = || -> R<FrameDescriptors> {
             unsafe {
                 let mut sizes: Vec<vk::DescriptorPoolSize> = Vec::new();
@@ -2776,6 +2842,13 @@ impl HostGpu {
                     sizes.push(
                         vk::DescriptorPoolSize::default()
                             .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                            .descriptor_count(1),
+                    );
+                }
+                if storage.is_some() {
+                    sizes.push(
+                        vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::STORAGE_BUFFER)
                             .descriptor_count(1),
                     );
                 }
@@ -2838,6 +2911,45 @@ impl HostGpu {
                     None
                 };
 
+                // SSBO next — identical to the UBO block but STORAGE_BUFFER, read-only, bound at offset 0
+                // (sidesteps minStorageBufferOffsetAlignment). No barrier: host-coherent + read-only.
+                let ssbo = if let Some(s) = storage {
+                    ssbo_buf = dev.create_buffer(
+                        &vk::BufferCreateInfo::default()
+                            .size(s.bytes.len() as u64)
+                            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                            .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                        None,
+                    )?;
+                    let req = dev.get_buffer_memory_requirements(ssbo_buf);
+                    ssbo_mem = dev.allocate_memory(
+                        &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(
+                            self.find_mem(
+                                req.memory_type_bits,
+                                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                            )?,
+                        ),
+                        None,
+                    )?;
+                    dev.bind_buffer_memory(ssbo_buf, ssbo_mem, 0)?;
+                    let ptr = dev.map_memory(ssbo_mem, 0, s.bytes.len() as u64, vk::MemoryMapFlags::empty())?;
+                    std::ptr::copy_nonoverlapping(s.bytes.as_ptr(), ptr as *mut u8, s.bytes.len());
+                    dev.unmap_memory(ssbo_mem);
+                    let binfo = [vk::DescriptorBufferInfo::default()
+                        .buffer(ssbo_buf)
+                        .offset(0)
+                        .range(s.bytes.len() as u64)];
+                    let writes = [vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(s.binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&binfo)];
+                    dev.update_descriptor_sets(&writes, &[]);
+                    Some(StorageGpu { buffer: ssbo_buf, mem: ssbo_mem })
+                } else {
+                    None
+                };
+
                 // Textures last — upload_texture_into writes each into the shared set at its binding and
                 // self-cleans on error. Already-built TextureGpus are collected so an error mid-way frees
                 // them (via the outer map_err path, which destroys the pool; the built textures are freed
@@ -2856,7 +2968,7 @@ impl HostGpu {
                     }
                 }
 
-                Ok(FrameDescriptors { pool, set, ubo, tex: tgpu })
+                Ok(FrameDescriptors { pool, set, ubo, ssbo, tex: tgpu })
             }
         };
         build().map_err(|e| {
@@ -2866,6 +2978,12 @@ impl HostGpu {
                 }
                 if ubo_mem != vk::DeviceMemory::null() {
                     dev.free_memory(ubo_mem, None);
+                }
+                if ssbo_buf != vk::Buffer::null() {
+                    dev.destroy_buffer(ssbo_buf, None);
+                }
+                if ssbo_mem != vk::DeviceMemory::null() {
+                    dev.free_memory(ssbo_mem, None);
                 }
                 if pool != vk::DescriptorPool::null() {
                     dev.destroy_descriptor_pool(pool, None); // frees the set
@@ -4259,6 +4377,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 textures: &[],
                 tex_binding: 0,
                 uniform: None,
+                storage: None,
                 raster_flags: 0,
             }),
         };
@@ -4377,6 +4496,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 textures: &[],
                 tex_binding: 0,
                 uniform: None,
+                storage: None,
                 raster_flags: 0,
             }),
         };
@@ -4467,6 +4587,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     textures: &[],
                     tex_binding: 0,
                     uniform: None,
+                    storage: None,
                     raster_flags: 0,
                 }),
             };
@@ -4581,6 +4702,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     textures: &[],
                     tex_binding: 0,
                     uniform: None,
+                    storage: None,
                     raster_flags: 0,
                 }),
             };
@@ -4686,6 +4808,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 }],
                 tex_binding: 0,
                 uniform: None,
+                storage: None,
                 raster_flags: 0,
             }),
         };
@@ -4772,6 +4895,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     textures: &[],
                     tex_binding: 0,
                     uniform: Some(UniformBlock { binding: 0, bytes: &ubo }),
+                    storage: None,
                     raster_flags: 0,
                 }),
             };
@@ -4796,6 +4920,189 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
              (cx0={cx0}, cxR={cx_right}) — the UBO didn't reach the vertex stage"
         );
         eprintln!("forwarded_uniform_only_offsets_geometry: OK (shift={shift}px ~ {expected}px)");
+    }
+
+    /// Phase-2c SSBO: a read-only `var<storage>` block reaches the VERTEX stage — the shader offsets each
+    /// vertex by the SSBO's xy, so a +0.5 NDC x-offset moves the triangle right by ~0.25·w vs a zero
+    /// offset. Proves the host builds a STORAGE_BUFFER descriptor (VERTEX|FRAGMENT), uploads the bytes,
+    /// and binds it — the piece a DXVK structured/raw SRV (or a skinning palette) needs.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_storage_only_offsets_geometry() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let vs = compile_wgsl(
+            "@group(0) @binding(0) var<storage, read> s: vec4<f32>;\n\
+             struct VOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };\n\
+             @vertex fn main(@location(0) p: vec2<f32>, @location(1) c: vec3<f32>) -> VOut {\n\
+               return VOut(vec4<f32>(p + s.xy, 0.0, 1.0), c);\n}",
+            naga::ShaderStage::Vertex,
+        );
+        let fs = compile_wgsl(
+            "@fragment fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {\n\
+               return vec4<f32>(c, 1.0);\n}",
+            naga::ShaderStage::Fragment,
+        );
+        use infinigpu_abi::wire::vk_vformat as V;
+        let attrs = [
+            VertexAttr { location: 0, format: V::R32G32_SFLOAT, offset: 0 },
+            VertexAttr { location: 1, format: V::R32G32B32_SFLOAT, offset: 8 },
+        ];
+        let tri: [[f32; 5]; 3] =
+            [[0.0, -0.3, 1.0, 0.0, 0.0], [-0.3, 0.3, 1.0, 0.0, 0.0], [0.3, 0.3, 1.0, 0.0, 0.0]];
+        let verts: Vec<u8> = tri.iter().flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes())).collect();
+        let draws = [DrawCmd { count: 3, instance_count: 1, first: 0, vertex_offset: 0, viewport: [0.0; 4] }];
+        let (w, h) = (128u32, 128u32);
+        let bg = [0.0, 0.0, 0.0, 1.0];
+
+        let centroid_x = |off: [f32; 4]| -> f32 {
+            let ssbo: Vec<u8> = off.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let draw = ForwardedDraw {
+                vertex_spirv: &vs,
+                vertex_entry: c"main",
+                fragment_spirv: &fs,
+                fragment_entry: c"main",
+                vertex_count: 0,
+                topology: 0,
+                geometry: Some(Geometry {
+                    vertex_data: &verts,
+                    vertex_stride: 20,
+                    attrs: &attrs,
+                    index_data: &[],
+                    index_u32: false,
+                    draws: &draws,
+                    depth: None,
+                    push_constants: &[],
+                    textures: &[],
+                    tex_binding: 0,
+                    uniform: None,
+                    storage: Some(StorageBlock { binding: 0, bytes: &ssbo }),
+                    raster_flags: 0,
+                }),
+            };
+            let frame = gpu.render_forwarded(w, h, bg, &draw).expect("storage render");
+            let (mut sum, mut n) = (0f64, 0f64);
+            for (i, p) in frame.rgba.chunks_exact(4).enumerate() {
+                if p[0] > 128 {
+                    sum += (i as u32 % w) as f64;
+                    n += 1.0;
+                }
+            }
+            assert!(n > 50.0, "the triangle should light many pixels ({n})");
+            (sum / n) as f32
+        };
+        let cx0 = centroid_x([0.0, 0.0, 0.0, 0.0]);
+        let cx_right = centroid_x([0.5, 0.0, 0.0, 0.0]);
+        let shift = cx_right - cx0;
+        let expected = 0.25 * w as f32;
+        assert!(
+            (shift - expected).abs() < w as f32 * 0.06,
+            "SSBO x-offset must move the triangle right ~{expected}px; got {shift}px \
+             (cx0={cx0}, cxR={cx_right}) — the SSBO didn't reach the vertex stage"
+        );
+        eprintln!("forwarded_storage_only_offsets_geometry: OK (shift={shift}px ~ {expected}px)");
+    }
+
+    /// Phase-2c composition: a UBO **and** an SSBO — two DIFFERENT buffer descriptor types — in ONE set at
+    /// distinct bindings. The VS offsets x by the UBO (binding 0) and y by the SSBO (binding 1); asserting
+    /// BOTH shifts proves the host's dynamic descriptor-set-0 layout mixes a UNIFORM_BUFFER and a
+    /// STORAGE_BUFFER correctly (what a real DXVK draw with both a constant buffer and a structured SRV needs).
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_uniform_and_storage_compose() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let vs = compile_wgsl(
+            "@group(0) @binding(0) var<uniform> u: vec4<f32>;\n\
+             @group(0) @binding(1) var<storage, read> s: vec4<f32>;\n\
+             struct VOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };\n\
+             @vertex fn main(@location(0) p: vec2<f32>, @location(1) c: vec3<f32>) -> VOut {\n\
+               return VOut(vec4<f32>(p.x + u.x, p.y + s.y, 0.0, 1.0), c);\n}",
+            naga::ShaderStage::Vertex,
+        );
+        let fs = compile_wgsl(
+            "@fragment fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {\n\
+               return vec4<f32>(c, 1.0);\n}",
+            naga::ShaderStage::Fragment,
+        );
+        use infinigpu_abi::wire::vk_vformat as V;
+        let attrs = [
+            VertexAttr { location: 0, format: V::R32G32_SFLOAT, offset: 0 },
+            VertexAttr { location: 1, format: V::R32G32B32_SFLOAT, offset: 8 },
+        ];
+        let tri: [[f32; 5]; 3] =
+            [[0.0, -0.3, 1.0, 0.0, 0.0], [-0.3, 0.3, 1.0, 0.0, 0.0], [0.3, 0.3, 1.0, 0.0, 0.0]];
+        let verts: Vec<u8> = tri.iter().flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes())).collect();
+        let draws = [DrawCmd { count: 3, instance_count: 1, first: 0, vertex_offset: 0, viewport: [0.0; 4] }];
+        let (w, h) = (128u32, 128u32);
+        let bg = [0.0, 0.0, 0.0, 1.0];
+
+        // Returns the (x, y) centroid of the lit triangle for a given UBO x-offset + SSBO y-offset.
+        let centroid = |ux: f32, sy: f32| -> (f32, f32) {
+            let ubo: Vec<u8> = [ux, 0.0, 0.0, 0.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+            let ssbo: Vec<u8> = [0.0, sy, 0.0, 0.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+            let draw = ForwardedDraw {
+                vertex_spirv: &vs,
+                vertex_entry: c"main",
+                fragment_spirv: &fs,
+                fragment_entry: c"main",
+                vertex_count: 0,
+                topology: 0,
+                geometry: Some(Geometry {
+                    vertex_data: &verts,
+                    vertex_stride: 20,
+                    attrs: &attrs,
+                    index_data: &[],
+                    index_u32: false,
+                    draws: &draws,
+                    depth: None,
+                    push_constants: &[],
+                    textures: &[],
+                    tex_binding: 0,
+                    uniform: Some(UniformBlock { binding: 0, bytes: &ubo }),
+                    storage: Some(StorageBlock { binding: 1, bytes: &ssbo }),
+                    raster_flags: 0,
+                }),
+            };
+            let frame = gpu.render_forwarded(w, h, bg, &draw).expect("compose render");
+            let (mut sx, mut sy2, mut n) = (0f64, 0f64, 0f64);
+            for (i, p) in frame.rgba.chunks_exact(4).enumerate() {
+                if p[0] > 128 {
+                    sx += (i as u32 % w) as f64;
+                    sy2 += (i as u32 / w) as f64;
+                    n += 1.0;
+                }
+            }
+            assert!(n > 50.0, "the triangle should light many pixels ({n})");
+            ((sx / n) as f32, (sy2 / n) as f32)
+        };
+        let (cx0, cy0) = centroid(0.0, 0.0);
+        let (cx_r, cy_v) = centroid(0.5, 0.5); // UBO shifts +x (right); SSBO shifts y (the host y-flips NDC)
+        let dx = cx_r - cx0;
+        let dy = cy_v - cy0;
+        let expected = 0.25 * w as f32;
+        // UBO drives x → a definite rightward shift (same convention as the UBO-only test).
+        assert!(
+            (dx - expected).abs() < w as f32 * 0.06,
+            "UBO x-offset must shift the triangle right ~{expected}px; got {dx}px — UBO half of the set failed"
+        );
+        // SSBO drives y → a shift of the right MAGNITUDE (direction depends on the host's y-flip, which is
+        // orthogonal to this test — what matters is the SSBO's bytes reached the vertex stage).
+        assert!(
+            (dy.abs() - expected).abs() < h as f32 * 0.06,
+            "SSBO y-offset must shift the triangle ~{expected}px vertically; got {dy}px — SSBO half of the set failed"
+        );
+        eprintln!("forwarded_uniform_and_storage_compose: OK (dx={dx}px dy={dy}px ~ {expected}px)");
     }
 
     /// Phase-2c composition: a UBO **and** a texture in ONE descriptor set at distinct bindings — the
@@ -4870,6 +5177,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     }],
                     tex_binding: 1, // image@1, sampler@2 — composes with the UBO@0
                     uniform: Some(UniformBlock { binding: 0, bytes: &ubo }),
+                    storage: None,
                     raster_flags: 0,
                 }),
             };
@@ -4969,6 +5277,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     textures: &[],
                     tex_binding: 0,
                     uniform: None,
+                    storage: None,
                     raster_flags: rf,
                 }),
             };
@@ -5042,6 +5351,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     textures: &[],
                     tex_binding: 0,
                     uniform: None,
+                    storage: None,
                     raster_flags: rf,
                 }),
             };
@@ -5133,6 +5443,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 textures: &textures,
                 tex_binding: 0, // t0 @0/s0 @1, t1 @2/s1 @3
                 uniform: None,
+                storage: None,
                 raster_flags: 0,
             }),
         };

@@ -444,12 +444,14 @@ struct ForwardedDrawTail {
  * Full order:
  *   attrs[attr_count] · draws[draw_count] · texs[tex_count] ·
  *   vSPIR-V · fSPIR-V · vertex data · index data · vertex entry · fragment entry ·
- *   push-const bytes · UBO bytes (`ubo_len`) · texture pixels (RGBA8, concatenated in `texs` order).
+ *   push-const bytes · UBO bytes (`ubo_len`) · SSBO bytes (`ssbo_len`) ·
+ *   texture pixels (RGBA8, concatenated in `texs` order).
  * `push_const_len` is a transform block (ABI 0.9); `tex_count` textures (ABI 0.10) bind a sampled
  * image at binding `tex_binding + 2i` and a sampler at `tex_binding + 2i + 1`; the UBO (ABI 0.11)
- * binds at `ubo_binding` (VERTEX|FRAGMENT). The host builds the descriptor-set-0 layout **dynamically**
- * from whichever resources are present at their declared bindings, so a UBO and a texture compose in
- * one set (e.g. UBO@0, image@1, sampler@2). The UBO byte blob is fixed-length (`ubo_len`); the texture
+ * binds at `ubo_binding` (VERTEX|FRAGMENT); the SSBO (ABI 0.13) binds at `ssbo_binding` (VERTEX|FRAGMENT).
+ * The host builds the descriptor-set-0 layout **dynamically** from whichever resources are present at
+ * their declared bindings, so a UBO, an SSBO, and a texture compose in one set (e.g. UBO@0, image@1,
+ * sampler@2, SSBO@3). The UBO and SSBO byte blobs are fixed-length (`ubo_len`, `ssbo_len`); the texture
  * pixels stay the terminal derived region (length = Σ `TextureDescWire::data_len`). Every length is
  * guest-controlled and MUST be bounds-checked against the actual payload length before use
  * (fail-closed). `raster_flags` (ABI 0.12) is a fixed-function state bitfield ([`raster_flags`]);
@@ -457,7 +459,7 @@ struct ForwardedDrawTail {
  *
  * `vertex_stride == 0` means "no vertex buffer" (bufferless, like [`ForwardedDrawTail`] — the
  * shader synthesizes geometry); otherwise binding 0 has that stride and the `attr_count`
- * attributes describe it. 72 bytes, 4-byte aligned.
+ * attributes describe it. 80 bytes, 4-byte aligned.
  */
 struct ForwardedCmdListTail {
   /**
@@ -553,6 +555,22 @@ struct ForwardedCmdListTail {
    * unknown bits to safe defaults; nothing here needs bounds-checking.
    */
   uint32_t raster_flags;
+  /**
+   * Byte length of the storage-buffer (SSBO) block (ABI 0.13) — a fixed-length byte blob appended
+   * after the UBO bytes and before the trailing texture pixels. `0` ⇒ no SSBO. The host uploads these
+   * bytes into a `STORAGE_BUFFER` bound at descriptor set 0 binding [`ssbo_binding`] (VERTEX|FRAGMENT),
+   * so a shader's `var<storage>` block (e.g. a DXVK structured/raw SRV, a skinning-matrix palette, or
+   * per-instance data) reads them. READ-ONLY: the host never writes it back to guest memory (a shader
+   * write is discarded — the present path only copies the color image). Bounded ≤ `MAX_SSBO_BYTES`
+   * host-side (a much larger cap than the UBO's, since `maxStorageBufferRange` is ≥ 128 MiB).
+   */
+  uint32_t ssbo_len;
+  /**
+   * Descriptor-set-0 binding the SSBO occupies (ABI 0.13). Ignored when `ssbo_len == 0`. Shares set 0
+   * with the UBO and the textures, so it must not equal `ubo_binding` (when `ubo_len > 0`) nor fall
+   * inside the texture range `[tex_binding .. tex_binding + 2*tex_count)` (when `tex_count > 0`).
+   */
+  uint32_t ssbo_binding;
 };
 
 /**

@@ -18,8 +18,8 @@ _Static_assert(sizeof(struct ForwardedDrawTail) == 24, "ForwardedDrawTail is 24 
 _Static_assert(offsetof(struct VulkanWorkload, scanout_addr) == 32, "scanout_addr@32");
 /* Phase-2b command-list structs — the cmdlist encoder copies these; drift is a compile error. The
  * tail grew to 52 B in ABI 0.9 (push_const_len), 56 B in 0.10 (tex_count), 68 B in 0.11
- * (ubo_len/ubo_binding/tex_binding), and 72 B in 0.12 (raster_flags). */
-_Static_assert(sizeof(struct ForwardedCmdListTail) == 72, "ForwardedCmdListTail is 72 bytes");
+ * (ubo_len/ubo_binding/tex_binding), 72 B in 0.12 (raster_flags), and 80 B in 0.13 (ssbo_len/ssbo_binding). */
+_Static_assert(sizeof(struct ForwardedCmdListTail) == 80, "ForwardedCmdListTail is 80 bytes");
 _Static_assert(sizeof(struct VertexAttrWire) == 12, "VertexAttrWire is 12 bytes");
 _Static_assert(sizeof(struct DrawCmdWire) == 32, "DrawCmdWire is 32 bytes");
 _Static_assert(sizeof(struct TextureDescWire) == 16, "TextureDescWire is 16 bytes");
@@ -90,6 +90,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
     uint32_t topology, uint32_t depth_flags,
     const uint8_t *push_const, uint32_t push_const_len,
     const uint8_t *ubo, uint32_t ubo_len, uint32_t ubo_binding,
+    const uint8_t *ssbo, uint32_t ssbo_len, uint32_t ssbo_binding,
     const struct DrawCmdWire *draws, uint32_t draw_count,
     const struct TextureDescWire *texs, uint32_t tex_count, uint32_t tex_binding,
     const uint8_t *texpix, uint32_t texpix_len, uint32_t raster_flags)
@@ -110,7 +111,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	const size_t total = sizeof(struct VulkanWorkload) + sizeof(struct ForwardedCmdListTail) +
 	                     attrs_bytes + draws_bytes + texs_bytes + vbytes + fbytes +
 	                     (size_t)vertex_data_len + (size_t)index_data_len + velen + felen +
-	                     (size_t)push_const_len + (size_t)ubo_len + (size_t)texpix_len;
+	                     (size_t)push_const_len + (size_t)ubo_len + (size_t)ssbo_len + (size_t)texpix_len;
 	if (out == NULL || total > cap)
 		return 0;
 
@@ -146,15 +147,17 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	tail.ubo_binding = ubo_binding;
 	tail.tex_binding = tex_binding;
 	tail.raster_flags = raster_flags;
+	tail.ssbo_len = ssbo_len;
+	tail.ssbo_binding = ssbo_binding;
 	memcpy(out + o, &tail, sizeof tail);
 	o += sizeof tail;
 
 	/* Sections in the order the host decoder reads them: attrs, draws, texdescs, vSPIR-V, fSPIR-V,
-	 * vertex data, index data, vertex entry, fragment entry, push constants, UBO bytes, texture
-	 * pixels. Each memcpy is guarded so a zero-length section with a NULL pointer isn't passed to
-	 * memcpy (undefined behaviour). The texdescs are in the fixed-array region (after draws); the UBO
-	 * bytes are a fixed-length blob after the push constants; the texture pixels are the trailing
-	 * region. */
+	 * vertex data, index data, vertex entry, fragment entry, push constants, UBO bytes, SSBO bytes,
+	 * texture pixels. Each memcpy is guarded so a zero-length section with a NULL pointer isn't passed
+	 * to memcpy (undefined behaviour). The texdescs are in the fixed-array region (after draws); the
+	 * UBO and SSBO bytes are fixed-length blobs after the push constants (UBO then SSBO); the texture
+	 * pixels are the trailing region. */
 	if (attrs_bytes) {
 		memcpy(out + o, attrs, attrs_bytes);
 		o += attrs_bytes;
@@ -188,6 +191,12 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	if (ubo_len) {
 		memcpy(out + o, ubo, ubo_len);
 		o += ubo_len;
+	}
+	if (ssbo_len) {
+		/* SSBO blob: after the UBO bytes, before the trailing texture pixels — matches the host
+		 * decoder's carve order (ubo_b, ssbo_b, then texture pixels). */
+		memcpy(out + o, ssbo, ssbo_len);
+		o += ssbo_len;
 	}
 	if (texpix_len) {
 		memcpy(out + o, texpix, texpix_len);

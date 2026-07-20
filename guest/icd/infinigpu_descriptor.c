@@ -162,6 +162,10 @@ infinigpu_AllocateDescriptorSets(VkDevice _device,
       set->ubo_offset = 0;
       set->ubo_range = 0;
       set->ubo_binding = 0;
+      set->ssbo_buffer = NULL;
+      set->ssbo_offset = 0;
+      set->ssbo_range = 0;
+      set->ssbo_binding = 0;
       list_addtail(&set->link, &pool->sets);
       pDescriptorSets[i] = infinigpu_descriptor_set_to_handle(set);
    }
@@ -258,8 +262,19 @@ infinigpu_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
             set->ubo_binding = wr->dstBinding;
          }
          break;
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+         /* A read-only SSBO (a DXVK structured/raw SRV, a skinning palette, per-instance data).
+          * Non-dynamic only (STORAGE_BUFFER_DYNAMIC stays in `default:` — dynamic offsets are a
+          * follow-up). Mirrors the UBO capture exactly; forwarded as bytes, never written back. */
+         if (wr->pBufferInfo && wr->pBufferInfo[0].buffer) {
+            set->ssbo_buffer = infinigpu_buffer_from_handle(wr->pBufferInfo[0].buffer);
+            set->ssbo_offset = wr->pBufferInfo[0].offset;
+            set->ssbo_range = wr->pBufferInfo[0].range;
+            set->ssbo_binding = wr->dstBinding;
+         }
+         break;
       default:
-         break; /* SSBO/dynamic/etc. — not forwarded yet */
+         break; /* STORAGE_BUFFER_DYNAMIC/UNIFORM_BUFFER_DYNAMIC/etc. — not forwarded yet */
       }
    }
 
