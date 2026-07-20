@@ -65,17 +65,26 @@ fixes the correctness landmines (B1) they expose.
   Mesa ICD compiles+links. GPU tests on the A5000: `forwarded_back_face_culling_removes_geometry` (one
   winding culls, the other renders) and `forwarded_alpha_blend_composites_over_background` (blue@0.5 over
   red → ~half/half). Fixes back-face overdraw + opaque transparency in real 3D scenes. **MSAA is deferred**
-  (needs a multisample render pass + resolve attachment, not a pipeline-only flag). **Known limitation
-  (adversarial-review finding, low):** the guest captures cull/front-face from the *static* pipeline
-  `pRasterizationState` only — it does NOT yet honor Vulkan-1.3 **dynamic** state
-  (`VK_DYNAMIC_STATE_CULL_MODE`/`FRONT_FACE` via `vkCmdSetCullMode`/`vkCmdSetFrontFace`, which DXVK/VKD3D
-  use routinely). A pipeline that declares those dynamic (static `cullMode` left at NONE) forwards
-  `raster_flags == 0` and silently skips culling. This is the pre-existing ICD-wide static-only capture
-  pattern shared by depth/topology/scissor — see "dynamic pipeline-state capture" below.
-- **Next up:** **dynamic pipeline-state capture** (`vkCmdSet{CullMode,FrontFace,DepthTestEnable,Scissor,…}`
-  — the Vulkan-1.3 dynamic-state entrypoints DXVK/VKD3D need; captured today only from static pipeline
-  fields); SSBO / multiple descriptor sets / multi-texture (storage buffers + more than one set); MSAA
-  (2d-A5 multisample); Phase 2a (format A6 / loadOp A8).
+  (needs a multisample render pass + resolve attachment, not a pipeline-only flag).
+- **Phase-2d-A5 DYNAMIC pipeline-state capture (EDS1) — DONE, guest-ICD-only.** The static capture read only
+  the pipeline's static fields, so a Vulkan-1.3 app that sets cull/front-face/depth/topology **dynamically**
+  (`vkCmdSetCullMode` etc. — how DXVK/VKD3D, the realistic path to Windows games, drive them) forwarded its
+  defaults. The ICD now scans `pDynamicState` into `p->dynamic_mask`, adds the six EDS1 `CmdSet*`
+  entrypoints (value + `cmd->dyn_set_mask`), and at submit a **pure resolver**
+  (`infinigpu_resolve_forwarded_state`) overrides each state where `dynamic_mask & set_mask`, rebuilding
+  `raster_flags`/`depth_flags` from components. Host/wire/device unchanged (they already take the final
+  values). Since the resolve is inside the ICD (not GPU-reachable here), it's a pure function the
+  conformance crate drives via FFI (`tests/dynamic_state_resolve.rs`, 9 cases). Guest Mesa ICD
+  compiles+links. **Adversarial review (10 agents) caught + fixed one medium bug:** the static depth
+  capture gated `depthCompareOp` on `test||write`, so a pipeline with dynamic test/write + static compareOp
+  dropped the compareOp → dynamically-enabled depth forwarded compare=NEVER (all fragments culled); now the
+  compareOp is captured whenever a depth-stencil state is present. **Scope:** cull/front-face/depth/topology
+  (EDS1). Blend-enable dynamic (EDS3) not handled; per-draw pipeline-state changes still forward one state
+  per command list (pre-existing architecture).
+- **Next up:** SSBO / multiple descriptor sets / multi-texture (storage buffers + more than one set); MSAA
+  (2d-A5 multisample); Phase 2a (format A6 / loadOp A8); EDS3 dynamic blend + per-draw state if a real game
+  needs them. Then the owner runtime render-validation in a real GPU VM (below) — the one link not yet
+  exercised end-to-end.
 
 The rest of this doc is the original design; the per-phase wire/host/test shape it describes is what the landed
 phases implemented.
