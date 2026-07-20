@@ -171,13 +171,14 @@ pub struct Geometry<'a> {
     /// `var<push_constant>` / `layout(push_constant)`. Empty ⇒ an empty pipeline layout (no
     /// transform, raw NDC). Applied to the VERTEX|FRAGMENT stages at offset 0 before the draws.
     pub push_constants: &'a [u8],
-    /// One sampled texture (Phase-2c) bound at descriptor set 0 (image = `tex_binding`, sampler =
-    /// `tex_binding + 1`), matching a WGSL `texture_2d`/`sampler` pair. `None` ⇒ untextured. The
-    /// single-texture case; multi-texture is a follow-up.
-    pub texture: Option<Texture<'a>>,
-    /// Base binding of `texture`'s sampled image (its sampler is at `tex_binding + 1`). `0` ⇒ image@0 /
-    /// sampler@1 (the pre-UBO default). Non-zero lets a UBO and a texture share set 0 at distinct
-    /// bindings (e.g. UBO@0, image@1, sampler@2). Ignored when `texture` is `None`.
+    /// Sampled textures (Phase-2c) bound into descriptor set 0. Texture `i` binds a sampled image at
+    /// `tex_binding + 2i` and a sampler at `tex_binding + 2i + 1`, matching consecutive WGSL
+    /// `texture_2d`/`sampler` pairs — the layout a real material shader (albedo/normal/roughness/…) uses.
+    /// Empty ⇒ untextured. Capped at [`MAX_TEXTURES`].
+    pub textures: &'a [Texture<'a>],
+    /// Base binding of texture 0's sampled image (its sampler is at `tex_binding + 1`; texture `i` at
+    /// `tex_binding + 2i` / `+ 2i + 1`). `0` ⇒ image@0 / sampler@1 (the pre-UBO default). Non-zero lets a
+    /// UBO and the textures share set 0 at distinct bindings. Ignored when `textures` is empty.
     pub tex_binding: u32,
     /// One uniform buffer (Phase-2c) bound at descriptor set 0 binding `uniform.binding`
     /// (VERTEX|FRAGMENT), for a shader's `var<uniform>` block (e.g. per-frame matrices). `None` ⇒ no
@@ -190,6 +191,11 @@ pub struct Geometry<'a> {
     /// in [`PipelineKey`]), so distinct states get distinct cached pipelines.
     pub raster_flags: u32,
 }
+
+/// Max sampled textures a single forwarded draw may bind into descriptor set 0 (Phase-2c multi-texture).
+/// A real material shader binds a handful (albedo/normal/metallic/roughness/ao/emissive); 8 covers the
+/// common case. The device decode enforces the same cap fail-closed.
+pub const MAX_TEXTURES: usize = 8;
 
 /// A forwarded uniform buffer (Phase-2c): a declared descriptor-set-0 binding + the raw bytes the host
 /// uploads into a `UNIFORM_BUFFER` for the shader's `var<uniform>` block to read (VERTEX|FRAGMENT).
@@ -675,25 +681,31 @@ struct PipelineKey {
 }
 
 /// The descriptor-set-0 signature a draw needs (Phase-2c): which resources bind where. The host builds
-/// a `VkDescriptorSetLayout` from this — a `UNIFORM_BUFFER` at `ubo_binding` (VERTEX|FRAGMENT), and/or a
-/// `SAMPLED_IMAGE` at `image_binding` + a `SAMPLER` at `image_binding + 1` (FRAGMENT). Same signature ⇒
-/// same layout ⇒ same pipeline, so it is cached and part of the [`PipelineKey`].
+/// a `VkDescriptorSetLayout` from this — a `UNIFORM_BUFFER` at `ubo_binding` (VERTEX|FRAGMENT), and/or
+/// `tex_count` `SAMPLED_IMAGE` + `SAMPLER` pairs at `tex_binding + 2i` / `+ 2i + 1` (FRAGMENT). The full
+/// layout is fixed by `(tex_binding, tex_count)`, so those two fields key it. Same signature ⇒ same
+/// layout ⇒ same pipeline, so it is cached and part of the [`PipelineKey`].
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 struct DescriptorSig {
     ubo_binding: Option<u32>,
-    image_binding: Option<u32>,
+    /// Base binding of texture 0's sampled image; `None` ⇒ no textures. Present iff `tex_count > 0`.
+    tex_binding: Option<u32>,
+    /// Number of sampled textures (each an image+sampler pair). `0` ⇒ none.
+    tex_count: u32,
 }
 
 /// The descriptor-set signature a draw needs, or `None` if it binds no descriptor resources (Phase-2c).
-/// A texture binds a sampled image at `tex_binding` (+ sampler at `+1`); a UBO binds at its `binding`.
+/// Textures bind image+sampler pairs from `tex_binding` (texture `i` at `+2i`/`+2i+1`); a UBO at its
+/// `binding`.
 fn desc_sig_of(draw: &ForwardedDraw) -> Option<DescriptorSig> {
     let g = draw.geometry.as_ref()?;
     let ubo_binding = g.uniform.as_ref().map(|u| u.binding);
-    let image_binding = g.texture.as_ref().map(|_| g.tex_binding);
-    if ubo_binding.is_none() && image_binding.is_none() {
+    let tex_count = g.textures.len() as u32;
+    let tex_binding = (tex_count > 0).then_some(g.tex_binding);
+    if ubo_binding.is_none() && tex_binding.is_none() {
         None
     } else {
-        Some(DescriptorSig { ubo_binding, image_binding })
+        Some(DescriptorSig { ubo_binding, tex_binding, tex_count })
     }
 }
 
@@ -904,7 +916,7 @@ struct FrameDescriptors {
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
     ubo: Option<UniformGpu>,
-    tex: Option<TextureGpu>,
+    tex: Vec<TextureGpu>,
 }
 
 impl FrameDescriptors {
@@ -917,7 +929,7 @@ impl FrameDescriptors {
         if let Some(u) = &self.ubo {
             u.destroy(dev);
         }
-        if let Some(t) = &self.tex {
+        for t in &self.tex {
             t.destroy(dev);
         }
     }
@@ -2336,7 +2348,7 @@ impl HostGpu {
                 let g = draw.geometry.as_ref().expect("desc_sig_of ⇒ geometry present");
                 let built = self
                     .desc_set_layout(sig)
-                    .and_then(|sl| self.build_frame_descriptors(g.uniform.as_ref(), g.texture.as_ref(), g.tex_binding, sl));
+                    .and_then(|sl| self.build_frame_descriptors(g.uniform.as_ref(), g.textures, g.tex_binding, sl));
                 match built {
                     Ok(d) => Some(d),
                     Err(e) => {
@@ -2558,21 +2570,25 @@ impl HostGpu {
                     .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
             );
         }
-        if let Some(b) = sig.image_binding {
-            bindings.push(
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(b)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            );
-            bindings.push(
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(b + 1)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            );
+        if let Some(base) = sig.tex_binding {
+            // Texture i: sampled image @ base+2i, sampler @ base+2i+1 (FRAGMENT).
+            for i in 0..sig.tex_count {
+                let b = base + 2 * i;
+                bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(b)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                );
+                bindings.push(
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(b + 1)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                );
+            }
         }
         let sl = unsafe {
             self.device.create_descriptor_set_layout(
@@ -2736,8 +2752,8 @@ impl HostGpu {
     fn build_frame_descriptors(
         &self,
         uniform: Option<&UniformBlock>,
-        tex: Option<&Texture>,
-        image_binding: u32,
+        textures: &[Texture],
+        tex_base: u32,
         set_layout: vk::DescriptorSetLayout,
     ) -> R<FrameDescriptors> {
         let dev = &self.device;
@@ -2746,6 +2762,9 @@ impl HostGpu {
             if u.bytes.is_empty() || u.bytes.len() > 65536 {
                 return Err(format!("bad uniform block ({} bytes)", u.bytes.len()).into());
             }
+        }
+        if textures.len() > MAX_TEXTURES {
+            return Err(format!("too many textures ({} > {MAX_TEXTURES})", textures.len()).into());
         }
         let mut pool = vk::DescriptorPool::null();
         let mut ubo_buf = vk::Buffer::null();
@@ -2760,16 +2779,16 @@ impl HostGpu {
                             .descriptor_count(1),
                     );
                 }
-                if tex.is_some() {
+                if !textures.is_empty() {
                     sizes.push(
                         vk::DescriptorPoolSize::default()
                             .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                            .descriptor_count(1),
+                            .descriptor_count(textures.len() as u32),
                     );
                     sizes.push(
                         vk::DescriptorPoolSize::default()
                             .ty(vk::DescriptorType::SAMPLER)
-                            .descriptor_count(1),
+                            .descriptor_count(textures.len() as u32),
                     );
                 }
                 pool = dev.create_descriptor_pool(
@@ -2819,11 +2838,23 @@ impl HostGpu {
                     None
                 };
 
-                // Texture last — upload_texture_into writes into the shared set and self-cleans on error.
-                let tgpu = match tex {
-                    Some(t) => Some(self.upload_texture_into(t, set, image_binding)?),
-                    None => None,
-                };
+                // Textures last — upload_texture_into writes each into the shared set at its binding and
+                // self-cleans on error. Already-built TextureGpus are collected so an error mid-way frees
+                // them (via the outer map_err path, which destroys the pool; the built textures are freed
+                // here explicitly since they live only in this Vec until the FrameDescriptors is returned).
+                let mut tgpu: Vec<TextureGpu> = Vec::with_capacity(textures.len());
+                for (i, t) in textures.iter().enumerate() {
+                    let binding = tex_base + 2 * i as u32;
+                    match self.upload_texture_into(t, set, binding) {
+                        Ok(g) => tgpu.push(g),
+                        Err(e) => {
+                            for g in &tgpu {
+                                g.destroy(dev);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
 
                 Ok(FrameDescriptors { pool, set, ubo, tex: tgpu })
             }
@@ -2877,7 +2908,7 @@ impl HostGpu {
             // copy staging→image, transition TRANSFER_DST→SHADER_READ_ONLY so the fragment shader can
             // sample it. Same command buffer as the render (one submit), so no extra sync needed. (The
             // UBO needs no barrier/copy — it is host-visible|coherent, written at descriptor-build time.)
-            if let Some(t) = descs.and_then(|d| d.tex.as_ref()) {
+            for t in descs.map(|d| d.tex.as_slice()).unwrap_or(&[]) {
                 let to_dst = vk::ImageMemoryBarrier::default()
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -4225,7 +4256,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 draws: &draws,
                 depth: None,
                 push_constants: &[],
-                texture: None,
+                textures: &[],
                 tex_binding: 0,
                 uniform: None,
                 raster_flags: 0,
@@ -4343,7 +4374,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 draws: &draws,
                 depth: None,
                 push_constants: &[],
-                texture: None,
+                textures: &[],
                 tex_binding: 0,
                 uniform: None,
                 raster_flags: 0,
@@ -4433,7 +4464,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     draws: &draws,
                     depth,
                     push_constants: &[],
-                    texture: None,
+                    textures: &[],
                     tex_binding: 0,
                     uniform: None,
                     raster_flags: 0,
@@ -4547,7 +4578,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     draws: &draws,
                     depth: None,
                     push_constants: m,
-                    texture: None,
+                    textures: &[],
                     tex_binding: 0,
                     uniform: None,
                     raster_flags: 0,
@@ -4647,12 +4678,12 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 draws: &draws,
                 depth: None,
                 push_constants: &[],
-                texture: Some(Texture {
+                textures: &[Texture {
                     width: 2,
                     height: 2,
                     rgba: &tex_px,
                     sampler: SamplerCfg { linear: false, repeat: false },
-                }),
+                }],
                 tex_binding: 0,
                 uniform: None,
                 raster_flags: 0,
@@ -4738,7 +4769,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     draws: &draws,
                     depth: None,
                     push_constants: &[],
-                    texture: None,
+                    textures: &[],
                     tex_binding: 0,
                     uniform: Some(UniformBlock { binding: 0, bytes: &ubo }),
                     raster_flags: 0,
@@ -4831,12 +4862,12 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     draws: &draws,
                     depth: None,
                     push_constants: &[],
-                    texture: Some(Texture {
+                    textures: &[Texture {
                         width: 2,
                         height: 2,
                         rgba: &tex_px,
                         sampler: SamplerCfg { linear: false, repeat: false },
-                    }),
+                    }],
                     tex_binding: 1, // image@1, sampler@2 — composes with the UBO@0
                     uniform: Some(UniformBlock { binding: 0, bytes: &ubo }),
                     raster_flags: 0,
@@ -4935,7 +4966,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     draws: &draws,
                     depth: None,
                     push_constants: &[],
-                    texture: None,
+                    textures: &[],
                     tex_binding: 0,
                     uniform: None,
                     raster_flags: rf,
@@ -5008,7 +5039,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     draws: &draws,
                     depth: None,
                     push_constants: &[],
-                    texture: None,
+                    textures: &[],
                     tex_binding: 0,
                     uniform: None,
                     raster_flags: rf,
@@ -5030,5 +5061,91 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
         );
         assert!(blended[0] > opaque[0] + 60, "blend must retain background red the opaque path drops");
         eprintln!("forwarded_alpha_blend_composites_over_background: OK (opaque={opaque:?}, blended={blended:?})");
+    }
+
+    /// Phase-2c multi-texture: TWO sampled textures bound into ONE descriptor set at distinct bindings
+    /// (image@0/sampler@1 and image@2/sampler@3) both sample correctly — the gate for real material
+    /// shaders (albedo + normal + …). The FS picks texture 0 on the left half of the quad and texture 1
+    /// on the right; a red + a blue 1×1 texture must show red-left / blue-right. If the host bound only
+    /// one, or crossed the bindings, the halves would be wrong.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_two_textures_sample_at_distinct_bindings() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let vs = compile_wgsl(
+            "struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };\n\
+             @vertex fn main(@location(0) p: vec2<f32>, @location(1) uv: vec2<f32>) -> VOut {\n\
+               return VOut(vec4<f32>(p, 0.0, 1.0), uv);\n}",
+            naga::ShaderStage::Vertex,
+        );
+        let fs = compile_wgsl(
+            "@group(0) @binding(0) var t0: texture_2d<f32>;\n\
+             @group(0) @binding(1) var s0: sampler;\n\
+             @group(0) @binding(2) var t1: texture_2d<f32>;\n\
+             @group(0) @binding(3) var s1: sampler;\n\
+             @fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {\n\
+               if (uv.x < 0.5) { return textureSample(t0, s0, uv); }\n\
+               return textureSample(t1, s1, uv);\n}",
+            naga::ShaderStage::Fragment,
+        );
+        use infinigpu_abi::wire::vk_vformat as V;
+        let attrs = [
+            VertexAttr { location: 0, format: V::R32G32_SFLOAT, offset: 0 },
+            VertexAttr { location: 1, format: V::R32G32_SFLOAT, offset: 8 },
+        ];
+        let quad: [[f32; 4]; 4] =
+            [[-1.0, -1.0, 0.0, 0.0], [1.0, -1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0], [-1.0, 1.0, 0.0, 1.0]];
+        let verts: Vec<u8> = quad.iter().flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes())).collect();
+        let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+        let index_data: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let red: [u8; 4] = [255, 0, 0, 255];
+        let blue: [u8; 4] = [0, 0, 255, 255];
+        let draws = [DrawCmd { count: 6, instance_count: 1, first: 0, vertex_offset: 0, viewport: [0.0; 4] }];
+        let (w, h) = (64u32, 64u32);
+        let bg = [0.0, 0.0, 0.0, 1.0];
+        let nearest = SamplerCfg { linear: false, repeat: false };
+        let textures = [
+            Texture { width: 1, height: 1, rgba: &red, sampler: nearest },
+            Texture { width: 1, height: 1, rgba: &blue, sampler: nearest },
+        ];
+        let draw = ForwardedDraw {
+            vertex_spirv: &vs,
+            vertex_entry: c"main",
+            fragment_spirv: &fs,
+            fragment_entry: c"main",
+            vertex_count: 0,
+            topology: 0,
+            geometry: Some(Geometry {
+                vertex_data: &verts,
+                vertex_stride: 16,
+                attrs: &attrs,
+                index_data: &index_data,
+                index_u32: false,
+                draws: &draws,
+                depth: None,
+                push_constants: &[],
+                textures: &textures,
+                tex_binding: 0, // t0 @0/s0 @1, t1 @2/s1 @3
+                uniform: None,
+                raster_flags: 0,
+            }),
+        };
+        let frame = gpu.render_forwarded(w, h, bg, &draw).expect("two-texture render");
+        // Sample a pixel in the left quarter (texture 0 = red) and the right quarter (texture 1 = blue).
+        let px = |x: u32, y: u32| {
+            let i = (y * w + x) as usize * 4;
+            [frame.rgba[i], frame.rgba[i + 1], frame.rgba[i + 2]]
+        };
+        let left = px(w / 4, h / 2);
+        let right = px(3 * w / 4, h / 2);
+        assert!(left[0] > 200 && left[2] < 60, "left half must sample texture 0 (red), got {left:?}");
+        assert!(right[2] > 200 && right[0] < 60, "right half must sample texture 1 (blue), got {right:?}");
+        eprintln!("forwarded_two_textures_sample_at_distinct_bindings: OK (left={left:?}, right={right:?})");
     }
 }

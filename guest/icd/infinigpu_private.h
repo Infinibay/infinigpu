@@ -181,14 +181,24 @@ struct infinigpu_descriptor_pool {
    struct list_head sets;   /* infinigpu_descriptor_set::link — freed on reset/destroy */
 };
 
+/* One sampled texture bound in a descriptor set: its image + sampler + the dstBinding the sampled image
+ * was written at (image@binding, sampler@binding+1). A real material shader binds several. */
+#define INFINIGPU_MAX_SET_TEXTURES 8
+struct infinigpu_desc_texture {
+   struct infinigpu_image_view *image;
+   struct infinigpu_sampler *sampler;
+   uint32_t binding;
+};
+
 struct infinigpu_descriptor_set {
    struct vk_object_base base;
    struct list_head link;                 /* in its pool's `sets` list */
    struct infinigpu_descriptor_pool *pool;
-   struct infinigpu_image_view *image;    /* sampled image bound here (NULL ⇒ none) */
-   struct infinigpu_sampler *sampler;     /* sampler bound here (NULL ⇒ none) */
-   uint32_t tex_binding;                  /* dstBinding the sampled image was written at (image@it, sampler@it+1) */
-   /* Phase-2c uniform buffer bound here (NULL ⇒ none). Composes with the texture in the same set at a
+   /* Phase-2c multi-texture: the sampled images bound here (empty ⇒ untextured). Each carries its own
+    * dstBinding; at submit they are sorted by binding and forwarded as texture i at tex_binding + 2i. */
+   struct infinigpu_desc_texture textures[INFINIGPU_MAX_SET_TEXTURES];
+   uint32_t texture_count;
+   /* Phase-2c uniform buffer bound here (NULL ⇒ none). Composes with the textures in the same set at a
     * distinct binding. `ubo_range == VK_WHOLE_SIZE` ⇒ resolve to total_size - ubo_offset at submit. */
    struct infinigpu_buffer *ubo_buffer;
    uint64_t ubo_offset;

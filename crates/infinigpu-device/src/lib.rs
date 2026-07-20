@@ -317,9 +317,10 @@ pub struct OwnedGeometry {
     pub depth: Option<DepthState>,
     /// Phase-2c push-constant bytes (a transform block); empty ⇒ no push constants.
     pub push_constants: Vec<u8>,
-    /// Phase-2c sampled texture (RGBA8 pixels + dims + sampler cfg); `None` ⇒ untextured.
-    pub texture: Option<OwnedTexture>,
-    /// Phase-2c base binding of `texture`'s sampled image (sampler at `+1`); `0` ⇒ image@0/sampler@1.
+    /// Phase-2c sampled textures (RGBA8 pixels + dims + sampler cfg); empty ⇒ untextured. Texture `i`
+    /// binds image@`tex_binding + 2i` / sampler@`+ 2i + 1`.
+    pub textures: Vec<OwnedTexture>,
+    /// Phase-2c base binding of texture 0's sampled image (sampler at `+1`); `0` ⇒ image@0/sampler@1.
     pub tex_binding: u32,
     /// Phase-2c uniform buffer (binding + bytes); `None` ⇒ no UBO. Composes with `texture`.
     pub uniform: Option<OwnedUniform>,
@@ -344,7 +345,26 @@ pub struct OwnedUniform {
 }
 
 impl OwnedForwardedDraw {
-    fn as_draw(&self) -> ForwardedDraw<'_> {
+    /// Borrowing `Texture` views over the decoded [`OwnedTexture`]s — the backing for
+    /// [`Geometry::textures`]. Built by the caller so its `Vec` outlives the [`ForwardedDraw`]
+    /// [`as_draw`](Self::as_draw) returns (a `&[Texture]` can't be owned by the returned struct).
+    pub fn textures_view(&self) -> Vec<Texture<'_>> {
+        match &self.geometry {
+            Some(g) => g
+                .textures
+                .iter()
+                .map(|t| Texture {
+                    width: t.width,
+                    height: t.height,
+                    rgba: &t.rgba,
+                    sampler: SamplerCfg { linear: t.linear, repeat: t.repeat },
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn as_draw<'a>(&'a self, textures: &'a [Texture<'a>]) -> ForwardedDraw<'a> {
         ForwardedDraw {
             vertex_spirv: &self.vertex_spirv,
             vertex_entry: &self.vertex_entry,
@@ -361,15 +381,7 @@ impl OwnedForwardedDraw {
                 draws: &g.draws,
                 depth: g.depth,
                 push_constants: &g.push_constants,
-                texture: g.texture.as_ref().map(|t| Texture {
-                    width: t.width,
-                    height: t.height,
-                    rgba: &t.rgba,
-                    sampler: SamplerCfg {
-                        linear: t.linear,
-                        repeat: t.repeat,
-                    },
-                }),
+                textures,
                 tex_binding: g.tex_binding,
                 uniform: g.uniform.as_ref().map(|u| UniformBlock {
                     binding: u.binding,
@@ -515,7 +527,11 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         || vdata_len > max_bytes
         || idata_len > max_bytes
         || pc_len > 256
-        || tex_count > 1
+        || tex_count > infinigpu_replay::MAX_TEXTURES
+        // Bound tex_binding like every other field so the host's `tex_binding + 2i` layout arithmetic
+        // can't overflow (real descriptor bindings are tiny; 65535 is astronomically above any).
+        || tex_binding > 65535
+        || ubo_binding > 65535
         || ubo_len > 65536
     {
         return None;
@@ -637,33 +653,40 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         }
     };
 
-    // Phase-2c: unpack the (at most one) sampled texture. Parse the texdesc from the fixed-array
-    // region, validate `data_len == width*height*4` (checked so a hostile product can't wrap), then
-    // carve its RGBA8 pixels out of the trailing region `r` (after push constants). Fail-closed on any
-    // dimension/length mismatch.
-    let texture = if tex_count == 1 {
+    // Phase-2c multi-texture: unpack the `tex_count` sampled textures. Each texdesc comes from the
+    // fixed-array region (parsed in order); its `data_len == width*height*4` RGBA8 pixels are carved
+    // sequentially from the trailing region `r` (after push constants + UBO), concatenated in texture
+    // order. Every dimension/length is checked (no wrap) against the remaining pixel bytes — fail-closed
+    // on any mismatch, so a hostile guest can't over-read.
+    let textures = {
         use infinigpu_abi::wire::sampler_flags as SF;
-        let (td, _) = TextureDescWire::read_from_prefix(texs_b).ok()?;
-        let w = td.width as usize;
-        let h = td.height as usize;
-        let data_len = td.data_len as usize;
-        if w == 0 || h == 0 {
-            return None;
+        let mut out = Vec::with_capacity(tex_count);
+        let mut tb = texs_b; // texdesc array cursor
+        let mut pix = r; // trailing concatenated-pixel cursor
+        for _ in 0..tex_count {
+            let (td, next) = TextureDescWire::read_from_prefix(tb).ok()?;
+            tb = next;
+            let w = td.width as usize;
+            let h = td.height as usize;
+            let data_len = td.data_len as usize;
+            if w == 0 || h == 0 {
+                return None;
+            }
+            let expect = w.checked_mul(h)?.checked_mul(4)?;
+            if data_len != expect || data_len > max_bytes || data_len > pix.len() {
+                return None;
+            }
+            let (texpix_b, rest_pix) = pix.split_at(data_len);
+            pix = rest_pix;
+            out.push(OwnedTexture {
+                width: td.width,
+                height: td.height,
+                rgba: texpix_b.to_vec(),
+                linear: td.sampler_flags & SF::LINEAR != 0,
+                repeat: td.sampler_flags & SF::REPEAT != 0,
+            });
         }
-        let expect = w.checked_mul(h)?.checked_mul(4)?;
-        if data_len != expect || data_len > max_bytes || data_len > r.len() {
-            return None;
-        }
-        let (texpix_b, _) = r.split_at(data_len);
-        Some(OwnedTexture {
-            width: td.width,
-            height: td.height,
-            rgba: texpix_b.to_vec(),
-            linear: td.sampler_flags & SF::LINEAR != 0,
-            repeat: td.sampler_flags & SF::REPEAT != 0,
-        })
-    } else {
-        None
+        out
     };
 
     // Phase-2c: the uniform buffer, if any (`ubo_len == 0` ⇒ none). `ubo_b` was carved as a fixed-length
@@ -690,7 +713,7 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
             draws,
             depth,
             push_constants: pc_b.to_vec(),
-            texture,
+            textures,
             tex_binding,
             uniform,
             raster_flags: tail.raster_flags,
@@ -1745,6 +1768,9 @@ impl InfinigpuBackend {
             // Try zero-copy first; on failure DON'T drop the frame — latch zero-copy off and fall
             // through to the one-copy present so the guest keeps getting correct frames. (`fwd` is
             // re-viewed per closure so nothing is consumed before the fallback.)
+            // Borrowing texture views backing Geometry::textures; must outlive both as_draw() calls
+            // below (empty for the bufferless zero-copy path, which has no geometry).
+            let tv = fwd.textures_view();
             let mut zc_result: Option<(u64, u64, u64, bool)> = None;
             if let Some(ptr) = zc_ptr {
                 let ptr_addr = ptr as usize; // pass as usize to keep the closure Send-clean
@@ -1753,7 +1779,7 @@ impl InfinigpuBackend {
                     // SAFETY: ptr is a page-aligned guest-RAM region valid for the frame; the device
                     // drops all imports on any DMA remap, so it can't dangle mid-submit.
                     unsafe {
-                        gpu_zc.render_forwarded_zerocopy(w, h, bg, &fwd.as_draw(), ptr_addr as *mut u8)
+                        gpu_zc.render_forwarded_zerocopy(w, h, bg, &fwd.as_draw(&tv), ptr_addr as *mut u8)
                     }
                 }) {
                     // Success: the writeback is folded into the GPU phase (DMA during execution).
@@ -1782,7 +1808,7 @@ impl InfinigpuBackend {
                     let gpu_p = Arc::clone(&self.shared_gpu);
                     let dma = &self.dma;
                     match self.ticket.as_ref().unwrap().run_timed(|| {
-                        gpu_p.render_forwarded_present(w, h, bg, &fwd.as_draw(), |px| {
+                        gpu_p.render_forwarded_present(w, h, bg, &fwd.as_draw(&tv), |px| {
                             scanout_addr == 0 || dma.write(scanout_addr, px)
                         })
                     }) {
@@ -3556,7 +3582,8 @@ mod tests {
         assert!(d.test && !d.write, "depth test-on/write-off round-trips");
         assert_eq!(d.compare, depth_compare::GREATER, "depth compare-op round-trips");
         assert_eq!(g.push_constants, [0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4], "push-const bytes round-trip");
-        let t = g.texture.expect("texdesc + pixels decode to a texture");
+        assert_eq!(g.textures.len(), 1, "one texture decodes");
+        let t = &g.textures[0];
         assert_eq!((t.width, t.height), (2, 2), "texture dims round-trip");
         assert_eq!(t.rgba, texpix, "texture pixels round-trip");
         assert!(t.linear && t.repeat, "sampler flags round-trip");
@@ -3597,6 +3624,51 @@ mod tests {
         let mut bad_magic = payload.clone();
         bad_magic[vspv_off] = bad_magic[vspv_off].wrapping_add(1);
         assert!(decode_forwarded_cmdlist(&bad_magic, CAP).is_none(), "non-SPIR-V vertex blob rejected");
+    }
+
+    /// Phase-2c multi-texture: the decoder unpacks TWO textures — distinct dims + a concatenated pixel
+    /// region — into `OwnedGeometry::textures[0..2]` in order, and rejects a `tex_count` past the cap.
+    /// Proves the per-texture bounds-checked carve (each `data_len` out of the trailing region) and that
+    /// texture order is preserved, off-hardware.
+    #[test]
+    fn forwarded_cmdlist_decodes_two_textures() {
+        use infinigpu_abi::wire::{sampler_flags, vk_vformat, DrawCmdWire, TextureDescWire, VertexAttrWire};
+        const CAP: usize = 64 * 1024 * 1024;
+        const MAGIC: u32 = 0x0723_0203;
+        let vspirv: [u32; 2] = [MAGIC, 0x11];
+        let fspirv: [u32; 2] = [MAGIC, 0x22];
+        let attrs = [VertexAttrWire { location: 0, format: vk_vformat::R32G32_SFLOAT, offset: 0 }];
+        let vdata = vec![0u8; 24]; // 3 verts × stride 8
+        let draws = [DrawCmdWire { count: 3, instance_count: 1, first: 0, vertex_offset: 0, vp_x: 0.0, vp_y: 0.0, vp_w: 0.0, vp_h: 0.0 }];
+        // Texture 0: 1×1 red. Texture 1: 2×1 green|blue. Pixels concatenated in texture order.
+        let t0: [u8; 4] = [255, 0, 0, 255];
+        let t1: [u8; 8] = [0, 255, 0, 255, 0, 0, 255, 255];
+        let mut texpix = Vec::new();
+        texpix.extend_from_slice(&t0);
+        texpix.extend_from_slice(&t1);
+        let texs = [
+            TextureDescWire { width: 1, height: 1, data_len: 4, sampler_flags: sampler_flags::LINEAR },
+            TextureDescWire { width: 2, height: 1, data_len: 8, sampler_flags: 0 },
+        ];
+        let payload = encode_forwarded_cmdlist(
+            8, 8, [0.0; 4], 0, &vspirv, &fspirv, c"m", c"m", 8, &attrs, &vdata, &[], false, 0, 0, &[],
+            &draws, &texs, &texpix, &[], 0, /*tex_binding*/ 0, 0,
+        );
+        let o = decode_forwarded_cmdlist(&payload, CAP).expect("two-texture cmdlist decodes");
+        let g = o.geometry.expect("geometry");
+        assert_eq!(g.textures.len(), 2, "both textures decode");
+        assert_eq!((g.textures[0].width, g.textures[0].height), (1, 1));
+        assert_eq!(g.textures[0].rgba, t0, "texture 0 pixels (red) in order");
+        assert!(g.textures[0].linear, "texture 0 sampler flags");
+        assert_eq!((g.textures[1].width, g.textures[1].height), (2, 1));
+        assert_eq!(g.textures[1].rgba, t1, "texture 1 pixels (green|blue) after texture 0");
+        assert!(!g.textures[1].linear, "texture 1 sampler flags (nearest)");
+
+        // tex_count past the cap (MAX_TEXTURES) is rejected fail-closed: forge a huge tex_count in the
+        // tail (offset 52) — the decoder must bail before allocating.
+        let mut too_many = payload.clone();
+        too_many[40 + 52..40 + 56].copy_from_slice(&(infinigpu_replay::MAX_TEXTURES as u32 + 1).to_le_bytes());
+        assert!(decode_forwarded_cmdlist(&too_many, CAP).is_none(), "tex_count past the cap rejected");
     }
 
     /// WGSL → SPIR-V via naga (pure-Rust; no glslang) so the device GPU test drives a real VBO-reading

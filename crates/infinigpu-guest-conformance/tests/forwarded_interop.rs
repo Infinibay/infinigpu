@@ -145,7 +145,8 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
     assert!(d.test && d.write, "depth test+write survive the C→Rust round-trip");
     assert_eq!(d.compare, depth_compare::LESS_OR_EQUAL, "depth compare-op survives");
     assert_eq!(g.push_constants, [9, 8, 7, 6, 5, 4, 3, 2], "push-constant bytes survive C→Rust");
-    let t = g.texture.expect("texdesc + pixel region decode to a texture");
+    assert_eq!(g.textures.len(), 1, "one texture decodes");
+    let t = &g.textures[0];
     assert_eq!((t.width, t.height), (2, 2), "texture dims survive C→Rust");
     assert_eq!(t.rgba, texpix, "texture pixels survive C→Rust (trailing region placement)");
     assert!(t.linear && !t.repeat, "sampler flags survive (linear on, repeat off)");
@@ -158,4 +159,43 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
         infinigpu_abi::wire::raster_flags::pack(infinigpu_abi::wire::cull_mode::BACK, true, true),
         "raster_flags survives C→Rust (cull BACK / front-face CW / blend on)"
     );
+}
+
+/// Phase-2c multi-texture: the **guest** C encoder serializes TWO sampled textures (a texdesc array +
+/// a concatenated pixel region) and the **host** Rust decoder unpacks both in order — proving the
+/// multi-texture wire byte-for-byte across C↔Rust, off-hardware. A real material shader binds several
+/// textures; if the C encoder's texdesc-array or concatenated-pixel layout disagreed with the host by a
+/// byte, one texture would be dropped or its pixels scrambled.
+#[test]
+fn c_cmdlist_encoder_two_textures_decode() {
+    use infinigpu_abi::wire::{sampler_flags, vk_vformat, DrawCmdWire, TextureDescWire, VertexAttrWire};
+
+    let vspirv: [u32; 2] = [SPIRV_MAGIC, 0x11];
+    let fspirv: [u32; 2] = [SPIRV_MAGIC, 0x22];
+    let attrs = [VertexAttrWire { location: 0, format: vk_vformat::R32G32_SFLOAT, offset: 0 }];
+    let vertex_data: Vec<u8> = (0u8..24).collect(); // 3 verts × stride 8
+    let draws = [DrawCmdWire { count: 3, instance_count: 1, first: 0, vertex_offset: 0, vp_x: 0.0, vp_y: 0.0, vp_w: 0.0, vp_h: 0.0 }];
+    // Texture 0: 1×1 red (nearest). Texture 1: 2×1 green|blue (linear). Pixels concatenated in order.
+    let t0: [u8; 4] = [255, 0, 0, 255];
+    let t1: [u8; 8] = [0, 255, 0, 255, 0, 0, 255, 255];
+    let mut texpix = Vec::new();
+    texpix.extend_from_slice(&t0);
+    texpix.extend_from_slice(&t1);
+    let texs = [
+        TextureDescWire { width: 1, height: 1, data_len: 4, sampler_flags: 0 },
+        TextureDescWire { width: 2, height: 1, data_len: 8, sampler_flags: sampler_flags::LINEAR },
+    ];
+    let payload = guest::encode_forwarded_cmdlist(
+        64, 64, [0.0; 4], 0, &vspirv, &fspirv, c"m", c"m", 8, &attrs, &vertex_data, &[], false, 0, 0,
+        &[], &draws, &texs, &texpix, &[], 0, /*tex_binding*/ 0, 0,
+    );
+    let o = decode_forwarded_cmdlist(&payload, CAP).expect("C two-texture cmdlist must decode");
+    let g = o.geometry.expect("geometry");
+    assert_eq!(g.textures.len(), 2, "both textures survive C→Rust");
+    assert_eq!((g.textures[0].width, g.textures[0].height), (1, 1));
+    assert_eq!(g.textures[0].rgba, t0, "texture 0 pixels (red) in order");
+    assert!(!g.textures[0].linear, "texture 0 sampler (nearest)");
+    assert_eq!((g.textures[1].width, g.textures[1].height), (2, 1));
+    assert_eq!(g.textures[1].rgba, t1, "texture 1 pixels (green|blue) after texture 0");
+    assert!(g.textures[1].linear, "texture 1 sampler (linear)");
 }

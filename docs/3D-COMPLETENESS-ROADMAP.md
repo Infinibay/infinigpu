@@ -31,7 +31,7 @@ fixes the correctness landmines (B1) they expose.
   image, binding 1 = sampler) and a sampler (linear/nearest × repeat/clamp), and binds it for the fragment shader
   to `textureSample`. Host + ABI + device (fail-closed decode: `data_len == w*h*4`) + guest C encoder + cbindgen
   header + conformance interop, all tests green (`forwarded_texture_samples_onto_a_quad` on the A5000; C↔Rust
-  round-trip). Single-texture; multi-texture + SSBO (multiple bindings, storage buffers) are the follow-up.
+  round-trip). Single-texture originally; **multi-texture (N images in one set) now DONE — see the bullet below.**
 - **Phase 2c textures — GUEST half DONE too (compile-verified).** The guest ICD now has a real descriptor
   subsystem (`infinigpu_descriptor.c`: layouts/samplers/pools/sets/update, all driver-owned — Mesa backfills
   none), records `CmdBindDescriptorSets` + a `CmdCopyBufferToImage2` texture upload, and at submit reads the
@@ -81,7 +81,22 @@ fixes the correctness landmines (B1) they expose.
   compareOp is captured whenever a depth-stencil state is present. **Scope:** cull/front-face/depth/topology
   (EDS1). Blend-enable dynamic (EDS3) not handled; per-draw pipeline-state changes still forward one state
   per command list (pre-existing architecture).
-- **Next up:** SSBO / multiple descriptor sets / multi-texture (storage buffers + more than one set); MSAA
+- **Phase-2c multi-texture (N sampled images in one set) — DONE, A5000-verified.** Lifts the single-texture
+  cap to `MAX_TEXTURES = 8` — the gate for real material shaders (albedo/normal/roughness/… bound at once).
+  **No ABI change** (the wire tail already had `tex_count`, a texdesc array, and a concatenated pixel region;
+  only the decode cap + host/guest handling assumed 1). Texture `i` binds image@`tex_binding + 2i` /
+  sampler@`+2i+1`. Host (`infinigpu-replay`): `Geometry.textures: &[Texture]`; `DescriptorSig` keys the layout
+  by `(tex_binding, tex_count)`; builds N image+sampler pairs, uploads N (freeing partials on a mid-loop
+  error), loops the upload barrier/copy over all N. Device decode loops N texdescs + carves each `data_len ==
+  w*h*4` pixel block fail-closed from the trailing region (per-texture `<= remaining` bound). Guest ICD: the
+  descriptor set holds an image array (`infinigpu_tex_slot` keyed by image binding; a sampler@`b` pairs with
+  the image@`b-1`); at submit the 4-bpp images are sorted by binding, copied into one contiguous `texpix`, and
+  forwarded. Verified: device (2-texture decode + cap reject), conformance (C↔Rust 2-texture), guest ICD
+  compiles+links; A5000 GPU test `forwarded_two_textures_sample_at_distinct_bindings` (red-left / blue-right
+  from two textures at bindings 0/1 and 2/3). **Scope:** N images in ONE set at consecutive `2i` bindings
+  (the common material layout); multiple descriptor SETS and non-consecutive/mixed-format bindings remain a
+  follow-up.
+- **Next up:** SSBO (storage buffers) + multiple descriptor sets; MSAA
   (2d-A5 multisample); Phase 2a (format A6 / loadOp A8); EDS3 dynamic blend + per-draw state if a real game
   needs them. Then the owner runtime render-validation in a real GPU VM (below) — the one link not yet
   exercised end-to-end.
@@ -192,7 +207,7 @@ paths. Do this whenever the ABI is bumped for Phase 2b anyway.
 |-------|----------|--------|------|----------|--------|
 | 2a | A6, A8 | S | low | correct colors; overlay passes | todo |
 | 2b | A1, A3, A7, A5-dyn | **L** | med | **any real mesh renders** | **DONE** host/device/wire + guest ICD recording (compile-verified); runtime render-validation pending owner |
-| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) | **push-const transform + textures + UBO DONE end-to-end** (host/wire/device + guest ICD recording; A5000-verified); SSBO / multi-set / multi-texture todo (**next**) |
+| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) | **push-const + textures + UBO + MULTI-texture DONE end-to-end** (host/wire/device + guest ICD; A5000-verified); SSBO / multi-descriptor-set todo (**next**) |
 | 2d | A4, A5-static | M | med | depth-correct 3D, transparency, MSAA | **A4 depth DONE**; **A5 cull/front-face/blend DONE** (A5000-verified); MSAA todo |
 | 2e | A9 | M | med | async frames (with Fix F) | todo |
 

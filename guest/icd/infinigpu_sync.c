@@ -256,48 +256,104 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       draws[i].vp_h = cmd->draws[i].viewport[3];
    }
 
-   /* Phase-2c texture: if a descriptor set with a sampled image is bound, forward its RGBA8 pixels.
-    * The ICD's images are LINEAR + tightly packed (row_pitch == width*bpp), so the pixels read
-    * contiguously from the image's host-mapped memory. Only 4-bpp (RGBA8-class) images are
-    * forwarded — the host samples them as R8G8B8A8; other formats are skipped fail-safe (untextured
-    * rather than colour-scrambled). */
-   struct TextureDescWire texdesc;
-   const uint8_t *texpix = NULL;
+   /* Phase-2c multi-texture: forward the sampled images bound in the set as texture i at tex_binding + 2i
+    * (the host's image@b / sampler@b+1 layout — how a material shader declares consecutive texture/sampler
+    * pairs). CRITICAL for correctness: the host derives each texture's binding purely from its ARRAY INDEX
+    * (base + 2i), so the forwarded array MUST cover EVERY binding the shader declares, with no gaps — else
+    * a later texture would land on a binding the shader reads as a different one (silent colour scramble).
+    * So we forward ALL image slots (not just 4-bpp ones): a non-4-bpp / unmapped image becomes a 1×1
+    * placeholder at ITS binding, keeping the base+2i sequence dense and the host layout complete — the
+    * shader samples a benign default there, never the wrong texture. If the slots are NOT a consecutive
+    * even sequence (base, base+2, …) — a gap or a sampler-only slot — the base+2i model can't represent
+    * them faithfully, so we forward NOTHING (fail-safe untextured, never scrambled). Arbitrary/
+    * non-consecutive bindings need a per-texture-binding wire (follow-up). `texpix` is malloc'd + freed. */
+   struct infinigpu_descriptor_set *ds = cmd->bound_desc_set;
+   struct TextureDescWire texs[INFINIGPU_MAX_SET_TEXTURES];
+   uint8_t *texpix = NULL;
    uint32_t texpix_len = 0;
    uint32_t tex_count = 0;
-   if (cmd->bound_desc_set && cmd->bound_desc_set->image) {
-      struct infinigpu_image *ti = cmd->bound_desc_set->image->image;
-      if (ti && ti->mem && ti->mem->map && ti->row_pitch == ti->vk.extent.width * 4u) {
-         uint32_t tw = ti->vk.extent.width;
-         uint32_t th = ti->vk.extent.height;
-         texpix = (const uint8_t *)ti->mem->map + ti->mem_offset;
-         texpix_len = tw * th * 4u;
-         texdesc.width = tw;
-         texdesc.height = th;
-         texdesc.data_len = texpix_len;
-         texdesc.sampler_flags = 0;
-         struct infinigpu_sampler *smp = cmd->bound_desc_set->sampler;
-         if (smp) {
-            if (smp->linear)
-               texdesc.sampler_flags |= INFINIGPU_SAMPLER_LINEAR;
-            if (smp->repeat)
-               texdesc.sampler_flags |= INFINIGPU_SAMPLER_REPEAT;
+   uint32_t tex_binding = 0;
+   if (ds && ds->texture_count > 0) {
+      /* Sort ALL image slots by binding (insertion sort; N ≤ 8) — including non-4-bpp, so the sequence
+       * stays complete and every shader-declared binding is covered. */
+      struct infinigpu_desc_texture *sorted[INFINIGPU_MAX_SET_TEXTURES];
+      uint32_t n = ds->texture_count;
+      for (uint32_t i = 0; i < n; i++)
+         sorted[i] = &ds->textures[i];
+      for (uint32_t i = 1; i < n; i++) {
+         struct infinigpu_desc_texture *key = sorted[i];
+         uint32_t j = i;
+         while (j > 0 && sorted[j - 1]->binding > key->binding) {
+            sorted[j] = sorted[j - 1];
+            j--;
          }
-         tex_count = 1;
+         sorted[j] = key;
+      }
+      /* Valid only if every slot has a bound image AND the bindings are consecutive-even (base + 2i). */
+      uint32_t base = sorted[0]->binding;
+      bool ok = true;
+      for (uint32_t i = 0; i < n; i++) {
+         if (!sorted[i]->image || !sorted[i]->image->image ||
+             sorted[i]->binding != base + 2u * i) {
+            ok = false;
+            break;
+         }
+      }
+      if (ok) {
+         /* Total pixel bytes: real w*h*4 for a 4-bpp mapped image, else 4 (a 1×1 placeholder). */
+         size_t total = 0;
+         for (uint32_t i = 0; i < n; i++) {
+            struct infinigpu_image *ti = sorted[i]->image->image;
+            bool fwd = ti->mem && ti->mem->map && ti->row_pitch == ti->vk.extent.width * 4u;
+            total += fwd ? (size_t)ti->vk.extent.width * ti->vk.extent.height * 4u : 4u;
+         }
+         texpix = malloc(total ? total : 1);
+         if (texpix) {
+            size_t off = 0;
+            for (uint32_t i = 0; i < n; i++) {
+               struct infinigpu_image *ti = sorted[i]->image->image;
+               bool fwd = ti->mem && ti->mem->map && ti->row_pitch == ti->vk.extent.width * 4u;
+               if (fwd) {
+                  uint32_t tw = ti->vk.extent.width;
+                  uint32_t th = ti->vk.extent.height;
+                  uint32_t bytes = tw * th * 4u;
+                  memcpy(texpix + off, (const uint8_t *)ti->mem->map + ti->mem_offset, bytes);
+                  off += bytes;
+                  texs[i].width = tw;
+                  texs[i].height = th;
+                  texs[i].data_len = bytes;
+               } else {
+                  /* 1×1 opaque-white placeholder — keeps this binding present in the host layout so a
+                   * non-4-bpp map degrades to a default rather than mis-binding a later texture. */
+                  texpix[off] = texpix[off + 1] = texpix[off + 2] = texpix[off + 3] = 255;
+                  off += 4;
+                  texs[i].width = 1;
+                  texs[i].height = 1;
+                  texs[i].data_len = 4;
+               }
+               texs[i].sampler_flags = 0;
+               struct infinigpu_sampler *smp = sorted[i]->sampler;
+               if (smp) {
+                  if (smp->linear)
+                     texs[i].sampler_flags |= INFINIGPU_SAMPLER_LINEAR;
+                  if (smp->repeat)
+                     texs[i].sampler_flags |= INFINIGPU_SAMPLER_REPEAT;
+               }
+            }
+            texpix_len = (uint32_t)total;
+            tex_count = n;
+            tex_binding = base;
+         }
       }
    }
 
    /* Phase-2c uniform buffer: if a UBO is bound in the (single) descriptor set, forward its bytes so
     * the host binds them for the shader's var<uniform> block. buf->map already includes the
-    * BindBufferMemory bind offset, so add ONLY the write offset (never double-count). tex_binding is
-    * forwarded so the host places the texture where the shader declares it (composes with the UBO). */
+    * BindBufferMemory bind offset, so add ONLY the write offset (never double-count). */
    const uint8_t *ubo = NULL;
    uint32_t ubo_len = 0;
    uint32_t ubo_binding = 0;
-   uint32_t tex_binding = 0;
-   struct infinigpu_descriptor_set *ds = cmd->bound_desc_set;
    if (ds) {
-      tex_binding = ds->tex_binding;
       if (ds->ubo_buffer && ds->ubo_buffer->map && ds->ubo_offset < ds->ubo_buffer->total_size) {
          /* Clamp to the bytes actually in the buffer past the write offset, exactly like the vertex
           * (vavail) and index (iavail) paths above. A non-conformant app can bind an explicit
@@ -325,6 +381,7 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
    uint8_t *payload = malloc(cap);
    if (!payload) {
       free(draws);
+      free(texpix);
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
@@ -358,9 +415,10 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       cmd->push_const, cmd->push_const_len,
       ubo, ubo_len, ubo_binding,
       draws, cmd->draw_count,
-      tex_count ? &texdesc : NULL, tex_count, tex_binding, texpix, texpix_len,
+      tex_count ? texs : NULL, tex_count, tex_binding, texpix, texpix_len,
       raster_flags);
    free(draws);
+   free(texpix);
    if (n == 0) {
       free(payload);
       return vk_errorf(dev, VK_ERROR_UNKNOWN, "cmdlist payload did not fit");

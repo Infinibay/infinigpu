@@ -157,9 +157,7 @@ infinigpu_AllocateDescriptorSets(VkDevice _device,
          return vk_error(dev, VK_ERROR_OUT_OF_POOL_MEMORY);
       }
       set->pool = pool;
-      set->image = NULL;
-      set->sampler = NULL;
-      set->tex_binding = 0;
+      set->texture_count = 0;
       set->ubo_buffer = NULL;
       set->ubo_offset = 0;
       set->ubo_range = 0;
@@ -184,6 +182,25 @@ infinigpu_FreeDescriptorSets(VkDevice _device, VkDescriptorPool _pool,
    return VK_SUCCESS;
 }
 
+/* Find the texture slot for image-binding `binding`, creating it (image/sampler NULL) if absent.
+ * Returns NULL only when the set is already full (INFINIGPU_MAX_SET_TEXTURES) — a fail-safe drop. The
+ * slots are keyed by the sampled-image dstBinding; a separate SAMPLER write at `binding+1` pairs with
+ * the image slot at `binding` (the host's image@b / sampler@b+1 layout). */
+static struct infinigpu_desc_texture *
+infinigpu_tex_slot(struct infinigpu_descriptor_set *set, uint32_t binding)
+{
+   for (uint32_t i = 0; i < set->texture_count; i++)
+      if (set->textures[i].binding == binding)
+         return &set->textures[i];
+   if (set->texture_count >= INFINIGPU_MAX_SET_TEXTURES)
+      return NULL;
+   struct infinigpu_desc_texture *t = &set->textures[set->texture_count++];
+   t->image = NULL;
+   t->sampler = NULL;
+   t->binding = binding;
+   return t;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 infinigpu_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
                                const VkWriteDescriptorSet *pDescriptorWrites,
@@ -191,9 +208,10 @@ infinigpu_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
                                const VkCopyDescriptorSet *pDescriptorCopies)
 {
    /* Capture the resources each write binds, and the binding NUMBER (dstBinding) so the host can build
-    * a descriptor-set layout that places them where the shader declares them. A sampled image + sampler
-    * and a uniform buffer can be written into the SAME set at distinct bindings (Phase-2c composition).
-    * The single-resource case takes element 0. */
+    * a descriptor-set layout that places them where the shader declares them. Several sampled images +
+    * samplers and a uniform buffer can be written into the SAME set at distinct bindings (Phase-2c
+    * multi-texture composition). Each image is keyed by its dstBinding; a separate SAMPLER at `b+1`
+    * pairs with the image at `b`. The single-resource case takes element 0. */
    for (uint32_t w = 0; w < descriptorWriteCount; w++) {
       const VkWriteDescriptorSet *wr = &pDescriptorWrites[w];
       VK_FROM_HANDLE(infinigpu_descriptor_set, set, wr->dstSet);
@@ -201,26 +219,35 @@ infinigpu_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
          continue;
 
       switch (wr->descriptorType) {
-      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
          if (!wr->pImageInfo)
             break;
-         if (wr->pImageInfo[0].imageView) {
-            set->image = infinigpu_image_view_from_handle(wr->pImageInfo[0].imageView);
-            set->tex_binding = wr->dstBinding;
-         }
+         struct infinigpu_desc_texture *t = infinigpu_tex_slot(set, wr->dstBinding);
+         if (!t)
+            break;
+         if (wr->pImageInfo[0].imageView)
+            t->image = infinigpu_image_view_from_handle(wr->pImageInfo[0].imageView);
          if (wr->pImageInfo[0].sampler)
-            set->sampler = infinigpu_sampler_from_handle(wr->pImageInfo[0].sampler);
+            t->sampler = infinigpu_sampler_from_handle(wr->pImageInfo[0].sampler);
          break;
-      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-         if (wr->pImageInfo && wr->pImageInfo[0].imageView) {
-            set->image = infinigpu_image_view_from_handle(wr->pImageInfo[0].imageView);
-            set->tex_binding = wr->dstBinding;
-         }
+      }
+      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: {
+         if (!wr->pImageInfo || !wr->pImageInfo[0].imageView)
+            break;
+         struct infinigpu_desc_texture *t = infinigpu_tex_slot(set, wr->dstBinding);
+         if (t)
+            t->image = infinigpu_image_view_from_handle(wr->pImageInfo[0].imageView);
          break;
-      case VK_DESCRIPTOR_TYPE_SAMPLER:
-         if (wr->pImageInfo && wr->pImageInfo[0].sampler)
-            set->sampler = infinigpu_sampler_from_handle(wr->pImageInfo[0].sampler);
+      }
+      case VK_DESCRIPTOR_TYPE_SAMPLER: {
+         /* A separate sampler pairs with the image one binding lower (host layout: image@b, sampler@b+1). */
+         if (!wr->pImageInfo || !wr->pImageInfo[0].sampler || wr->dstBinding == 0)
+            break;
+         struct infinigpu_desc_texture *t = infinigpu_tex_slot(set, wr->dstBinding - 1);
+         if (t)
+            t->sampler = infinigpu_sampler_from_handle(wr->pImageInfo[0].sampler);
          break;
+      }
       case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
          /* A UBO (per-frame matrices etc.). Non-dynamic only — dynamic offsets from
           * CmdBindDescriptorSets are unsupported this iteration. */
