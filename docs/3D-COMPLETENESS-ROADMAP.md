@@ -16,9 +16,13 @@ fixes the correctness landmines (B1) they expose.
 - **Phase 2d depth (A4) — DONE, A5000-verified.** Optional depth attachment (D32) + depth test/write/compare,
   forwarded via the `ForwardedCmdListTail.depth_flags` bitfield. Host + ABI + device + guest wire + tests.
   (A5 static state — blend/cull/MSAA — is NOT yet done; see 2d below.)
-- **Next up:** Phase 2c (the transform: UBO / push constants, then textures) — the biggest remaining gate for a
-  real game, since geometry today renders in raw NDC with no camera/model transform. Then Phase 2a (format A6 /
-  loadOp A8) for colour-space correctness, and A5 static state.
+- **Phase 2c transform (push constants) — DONE, A5000-verified.** A push-constant block (an MVP `mat4`) is
+  forwarded via `ForwardedCmdListTail.push_const_len` (ABI 0.9, tail 48→52 B) + a trailing section, applied to
+  VERTEX|FRAGMENT before the draws. Geometry can now leave raw NDC (camera/model transform). Host + ABI + device
+  + guest wire + tests. **Remaining 2c (the XL part):** full UBO/SSBO via descriptor sets (larger uniforms,
+  multiple bindings) and **textures** (sampled images + samplers + layout transitions) — most games need textures.
+- **Next up:** Phase 2c textures/UBO (descriptor sets — the biggest remaining chunk); Phase 2a (format A6 /
+  loadOp A8) for colour-space correctness; A5 static state (blend/cull/MSAA).
 
 The rest of this doc is the original design; the per-phase wire/host/test shape it describes is what the landed
 phases implemented.
@@ -126,7 +130,7 @@ paths. Do this whenever the ABI is bumped for Phase 2b anyway.
 |-------|----------|--------|------|----------|--------|
 | 2a | A6, A8 | S | low | correct colors; overlay passes | todo |
 | 2b | A1, A3, A7, A5-dyn | **L** | med | **any real mesh renders** | **DONE** (host/device/wire; guest ICD recording pending owner) |
-| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) | todo — **next** (transform is the gate) |
+| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) | **push-const transform DONE**; UBO-descriptors + textures todo (**next**) |
 | 2d | A4, A5-static | M | med | depth-correct 3D, transparency, MSAA | **A4 depth DONE**; A5 static (blend/cull/MSAA) todo |
 | 2e | A9 | M | med | async frames (with Fix F) | todo |
 
