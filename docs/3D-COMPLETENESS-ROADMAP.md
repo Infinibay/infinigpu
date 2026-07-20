@@ -18,7 +18,8 @@ fixes the correctness landmines (B1) they expose.
   the ICD is the next guest piece (host+wire+device textures are already done — see Phase 2c below).
 - **Phase 2d depth (A4) — DONE, A5000-verified.** Optional depth attachment (D32) + depth test/write/compare,
   forwarded via the `ForwardedCmdListTail.depth_flags` bitfield. Host + ABI + device + guest wire + tests.
-  (A5 static state — blend/cull/MSAA — is NOT yet done; see 2d below.)
+  (A5 static state — the cull/front-face/blend part is now DONE, see the raster-state bullet below; MSAA
+  is still todo.)
 - **Phase 2c transform (push constants) — DONE, A5000-verified.** A push-constant block (an MVP `mat4`) is
   forwarded via `ForwardedCmdListTail.push_const_len` (ABI 0.9, tail 48→52 B) + a trailing section, applied to
   VERTEX|FRAGMENT before the draws. Geometry can now leave raw NDC (camera/model transform). Host + ABI + device
@@ -50,8 +51,31 @@ fixes the correctness landmines (B1) they expose.
   interop, all green — GPU tests `forwarded_uniform_only_offsets_geometry` (UBO offsets geometry in VERTEX) and
   `forwarded_uniform_and_texture_compose` (UBO + texture compose in one set) pass on the A5000; the texture-only
   guard `forwarded_texture_samples_onto_a_quad` still passes.
-- **Next up:** SSBO / multiple descriptor sets / multi-texture (storage buffers + more than one set); A5 static
-  state (blend/cull/MSAA); Phase 2a (format A6 / loadOp A8).
+- **Phase 2d-A5 raster state (cull / front-face / blend) — DONE end-to-end, A5000-verified.** The static
+  fixed-function state `build_pipeline` used to hardcode (cull NONE / front-face CCW / blend off) is now
+  forwarded via one new `ForwardedCmdListTail.raster_flags` bitfield (ABI 0.12, tail 68→72 B): bits 0–1 =
+  cull mode (NONE/FRONT/BACK/FRONT_AND_BACK), bit 2 = front-face-CW, bit 3 = alpha-blend enable. `0`
+  reproduces the old default exactly, so older/bufferless draws are unchanged. Host maps it into the
+  pipeline's rasterization + colour-blend state (blend = standard src-alpha over one-minus-src-alpha);
+  `PipelineKey` gained `raster_flags` so distinct states get distinct cached pipelines. Device decode reads
+  it as an opaque bitfield (unknown values → safe defaults, no bounds needed). Guest ICD captures
+  `VkPipelineRasterizationStateCreateInfo` (cullMode/frontFace) + colour-blend attachment[0].blendEnable
+  (`infinigpu_pipeline.c`), relying on VkCullModeFlagBits NONE/FRONT/BACK/FRONT_AND_BACK == 0/1/2/3. Host +
+  ABI + device (round-trip) + guest C encoder + cbindgen header + conformance interop, all green; the guest
+  Mesa ICD compiles+links. GPU tests on the A5000: `forwarded_back_face_culling_removes_geometry` (one
+  winding culls, the other renders) and `forwarded_alpha_blend_composites_over_background` (blue@0.5 over
+  red → ~half/half). Fixes back-face overdraw + opaque transparency in real 3D scenes. **MSAA is deferred**
+  (needs a multisample render pass + resolve attachment, not a pipeline-only flag). **Known limitation
+  (adversarial-review finding, low):** the guest captures cull/front-face from the *static* pipeline
+  `pRasterizationState` only — it does NOT yet honor Vulkan-1.3 **dynamic** state
+  (`VK_DYNAMIC_STATE_CULL_MODE`/`FRONT_FACE` via `vkCmdSetCullMode`/`vkCmdSetFrontFace`, which DXVK/VKD3D
+  use routinely). A pipeline that declares those dynamic (static `cullMode` left at NONE) forwards
+  `raster_flags == 0` and silently skips culling. This is the pre-existing ICD-wide static-only capture
+  pattern shared by depth/topology/scissor — see "dynamic pipeline-state capture" below.
+- **Next up:** **dynamic pipeline-state capture** (`vkCmdSet{CullMode,FrontFace,DepthTestEnable,Scissor,…}`
+  — the Vulkan-1.3 dynamic-state entrypoints DXVK/VKD3D need; captured today only from static pipeline
+  fields); SSBO / multiple descriptor sets / multi-texture (storage buffers + more than one set); MSAA
+  (2d-A5 multisample); Phase 2a (format A6 / loadOp A8).
 
 The rest of this doc is the original design; the per-phase wire/host/test shape it describes is what the landed
 phases implemented.
@@ -160,7 +184,7 @@ paths. Do this whenever the ABI is bumped for Phase 2b anyway.
 | 2a | A6, A8 | S | low | correct colors; overlay passes | todo |
 | 2b | A1, A3, A7, A5-dyn | **L** | med | **any real mesh renders** | **DONE** host/device/wire + guest ICD recording (compile-verified); runtime render-validation pending owner |
 | 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) | **push-const transform + textures + UBO DONE end-to-end** (host/wire/device + guest ICD recording; A5000-verified); SSBO / multi-set / multi-texture todo (**next**) |
-| 2d | A4, A5-static | M | med | depth-correct 3D, transparency, MSAA | **A4 depth DONE**; A5 static (blend/cull/MSAA) todo |
+| 2d | A4, A5-static | M | med | depth-correct 3D, transparency, MSAA | **A4 depth DONE**; **A5 cull/front-face/blend DONE** (A5000-verified); MSAA todo |
 | 2e | A9 | M | med | async frames (with Fix F) | todo |
 
 Recommended order: **2a → 2b → 2c → 2d**, with 2e deferred to the async-submit work. 2a is a few hours of

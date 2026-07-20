@@ -183,6 +183,12 @@ pub struct Geometry<'a> {
     /// (VERTEX|FRAGMENT), for a shader's `var<uniform>` block (e.g. per-frame matrices). `None` ⇒ no
     /// UBO. Composes with `texture` in the same set at a distinct binding.
     pub uniform: Option<UniformBlock<'a>>,
+    /// Static fixed-function rasterization + blend state (Phase-2d-A5) as an
+    /// [`infinigpu_abi::wire::raster_flags`] bitfield: cull mode, front-face winding, alpha-blend
+    /// enable. `0` ⇒ cull NONE / front-face CCW / blend off — the state `build_pipeline` hardcoded
+    /// before this field, so a bufferless or older draw is unchanged. Baked into the pipeline (keyed
+    /// in [`PipelineKey`]), so distinct states get distinct cached pipelines.
+    pub raster_flags: u32,
 }
 
 /// A forwarded uniform buffer (Phase-2c): a declared descriptor-set-0 binding + the raw bytes the host
@@ -259,6 +265,18 @@ fn map_compare(c: u32) -> vk::CompareOp {
         C::GREATER_OR_EQUAL => vk::CompareOp::GREATER_OR_EQUAL,
         C::ALWAYS => vk::CompareOp::ALWAYS,
         _ => vk::CompareOp::LESS_OR_EQUAL,
+    }
+}
+
+/// Map a [`wire::raster_flags`](infinigpu_abi::wire::raster_flags) cull sub-field to `VkCullModeFlags`.
+/// Unknown values fall back to `NONE` (render everything) — fail-safe: a bad flag never hides geometry.
+fn map_cull_mode(rf: u32) -> vk::CullModeFlags {
+    use infinigpu_abi::wire::cull_mode as C;
+    match infinigpu_abi::wire::raster_flags::cull(rf) {
+        C::FRONT => vk::CullModeFlags::FRONT,
+        C::BACK => vk::CullModeFlags::BACK,
+        C::FRONT_AND_BACK => vk::CullModeFlags::FRONT_AND_BACK,
+        _ => vk::CullModeFlags::NONE,
     }
 }
 
@@ -650,6 +668,10 @@ struct PipelineKey {
     /// (hence the pipeline) includes the descriptor-set layout built from this, so it is part of the key.
     /// `None` ⇒ no descriptor set (empty layout, the pre-2c paths).
     desc_sig: Option<DescriptorSig>,
+    /// Phase-2d-A5 static rasterization+blend state (cull/front-face/blend) baked into the pipeline,
+    /// as an [`infinigpu_abi::wire::raster_flags`] bitfield. `0` ⇒ cull NONE / CCW / blend off, so the
+    /// pre-A5 paths key exactly as before. Distinct states ⇒ distinct cached pipelines.
+    raster_flags: u32,
 }
 
 /// The descriptor-set-0 signature a draw needs (Phase-2c): which resources bind where. The host builds
@@ -685,6 +707,14 @@ fn depth_key_of(draw: &ForwardedDraw) -> (bool, u32) {
         }
         _ => (false, 0),
     }
+}
+
+/// Static rasterization+blend state of a draw (Phase-2d-A5), as an
+/// [`infinigpu_abi::wire::raster_flags`] bitfield; `0` (cull NONE / CCW / blend off) for a bufferless
+/// draw or one that didn't request any (the pre-A5 default). Baked into the pipeline, so it is part of
+/// the [`PipelineKey`].
+fn raster_flags_of(draw: &ForwardedDraw) -> u32 {
+    draw.geometry.as_ref().map(|g| g.raster_flags).unwrap_or(0)
 }
 
 /// Byte size of a draw's push-constant block (Phase-2c); `0` when there are none. The pipeline layout
@@ -1357,16 +1387,33 @@ impl HostGpu {
         let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
+        // Phase-2d-A5: static rasterization + blend state from the mesh's `raster_flags` (cull mode,
+        // front-face winding, alpha-blend enable). `0` reproduces the pre-A5 hardcoded default
+        // (cull NONE / CCW / blend off), so bufferless / older draws are unchanged.
+        let rf = raster_flags_of(draw);
         let raster = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .cull_mode(map_cull_mode(rf))
+            .front_face(if rf & infinigpu_abi::wire::raster_flags::FRONT_FACE_CW != 0 {
+                vk::FrontFace::CLOCKWISE
+            } else {
+                vk::FrontFace::COUNTER_CLOCKWISE
+            })
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        // Standard src-alpha-over blending when requested; the source alpha the shader outputs drives
+        // the composite (colour = src.rgb·src.a + dst.rgb·(1−src.a)). Off ⇒ opaque overwrite (default).
+        let blend_on = rf & infinigpu_abi::wire::raster_flags::BLEND != 0;
         let blend_attach = [vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(vk::ColorComponentFlags::RGBA)
-            .blend_enable(false)];
+            .blend_enable(blend_on)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)];
         let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attach);
         // Phase-2d depth-stencil state: present iff the mesh requested a depth attachment (test or
         // write). The pipeline's depth config MUST agree with the render pass's attachment presence.
@@ -1458,6 +1505,7 @@ impl HostGpu {
             depth_key,
             pc_size: push_const_size_of(draw),
             desc_sig: desc_sig_of(draw),
+            raster_flags: raster_flags_of(draw),
         };
         let mut cache = self.obj_cache.lock().unwrap_or_else(|e| e.into_inner());
         // Fail-closed bound before inserting anything new.
@@ -4180,6 +4228,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 texture: None,
                 tex_binding: 0,
                 uniform: None,
+                raster_flags: 0,
             }),
         };
         let (w, h) = (256u32, 256u32);
@@ -4297,6 +4346,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 texture: None,
                 tex_binding: 0,
                 uniform: None,
+                raster_flags: 0,
             }),
         };
         let bg = [0.0, 0.0, 0.0, 1.0];
@@ -4386,6 +4436,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     texture: None,
                     tex_binding: 0,
                     uniform: None,
+                    raster_flags: 0,
                 }),
             };
             gpu.render_forwarded(w, h, bg, &draw).expect("depth render").pixel(w / 2, h / 2)
@@ -4499,6 +4550,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     texture: None,
                     tex_binding: 0,
                     uniform: None,
+                    raster_flags: 0,
                 }),
             };
             gpu.render_forwarded(w, h, bg, &draw).expect("transform render")
@@ -4603,6 +4655,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 }),
                 tex_binding: 0,
                 uniform: None,
+                raster_flags: 0,
             }),
         };
         let (w, h) = (128u32, 128u32);
@@ -4688,6 +4741,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     texture: None,
                     tex_binding: 0,
                     uniform: Some(UniformBlock { binding: 0, bytes: &ubo }),
+                    raster_flags: 0,
                 }),
             };
             let frame = gpu.render_forwarded(w, h, bg, &draw).expect("uniform render");
@@ -4785,6 +4839,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     }),
                     tex_binding: 1, // image@1, sampler@2 — composes with the UBO@0
                     uniform: Some(UniformBlock { binding: 0, bytes: &ubo }),
+                    raster_flags: 0,
                 }),
             };
             gpu.render_forwarded(w, h, bg, &draw).expect("composed render")
@@ -4829,5 +4884,151 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
         eprintln!(
             "forwarded_uniform_and_texture_compose: OK (shift={shift}px, colours r={red} g={green} b={blue} w={white})"
         );
+    }
+
+    /// Phase-2d-A5 cull: `raster_flags` cull mode + front-face actually reach the GPU pipeline. The
+    /// SAME triangle is rendered three ways — cull NONE (control), cull BACK with CCW-front, cull BACK
+    /// with CW-front. Whatever the triangle's winding, exactly ONE of the two BACK variants treats it
+    /// as a back face and culls it (renders empty) while the other renders it like the control. Without
+    /// this, solid closed meshes over-draw their hidden back faces. Winding-agnostic by construction.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_back_face_culling_removes_geometry() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let vs = compile_wgsl(
+            "@vertex fn main(@location(0) p: vec2<f32>) -> @builtin(position) vec4<f32> {\n\
+               return vec4<f32>(p, 0.0, 1.0);\n}",
+            naga::ShaderStage::Vertex,
+        );
+        let fs = compile_wgsl(
+            "@fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.0, 0.0, 1.0); }",
+            naga::ShaderStage::Fragment,
+        );
+        use infinigpu_abi::wire::{cull_mode, raster_flags, vk_vformat as V};
+        let attrs = [VertexAttr { location: 0, format: V::R32G32_SFLOAT, offset: 0 }];
+        let tri: [[f32; 2]; 3] = [[0.0, -0.6], [-0.6, 0.6], [0.6, 0.6]];
+        let verts: Vec<u8> = tri.iter().flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes())).collect();
+        let draws = [DrawCmd { count: 3, instance_count: 1, first: 0, vertex_offset: 0, viewport: [0.0; 4] }];
+        let (w, h) = (128u32, 128u32);
+        let bg = [0.0, 0.0, 0.0, 1.0];
+
+        let lit = |rf: u32| -> u32 {
+            let draw = ForwardedDraw {
+                vertex_spirv: &vs,
+                vertex_entry: c"main",
+                fragment_spirv: &fs,
+                fragment_entry: c"main",
+                vertex_count: 0,
+                topology: 0,
+                geometry: Some(Geometry {
+                    vertex_data: &verts,
+                    vertex_stride: 8,
+                    attrs: &attrs,
+                    index_data: &[],
+                    index_u32: false,
+                    draws: &draws,
+                    depth: None,
+                    push_constants: &[],
+                    texture: None,
+                    tex_binding: 0,
+                    uniform: None,
+                    raster_flags: rf,
+                }),
+            };
+            let frame = gpu.render_forwarded(w, h, bg, &draw).expect("cull render");
+            frame.rgba.chunks_exact(4).filter(|p| p[0] > 128).count() as u32
+        };
+        let ctrl = lit(0); // cull NONE
+        let back_ccw = lit(raster_flags::pack(cull_mode::BACK, false, false));
+        let back_cw = lit(raster_flags::pack(cull_mode::BACK, true, false));
+        assert!(ctrl > 500, "control (cull NONE) must render the triangle ({ctrl} px)");
+        // Exactly one BACK variant culls (≈0), the other renders (≈ctrl). front_face selects which.
+        let culled = back_ccw.min(back_cw);
+        let kept = back_ccw.max(back_cw);
+        assert!(culled < ctrl / 20, "one winding must be culled to ~empty (got {culled} px)");
+        assert!(kept > ctrl / 2, "the other winding must still render (got {kept} px)");
+        eprintln!(
+            "forwarded_back_face_culling_removes_geometry: OK (none={ctrl}, back+ccw={back_ccw}, back+cw={back_cw})"
+        );
+    }
+
+    /// Phase-2d-A5 blend: the `BLEND` `raster_flags` bit enables standard src-alpha-over compositing.
+    /// A triangle whose fragment alpha is 0.5 is drawn over a solid red background. Blend OFF ⇒ the
+    /// triangle's colour opaquely overwrites red; blend ON ⇒ the covered pixels are a 50/50 composite
+    /// of the triangle colour and the red background. Without this, transparent surfaces render opaque.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_alpha_blend_composites_over_background() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let vs = compile_wgsl(
+            "@vertex fn main(@location(0) p: vec2<f32>) -> @builtin(position) vec4<f32> {\n\
+               return vec4<f32>(p, 0.0, 1.0);\n}",
+            naga::ShaderStage::Vertex,
+        );
+        // Fragment: blue at half alpha.
+        let fs = compile_wgsl(
+            "@fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 0.0, 1.0, 0.5); }",
+            naga::ShaderStage::Fragment,
+        );
+        use infinigpu_abi::wire::{raster_flags, vk_vformat as V};
+        let attrs = [VertexAttr { location: 0, format: V::R32G32_SFLOAT, offset: 0 }];
+        // A big centred triangle so the centre pixel is definitely covered.
+        let tri: [[f32; 2]; 3] = [[0.0, -0.8], [-0.8, 0.8], [0.8, 0.8]];
+        let verts: Vec<u8> = tri.iter().flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes())).collect();
+        let draws = [DrawCmd { count: 3, instance_count: 1, first: 0, vertex_offset: 0, viewport: [0.0; 4] }];
+        let (w, h) = (64u32, 64u32);
+        let bg = [1.0, 0.0, 0.0, 1.0]; // red background
+
+        let centre = |rf: u32| -> [u8; 4] {
+            let draw = ForwardedDraw {
+                vertex_spirv: &vs,
+                vertex_entry: c"main",
+                fragment_spirv: &fs,
+                fragment_entry: c"main",
+                vertex_count: 0,
+                topology: 0,
+                geometry: Some(Geometry {
+                    vertex_data: &verts,
+                    vertex_stride: 8,
+                    attrs: &attrs,
+                    index_data: &[],
+                    index_u32: false,
+                    draws: &draws,
+                    depth: None,
+                    push_constants: &[],
+                    texture: None,
+                    tex_binding: 0,
+                    uniform: None,
+                    raster_flags: rf,
+                }),
+            };
+            let frame = gpu.render_forwarded(w, h, bg, &draw).expect("blend render");
+            let idx = ((h / 2) * w + w / 2) as usize * 4;
+            [frame.rgba[idx], frame.rgba[idx + 1], frame.rgba[idx + 2], frame.rgba[idx + 3]]
+        };
+        let opaque = centre(0); // blend off
+        let blended = centre(raster_flags::BLEND); // blend on
+        // Blend off: opaque blue overwrite (R≈0, B≈255).
+        assert!(opaque[0] < 40 && opaque[2] > 200, "blend-off must be opaque blue, got {opaque:?}");
+        // Blend on: ~50/50 of blue over red ⇒ roughly (128, 0, 128). Both channels mid-range, and
+        // distinctly different from the opaque overwrite.
+        assert!(
+            blended[0] > 90 && blended[0] < 170 && blended[2] > 90 && blended[2] < 170,
+            "blend-on must composite blue over red (~half red, half blue), got {blended:?}"
+        );
+        assert!(blended[0] > opaque[0] + 60, "blend must retain background red the opaque path drops");
+        eprintln!("forwarded_alpha_blend_composites_over_background: OK (opaque={opaque:?}, blended={blended:?})");
     }
 }

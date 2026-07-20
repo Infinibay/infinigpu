@@ -119,6 +119,7 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
         &ubo,
         0, // ubo_binding
         1, // tex_binding (image@1, sampler@2)
+        infinigpu_abi::wire::raster_flags::pack(infinigpu_abi::wire::cull_mode::BACK, true, true),
     );
 
     let o = decode_forwarded_cmdlist(&payload, CAP).expect("C-encoded cmdlist must decode");
@@ -152,4 +153,9 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
     let u = g.uniform.expect("ubo bytes decode to a uniform");
     assert_eq!(u.binding, 0, "ubo binding survives C→Rust");
     assert_eq!(u.bytes, ubo, "ubo bytes survive C→Rust (blob after push-const, before texpix)");
+    assert_eq!(
+        g.raster_flags,
+        infinigpu_abi::wire::raster_flags::pack(infinigpu_abi::wire::cull_mode::BACK, true, true),
+        "raster_flags survives C→Rust (cull BACK / front-face CW / blend on)"
+    );
 }

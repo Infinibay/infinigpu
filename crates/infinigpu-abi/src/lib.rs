@@ -73,16 +73,18 @@ mod layout_asserts {
     // entry-name strings follow it in the payload (variable length).
     const _: () = assert!(size_of::<ForwardedDrawTail>() == 24);
     const _: () = assert!(align_of::<ForwardedDrawTail>() == 4);
-    // ForwardedCmdListTail (vk_op::FORWARDED_CMDLIST): 17×u32 = 68, 4-byte aligned (ABI 0.9 added
-    // push_const_len; 0.10 tex_count; 0.11 ubo_len/ubo_binding/tex_binding). Its trailing
-    // VertexAttrWire[]/DrawCmdWire[]/TextureDescWire[] arrays are 4-multiples so they stay 4-aligned.
-    const _: () = assert!(size_of::<ForwardedCmdListTail>() == 68);
+    // ForwardedCmdListTail (vk_op::FORWARDED_CMDLIST): 18×u32 = 72, 4-byte aligned (ABI 0.9 added
+    // push_const_len; 0.10 tex_count; 0.11 ubo_len/ubo_binding/tex_binding; 0.12 raster_flags). Its
+    // trailing VertexAttrWire[]/DrawCmdWire[]/TextureDescWire[] arrays are 4-multiples so they stay
+    // 4-aligned.
+    const _: () = assert!(size_of::<ForwardedCmdListTail>() == 72);
     const _: () = assert!(align_of::<ForwardedCmdListTail>() == 4);
     const _: () = assert!(offset_of!(ForwardedCmdListTail, push_const_len) == 48);
     const _: () = assert!(offset_of!(ForwardedCmdListTail, tex_count) == 52);
     const _: () = assert!(offset_of!(ForwardedCmdListTail, ubo_len) == 56);
     const _: () = assert!(offset_of!(ForwardedCmdListTail, ubo_binding) == 60);
     const _: () = assert!(offset_of!(ForwardedCmdListTail, tex_binding) == 64);
+    const _: () = assert!(offset_of!(ForwardedCmdListTail, raster_flags) == 68);
     const _: () = assert!(size_of::<TextureDescWire>() == 16);
     const _: () = assert!(align_of::<TextureDescWire>() == 4);
     const _: () = assert!(size_of::<VertexAttrWire>() == 12);
@@ -127,7 +129,7 @@ mod tests {
             abi_version(),
             (u32::from(ABI_MAJOR) << 16) | u32::from(ABI_MINOR)
         );
-        assert_eq!(abi_version(), 0x0000_000B);
+        assert_eq!(abi_version(), 0x0000_000C);
     }
 
     #[test]

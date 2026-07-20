@@ -323,6 +323,9 @@ pub struct OwnedGeometry {
     pub tex_binding: u32,
     /// Phase-2c uniform buffer (binding + bytes); `None` ⇒ no UBO. Composes with `texture`.
     pub uniform: Option<OwnedUniform>,
+    /// Phase-2d-A5 static rasterization+blend state (`ForwardedCmdListTail::raster_flags`); `0` ⇒
+    /// cull NONE / front-face CCW / blend off (the pre-0.12 default).
+    pub raster_flags: u32,
 }
 
 /// Owning form of a decoded Phase-2c texture (see [`decode_forwarded_cmdlist`]).
@@ -372,6 +375,7 @@ impl OwnedForwardedDraw {
                     binding: u.binding,
                     bytes: &u.bytes,
                 }),
+                raster_flags: g.raster_flags,
             }),
         }
     }
@@ -689,6 +693,7 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
             texture,
             tex_binding,
             uniform,
+            raster_flags: tail.raster_flags,
         }),
     })
 }
@@ -3422,6 +3427,7 @@ mod tests {
         ubo: &[u8],
         ubo_binding: u32,
         tex_binding: u32,
+        raster_flags: u32,
     ) -> Vec<u8> {
         use infinigpu_abi::wire::{index_type, vk_op, ForwardedCmdListTail, VulkanWorkload};
         use zerocopy::IntoBytes;
@@ -3456,6 +3462,7 @@ mod tests {
             ubo_len: ubo.len() as u32,
             ubo_binding,
             tex_binding,
+            raster_flags,
         };
         let mut p = Vec::new();
         p.extend_from_slice(wl.as_bytes());
@@ -3503,7 +3510,9 @@ mod tests {
             DrawCmdWire { count: 3, instance_count: 1, first: 0, vertex_offset: 0, vp_x: 0.0, vp_y: 0.0, vp_w: 0.0, vp_h: 0.0 },
             DrawCmdWire { count: 3, instance_count: 2, first: 0, vertex_offset: 1, vp_x: 8.0, vp_y: 9.0, vp_w: 10.0, vp_h: 11.0 },
         ];
-        use infinigpu_abi::wire::{depth_compare, depth_flags, sampler_flags, TextureDescWire};
+        use infinigpu_abi::wire::{
+            cull_mode, depth_compare, depth_flags, raster_flags, sampler_flags, TextureDescWire,
+        };
         let df = depth_flags::pack(true, false, depth_compare::GREATER); // test on, write off
         // A 2×2 RGBA8 texture (4 distinct texels) with linear+repeat sampling.
         let texpix: Vec<u8> = vec![
@@ -3517,10 +3526,13 @@ mod tests {
         }];
         // A 64-byte UBO at binding 0 composing with the texture at image@1 / sampler@2 (tex_binding=1).
         let ubo: Vec<u8> = (0u8..64).collect();
+        // Static raster state: cull BACK, front-face CW, blend on — a non-zero bitfield so a decode
+        // that dropped or mis-placed the field surfaces.
+        let rf = raster_flags::pack(cull_mode::BACK, true, true);
         let payload = encode_forwarded_cmdlist(
             32, 16, [0.1, 0.2, 0.3, 1.0], 0, &vspirv, &fspirv, c"vs", c"fs", 20, &attrs, &vdata,
             &idata, false, 1, df, &[0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4], &draws, &texs, &texpix,
-            &ubo, 0, 1,
+            &ubo, 0, 1, rf,
         );
 
         let o = decode_forwarded_cmdlist(&payload, CAP).expect("valid cmdlist decodes");
@@ -3552,6 +3564,7 @@ mod tests {
         let u = g.uniform.expect("ubo bytes decode to a uniform");
         assert_eq!(u.binding, 0, "ubo binding round-trips");
         assert_eq!(u.bytes, ubo, "ubo bytes round-trip (after push-const, before texpix)");
+        assert_eq!(g.raster_flags, rf, "raster_flags round-trips (cull BACK / CW / blend)");
 
         // Hostile → None (fail-closed):
         assert!(decode_forwarded_cmdlist(&payload[..44], CAP).is_none(), "truncated before tail rejected");
@@ -3573,14 +3586,14 @@ mod tests {
         overlap[40 + 60..40 + 64].copy_from_slice(&1u32.to_le_bytes()); // 1 collides with image@1
         assert!(decode_forwarded_cmdlist(&overlap, CAP).is_none(), "ubo/texture binding overlap rejected");
         // A texture whose data_len doesn't match width*height*4 is rejected. The single texdesc's
-        // data_len is its 3rd u32; the texdescs sit after VulkanWorkload(40) + tail(68) + attrs + draws.
-        let tex_off = 40 + 68 + attrs.len() * 12 + draws.len() * 32;
+        // data_len is its 3rd u32; the texdescs sit after VulkanWorkload(40) + tail(72) + attrs + draws.
+        let tex_off = 40 + 72 + attrs.len() * 12 + draws.len() * 32;
         let mut bad_texlen = payload.clone();
         bad_texlen[tex_off + 8..tex_off + 12].copy_from_slice(&99u32.to_le_bytes());
         assert!(decode_forwarded_cmdlist(&bad_texlen, CAP).is_none(), "texture data_len mismatch rejected");
-        // bad vertex SPIR-V magic (first vSPIR-V word sits after the VulkanWorkload(40) + tail(68) +
+        // bad vertex SPIR-V magic (first vSPIR-V word sits after the VulkanWorkload(40) + tail(72) +
         // attrs + draws + texdesc arrays).
-        let vspv_off = 40 + 68 + attrs.len() * 12 + draws.len() * 32 + texs.len() * 16;
+        let vspv_off = 40 + 72 + attrs.len() * 12 + draws.len() * 32 + texs.len() * 16;
         let mut bad_magic = payload.clone();
         bad_magic[vspv_off] = bad_magic[vspv_off].wrapping_add(1);
         assert!(decode_forwarded_cmdlist(&bad_magic, CAP).is_none(), "non-SPIR-V vertex blob rejected");
@@ -3653,7 +3666,7 @@ mod tests {
         let scanout_addr = GUEST_BASE + SCAN_OFF as u64;
         let payload = encode_forwarded_cmdlist(
             w, h, bg, scanout_addr, &vs, &fs, c"main", c"main", 20, &attrs, &vdata, &[], false, 0, 0,
-            &[], &draws, &[], &[], &[], 0, 0,
+            &[], &draws, &[], &[], &[], 0, 0, 0,
         );
         let sc = infinigpu_abi::wire::SubmitCmd {
             ctx_id: 0,

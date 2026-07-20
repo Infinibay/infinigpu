@@ -55,7 +55,13 @@ pub const ABI_MAJOR: u16 = 0;
 /// descriptor-set-0 layout dynamically from the present resources at their declared bindings (UBO@`ubo_binding`
 /// VERTEX|FRAGMENT, image@`tex_binding`, sampler@`tex_binding+1`); `tex_binding == 0` keeps 0.10 texture-only
 /// command lists byte-identical. Gate on `negotiated_minor >= 11` before sending a UBO command list.
-pub const ABI_MINOR: u16 = 11;
+/// v12 grew the tail by `raster_flags` (68→72 B) — a static fixed-function state bitfield (cull mode,
+/// front-face winding, alpha-blend enable) the host's `build_pipeline` used to hardcode. `raster_flags
+/// == 0` reproduces the old default (cull NONE / CCW / blend off) exactly, so a v12 host reading a
+/// pre-v12 command list (no such field) is unaffected; but since the tail size changed, a v12 guest
+/// must gate on `negotiated_minor >= 12` before sending a command list (an older host would misparse
+/// the trailing sections). Fixes back-face overdraw and opaque transparency in real 3D scenes.
+pub const ABI_MINOR: u16 = 12;
 
 /// Packed `ABI_VERSION` register value (`major << 16 | minor`).
 pub const fn abi_version() -> u32 {

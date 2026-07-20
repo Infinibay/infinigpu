@@ -452,11 +452,12 @@ struct ForwardedDrawTail {
  * one set (e.g. UBO@0, image@1, sampler@2). The UBO byte blob is fixed-length (`ubo_len`); the texture
  * pixels stay the terminal derived region (length = Σ `TextureDescWire::data_len`). Every length is
  * guest-controlled and MUST be bounds-checked against the actual payload length before use
- * (fail-closed).
+ * (fail-closed). `raster_flags` (ABI 0.12) is a fixed-function state bitfield ([`raster_flags`]);
+ * it carries no trailing bytes.
  *
  * `vertex_stride == 0` means "no vertex buffer" (bufferless, like [`ForwardedDrawTail`] — the
  * shader synthesizes geometry); otherwise binding 0 has that stride and the `attr_count`
- * attributes describe it. 68 bytes, 4-byte aligned.
+ * attributes describe it. 72 bytes, 4-byte aligned.
  */
 struct ForwardedCmdListTail {
   /**
@@ -544,6 +545,14 @@ struct ForwardedCmdListTail {
    * occupy the same set at distinct bindings (UBO@0, image@1, sampler@2), which real apps need.
    */
   uint32_t tex_binding;
+  /**
+   * Static fixed-function rasterization + blend state (ABI 0.12) as a [`raster_flags`] bitfield:
+   * `(cull << CULL_SHIFT) | FRONT_FACE_CW? | BLEND?`. `0` ⇒ cull NONE / front-face CCW / blend off
+   * — the exact state `build_pipeline` hardcoded before 0.12, so a pre-0.12 guest (this field
+   * zero) renders identically. The host reads it as an opaque bitfield (no trailing bytes) and maps
+   * unknown bits to safe defaults; nothing here needs bounds-checking.
+   */
+  uint32_t raster_flags;
 };
 
 /**

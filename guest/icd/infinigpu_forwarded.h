@@ -52,6 +52,19 @@
 #define INFINIGPU_SAMPLER_LINEAR 0x1u
 #define INFINIGPU_SAMPLER_REPEAT 0x2u
 
+/* Mirror of infinigpu_abi::wire::raster_flags (Phase-2d-A5 — the ForwardedCmdListTail.raster_flags
+ * bitfield: (cull << CULL_SHIFT) | FRONT_FACE_CW? | BLEND?). 0 = cull NONE / front-face CCW / blend
+ * off — the pre-0.12 default. */
+#define INFINIGPU_CULL_SHIFT 0u
+#define INFINIGPU_CULL_MASK 0x3u
+#define INFINIGPU_RASTER_FRONT_FACE_CW 0x4u
+#define INFINIGPU_RASTER_BLEND 0x8u
+/* Mirror of infinigpu_abi::wire::cull_mode (the CULL sub-field values). */
+#define INFINIGPU_CULL_NONE 0u
+#define INFINIGPU_CULL_FRONT 1u
+#define INFINIGPU_CULL_BACK 2u
+#define INFINIGPU_CULL_FRONT_AND_BACK 3u
+
 /* Wire structs whose bytes this encoder copies (defined in the generated infinigpu_abi.h). Only
  * pointers appear in the prototype, so a forward declaration keeps this header light. */
 struct VertexAttrWire;
@@ -91,9 +104,11 @@ size_t infinigpu_encode_forwarded(uint8_t *out, size_t cap,
  * a UBO and a texture share set 0 at distinct bindings (e.g. UBO@0, image@1, sampler@2). Full section
  * order: attrs · draws · texdescs · vSPIR-V · fSPIR-V · vertex data · index data · vertex entry ·
  * fragment entry · push constants · UBO bytes · texture pixels. `index_data_len == 0` ⇒ non-indexed;
- * `tex_count == 0` ⇒ untextured; `ubo_len == 0` ⇒ no UBO. Returns the total byte length, or 0 if it
- * would not fit `cap` (or the geometry is degenerate). The caller wraps the result in a SUBMIT_CMD
- * (encoding VULKAN_VENUSLIKE), the same as the bufferless encoder.
+ * `tex_count == 0` ⇒ untextured; `ubo_len == 0` ⇒ no UBO. `raster_flags` (Phase-2d-A5) is the static
+ * fixed-function state bitfield (cull/front-face/blend); 0 ⇒ the pre-0.12 default (cull NONE / CCW /
+ * blend off). Returns the total byte length, or 0 if it would not fit `cap` (or the geometry is
+ * degenerate). The caller wraps the result in a SUBMIT_CMD (encoding VULKAN_VENUSLIKE), the same as
+ * the bufferless encoder.
  */
 size_t infinigpu_encode_forwarded_cmdlist(
     uint8_t *out, size_t cap,
@@ -110,6 +125,6 @@ size_t infinigpu_encode_forwarded_cmdlist(
     const uint8_t *ubo, uint32_t ubo_len, uint32_t ubo_binding,
     const struct DrawCmdWire *draws, uint32_t draw_count,
     const struct TextureDescWire *texs, uint32_t tex_count, uint32_t tex_binding,
-    const uint8_t *texpix, uint32_t texpix_len);
+    const uint8_t *texpix, uint32_t texpix_len, uint32_t raster_flags);
 
 #endif /* INFINIGPU_FORWARDED_H */

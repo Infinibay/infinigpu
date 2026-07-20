@@ -339,7 +339,8 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       cmd->push_const, cmd->push_const_len,
       ubo, ubo_len, ubo_binding,
       draws, cmd->draw_count,
-      tex_count ? &texdesc : NULL, tex_count, tex_binding, texpix, texpix_len);
+      tex_count ? &texdesc : NULL, tex_count, tex_binding, texpix, texpix_len,
+      p->raster_flags);
    free(draws);
    if (n == 0) {
       free(payload);

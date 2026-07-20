@@ -145,6 +145,9 @@ struct infinigpu_pipeline {
    struct infinigpu_vertex_attr attrs[INFINIGPU_MAX_ATTRS];
    /* Phase-2d depth-test state, pre-packed as a ForwardedCmdListTail.depth_flags bitfield (0 ⇒ none). */
    uint32_t depth_flags;
+   /* Phase-2d-A5 static rasterization+blend state, pre-packed as a ForwardedCmdListTail.raster_flags
+    * bitfield (cull mode | front-face-CW? | blend?); 0 ⇒ cull NONE / CCW / blend off (the default). */
+   uint32_t raster_flags;
 };
 
 /* A dummy pipeline cache (we never cache — SPIR-V is forwarded, not compiled). */

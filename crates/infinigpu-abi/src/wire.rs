@@ -426,6 +426,46 @@ pub mod depth_flags {
     }
 }
 
+/// Cull mode on the wire (the `cull` sub-field of [`ForwardedCmdListTail::raster_flags`]) — our own
+/// small enum the host maps to `VkCullModeFlags`. `NONE` (0) is the pre-0.12 default, so an older
+/// guest sending `raster_flags == 0` culls nothing exactly as before.
+pub mod cull_mode {
+    /// No face culling (the pre-0.12 host default).
+    pub const NONE: u32 = 0;
+    /// Cull front faces.
+    pub const FRONT: u32 = 1;
+    /// Cull back faces (the common case for solid closed meshes).
+    pub const BACK: u32 = 2;
+    /// Cull both (renders nothing — rare, but a valid Vulkan state).
+    pub const FRONT_AND_BACK: u32 = 3;
+}
+
+/// Bit layout of [`ForwardedCmdListTail::raster_flags`] (Phase-2d A5, ABI 0.12) — the static
+/// fixed-function rasterization + blend state the host's `build_pipeline` used to hardcode (cull
+/// NONE, front-face CCW, blend off). `0` reproduces that exact default, so a pre-0.12 guest is
+/// byte- and semantics-identical. Only cull/front-face/blend live here; MSAA (needs a multisample
+/// render pass + resolve) and blend *factors* (beyond standard src-alpha-over) are deferred.
+pub mod raster_flags {
+    /// Bit offset of the [`cull_mode`] sub-field (bits 0–1).
+    pub const CULL_SHIFT: u32 = 0;
+    /// Mask selecting the [`cull_mode`] sub-field.
+    pub const CULL_MASK: u32 = 0x3;
+    /// Front face is clockwise when set; counter-clockwise (the pre-0.12 default) when clear.
+    pub const FRONT_FACE_CW: u32 = 1 << 2;
+    /// Enable standard alpha blending (src-alpha over one-minus-src-alpha) on the colour attachment.
+    pub const BLEND: u32 = 1 << 3;
+    /// Pack a `(cull, front_face_cw, blend)` triple into the field.
+    pub const fn pack(cull: u32, front_face_cw: bool, blend: bool) -> u32 {
+        ((cull & CULL_MASK) << CULL_SHIFT)
+            | ((front_face_cw as u32) << 2)
+            | ((blend as u32) << 3)
+    }
+    /// Extract the [`cull_mode`] value.
+    pub const fn cull(flags: u32) -> u32 {
+        (flags >> CULL_SHIFT) & CULL_MASK
+    }
+}
+
 /// Primitive topology on the wire ([`ForwardedDrawTail::topology`]) — our own small enum so the
 /// wire doesn't couple to any Vulkan header's numeric values; the host maps it to the real
 /// `VkPrimitiveTopology`. Phase 1 only needs the triangle list; unknown values map to it.
@@ -504,11 +544,12 @@ pub struct ForwardedDrawTail {
 /// one set (e.g. UBO@0, image@1, sampler@2). The UBO byte blob is fixed-length (`ubo_len`); the texture
 /// pixels stay the terminal derived region (length = Σ `TextureDescWire::data_len`). Every length is
 /// guest-controlled and MUST be bounds-checked against the actual payload length before use
-/// (fail-closed).
+/// (fail-closed). `raster_flags` (ABI 0.12) is a fixed-function state bitfield ([`raster_flags`]);
+/// it carries no trailing bytes.
 ///
 /// `vertex_stride == 0` means "no vertex buffer" (bufferless, like [`ForwardedDrawTail`] — the
 /// shader synthesizes geometry); otherwise binding 0 has that stride and the `attr_count`
-/// attributes describe it. 68 bytes, 4-byte aligned.
+/// attributes describe it. 72 bytes, 4-byte aligned.
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct ForwardedCmdListTail {
@@ -563,6 +604,12 @@ pub struct ForwardedCmdListTail {
     /// byte- and semantics-identical to ABI 0.10 texture-only command lists. Lets a UBO and a texture
     /// occupy the same set at distinct bindings (UBO@0, image@1, sampler@2), which real apps need.
     pub tex_binding: u32,
+    /// Static fixed-function rasterization + blend state (ABI 0.12) as a [`raster_flags`] bitfield:
+    /// `(cull << CULL_SHIFT) | FRONT_FACE_CW? | BLEND?`. `0` ⇒ cull NONE / front-face CCW / blend off
+    /// — the exact state `build_pipeline` hardcoded before 0.12, so a pre-0.12 guest (this field
+    /// zero) renders identically. The host reads it as an opaque bitfield (no trailing bytes) and maps
+    /// unknown bits to safe defaults; nothing here needs bounds-checking.
+    pub raster_flags: u32,
 }
 
 /// One sampled texture in a [`ForwardedCmdListTail`] (in the fixed-array region after the draws).

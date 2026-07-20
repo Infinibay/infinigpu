@@ -89,6 +89,7 @@ unsafe extern "C" {
         tex_binding: u32,
         texpix: *const u8,
         texpix_len: u32,
+        raster_flags: u32,
     ) -> usize;
 }
 
@@ -120,6 +121,7 @@ pub fn encode_forwarded_cmdlist(
     ubo: &[u8],
     ubo_binding: u32,
     tex_binding: u32,
+    raster_flags: u32,
 ) -> Vec<u8> {
     let cap = 128
         + vspirv.len() * 4
@@ -171,6 +173,7 @@ pub fn encode_forwarded_cmdlist(
             tex_binding,
             texpix.as_ptr(),
             texpix.len() as u32,
+            raster_flags,
         )
     };
     assert!(n > 0, "C cmdlist encoder returned 0 (degenerate geometry or did not fit)");

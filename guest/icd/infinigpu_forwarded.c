@@ -17,9 +17,9 @@ _Static_assert(sizeof(struct VulkanWorkload) == 40, "VulkanWorkload is 40 bytes"
 _Static_assert(sizeof(struct ForwardedDrawTail) == 24, "ForwardedDrawTail is 24 bytes");
 _Static_assert(offsetof(struct VulkanWorkload, scanout_addr) == 32, "scanout_addr@32");
 /* Phase-2b command-list structs — the cmdlist encoder copies these; drift is a compile error. The
- * tail grew to 52 B in ABI 0.9 (push_const_len), 56 B in 0.10 (tex_count), and 68 B in 0.11
- * (ubo_len/ubo_binding/tex_binding). */
-_Static_assert(sizeof(struct ForwardedCmdListTail) == 68, "ForwardedCmdListTail is 68 bytes");
+ * tail grew to 52 B in ABI 0.9 (push_const_len), 56 B in 0.10 (tex_count), 68 B in 0.11
+ * (ubo_len/ubo_binding/tex_binding), and 72 B in 0.12 (raster_flags). */
+_Static_assert(sizeof(struct ForwardedCmdListTail) == 72, "ForwardedCmdListTail is 72 bytes");
 _Static_assert(sizeof(struct VertexAttrWire) == 12, "VertexAttrWire is 12 bytes");
 _Static_assert(sizeof(struct DrawCmdWire) == 32, "DrawCmdWire is 32 bytes");
 _Static_assert(sizeof(struct TextureDescWire) == 16, "TextureDescWire is 16 bytes");
@@ -92,7 +92,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
     const uint8_t *ubo, uint32_t ubo_len, uint32_t ubo_binding,
     const struct DrawCmdWire *draws, uint32_t draw_count,
     const struct TextureDescWire *texs, uint32_t tex_count, uint32_t tex_binding,
-    const uint8_t *texpix, uint32_t texpix_len)
+    const uint8_t *texpix, uint32_t texpix_len, uint32_t raster_flags)
 {
 	const size_t vbytes = (size_t)vspirv_words * 4u;
 	const size_t fbytes = (size_t)fspirv_words * 4u;
@@ -145,6 +145,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	tail.ubo_len = ubo_len;
 	tail.ubo_binding = ubo_binding;
 	tail.tex_binding = tex_binding;
+	tail.raster_flags = raster_flags;
 	memcpy(out + o, &tail, sizeof tail);
 	o += sizeof tail;
 

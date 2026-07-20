@@ -176,6 +176,24 @@ infinigpu_graphics_pipeline_init(struct infinigpu_device *dev,
       p->depth_flags = df;
    }
 
+   /* Phase-2d-A5: pack the static rasterization + blend state into a ForwardedCmdListTail.raster_flags
+    * bitfield the host applies in build_pipeline (which otherwise hardcodes cull NONE / CCW / blend off).
+    * VkCullModeFlagBits NONE/FRONT/BACK/FRONT_AND_BACK are 0/1/2/3 — identical to INFINIGPU_CULL_*; the
+    * low 2 bits carry them directly. VK_FRONT_FACE_CLOCKWISE is 1. Only binding-0 blend is on the wire
+    * (single colour attachment), so read attachment 0. Ignored on the bufferless path (stride 0). */
+   uint32_t rf = 0;
+   const VkPipelineRasterizationStateCreateInfo *rs = ci->pRasterizationState;
+   if (rs) {
+      rf |= ((uint32_t)rs->cullMode & INFINIGPU_CULL_MASK) << INFINIGPU_CULL_SHIFT;
+      if (rs->frontFace == VK_FRONT_FACE_CLOCKWISE)
+         rf |= INFINIGPU_RASTER_FRONT_FACE_CW;
+   }
+   const VkPipelineColorBlendStateCreateInfo *cb = ci->pColorBlendState;
+   if (cb && cb->attachmentCount > 0 && cb->pAttachments &&
+       cb->pAttachments[0].blendEnable)
+      rf |= INFINIGPU_RASTER_BLEND;
+   p->raster_flags = rf;
+
    for (uint32_t i = 0; i < ci->stageCount; i++) {
       VkResult r = infinigpu_pipeline_add_stage(dev, p, &ci->pStages[i]);
       if (r != VK_SUCCESS)
