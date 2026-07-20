@@ -1,8 +1,27 @@
 # 3D acceleration completeness roadmap (own-remoting Vulkan)
 
 Design for taking the forwarded 3D path from "renders the built-in triangle / a single bufferless shader draw"
-to "runs a real Vulkan app". This is a **design doc — nothing here is implemented.** It sequences the audit's
-completeness findings (A1–A9) into buildable phases and fixes the correctness landmines (B1) they expose.
+to "runs a real Vulkan app". It sequences the audit's completeness findings (A1–A9) into buildable phases and
+fixes the correctness landmines (B1) they expose.
+
+## Implementation status (updated as phases land)
+
+- **Phase 2b (A1 VBO/IBO + A3 multi-draw + A7 viewport) — DONE, A5000-verified.** `vk_op::FORWARDED_CMDLIST`
+  (ABI 0.8) carries a mesh: a vertex buffer, optional index buffer, a vertex-input layout, and an ordered
+  draw list with per-draw viewport. Host render (`infinigpu-replay`), device decode (`decode_forwarded_cmdlist`),
+  and the guest wire ENCODER (`infinigpu_encode_forwarded_cmdlist` + C↔Rust conformance) are all implemented and
+  tested. **Remaining guest piece (owner's Mesa build env):** the ICD *recording* — `CmdBindVertexBuffers` /
+  `CmdBindIndexBuffer` / `CmdDrawIndexed` / `CmdSetViewport` handlers + capturing the pipeline's vertex-input
+  layout + calling the encoder from `driver_submit`. The wire it targets is proven.
+- **Phase 2d depth (A4) — DONE, A5000-verified.** Optional depth attachment (D32) + depth test/write/compare,
+  forwarded via the `ForwardedCmdListTail.depth_flags` bitfield. Host + ABI + device + guest wire + tests.
+  (A5 static state — blend/cull/MSAA — is NOT yet done; see 2d below.)
+- **Next up:** Phase 2c (the transform: UBO / push constants, then textures) — the biggest remaining gate for a
+  real game, since geometry today renders in raw NDC with no camera/model transform. Then Phase 2a (format A6 /
+  loadOp A8) for colour-space correctness, and A5 static state.
+
+The rest of this doc is the original design; the per-phase wire/host/test shape it describes is what the landed
+phases implemented.
 
 The perf track (Fix A/B/D, fence-spin, the token-bucket fix) is **orthogonal**: these phases *add* per-submit
 work (more state to forward and replay), they do not change the tail-latency story. Sequence them as a separate
@@ -103,13 +122,13 @@ paths. Do this whenever the ABI is bumped for Phase 2b anyway.
 
 ## Effort / risk summary
 
-| Phase | Findings | Effort | Risk | Unblocks |
-|-------|----------|--------|------|----------|
-| 2a | A6, A8 | S | low | correct colors; overlay passes |
-| 2b | A1, A3, A7, A5-dyn | **L** | med | **any real mesh renders** |
-| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) |
-| 2d | A4, A5-static | M | med | depth-correct 3D, transparency, MSAA |
-| 2e | A9 | M | med | async frames (with Fix F) |
+| Phase | Findings | Effort | Risk | Unblocks | Status |
+|-------|----------|--------|------|----------|--------|
+| 2a | A6, A8 | S | low | correct colors; overlay passes | todo |
+| 2b | A1, A3, A7, A5-dyn | **L** | med | **any real mesh renders** | **DONE** (host/device/wire; guest ICD recording pending owner) |
+| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) | todo — **next** (transform is the gate) |
+| 2d | A4, A5-static | M | med | depth-correct 3D, transparency, MSAA | **A4 depth DONE**; A5 static (blend/cull/MSAA) todo |
+| 2e | A9 | M | med | async frames (with Fix F) | todo |
 
 Recommended order: **2a → 2b → 2c → 2d**, with 2e deferred to the async-submit work. 2a is a few hours of
 correctness wins; 2b is the real milestone (first real app frame); 2c is the bulk of the work. Every phase needs
