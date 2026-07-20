@@ -19,9 +19,9 @@
  * Distinct from the row pitch, which stays packed for the host writeback. */
 #define INFINIGPU_MEM_ALIGN 256
 
-VKAPI_ATTR VkResult VKAPI_CALL
-infinigpu_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
-                      const VkAllocationCallbacks *pAllocator, VkImage *pImage)
+static VkResult
+infinigpu_image_create(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
+                       const VkAllocationCallbacks *pAllocator, VkImage *pImage)
 {
    VK_FROM_HANDLE(infinigpu_device, device, _device);
    struct infinigpu_image *image =
@@ -40,6 +40,37 @@ infinigpu_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
 
    *pImage = infinigpu_image_to_handle(image);
    return VK_SUCCESS;
+}
+
+/* Resolve a swapchain + index to the driver's real (WSI-created) VkImage. */
+static struct infinigpu_image *
+infinigpu_swapchain_get_image(VkSwapchainKHR swapchain, uint32_t index)
+{
+   return infinigpu_image_from_handle(wsi_common_get_image(swapchain, index));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+infinigpu_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
+                      const VkAllocationCallbacks *pAllocator, VkImage *pImage)
+{
+   /* WSI deferred-alloc path: an app may create an image tagged with
+    * VkImageSwapchainCreateInfoKHR and later bind it onto a swapchain image
+    * (VkBindImageMemorySwapchainInfoKHR, handled in BindImageMemory2). Build it
+    * with the layout the WSI implicitly chose: LINEAR (infinigpu is always
+    * packed-linear anyway), single-sample, color-attachment-usable. Matches
+    * lavapipe's lvp_image_from_swapchain, adapted to our linear image model. */
+   const VkImageSwapchainCreateInfoKHR *swapchain_info =
+      vk_find_struct_const(pCreateInfo->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR);
+   if (swapchain_info && swapchain_info->swapchain != VK_NULL_HANDLE) {
+      VkImageCreateInfo local = *pCreateInfo;
+      local.pNext = NULL;
+      local.tiling = VK_IMAGE_TILING_LINEAR;
+      local.samples = VK_SAMPLE_COUNT_1_BIT;
+      local.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      return infinigpu_image_create(_device, &local, pAllocator, pImage);
+   }
+
+   return infinigpu_image_create(_device, pCreateInfo, pAllocator, pImage);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -90,8 +121,22 @@ infinigpu_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount,
       VK_FROM_HANDLE(infinigpu_image, image, pBindInfos[i].image);
       VK_FROM_HANDLE(infinigpu_device_memory, mem, pBindInfos[i].memory);
 
-      image->mem = mem;                              /* the only backing step */
-      image->mem_offset = pBindInfos[i].memoryOffset;
+      /* WSI deferred-alloc bind: alias this image onto a swapchain image's
+       * backing memory instead of `mem` (which is VK_NULL_HANDLE here). The
+       * WSI already allocated + bound that swapchain image via our normal path,
+       * so it has a live ->mem; we just point at the same BO/offset. */
+      const VkBindImageMemorySwapchainInfoKHR *sw =
+         vk_find_struct_const(pBindInfos[i].pNext,
+                              BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
+      if (sw && sw->swapchain != VK_NULL_HANDLE) {
+         struct infinigpu_image *backing =
+            infinigpu_swapchain_get_image(sw->swapchain, sw->imageIndex);
+         image->mem = backing->mem;
+         image->mem_offset = backing->mem_offset;
+      } else {
+         image->mem = mem;                           /* the only backing step */
+         image->mem_offset = pBindInfos[i].memoryOffset;
+      }
 
       const VkBindMemoryStatusKHR *status =
          vk_find_struct_const(pBindInfos[i].pNext, BIND_MEMORY_STATUS_KHR);

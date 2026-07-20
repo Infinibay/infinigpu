@@ -45,9 +45,13 @@
 #define INFINIGPU_RENDER_NODE "/dev/dri/renderD128"
 #define INFINIGPU_DRM_NAME    "infinigpu"
 
-/* Phase 0: advertise no device extensions. */
+/* VK_KHR_swapchain: the device half of WSI. Advertised unconditionally because
+ * the headless surface backend is always compiled in (non-Windows) and we always
+ * initialize wsi_device. Its entrypoints (vkCreateSwapchainKHR / AcquireNextImage
+ * / QueuePresentKHR / GetSwapchainImagesKHR) come from wsi_device_entrypoints,
+ * merged into the device dispatch table in infinigpu_CreateDevice. */
 const struct vk_device_extension_table infinigpu_device_extensions = {
-   0,
+   .KHR_swapchain = true,
 };
 
 static void
@@ -125,6 +129,10 @@ infinigpu_physical_device_init(struct infinigpu_physical_device *pdev,
    struct vk_physical_device_dispatch_table dispatch_table;
    vk_physical_device_dispatch_table_from_entrypoints(
       &dispatch_table, &infinigpu_physical_device_entrypoints, true);
+   /* Merge the common WSI surface-query entrypoints (GetPhysicalDeviceSurface*,
+    * GetPhysicalDeviceDisplay*, …). overwrite=false: our own entries always win. */
+   vk_physical_device_dispatch_table_from_entrypoints(
+      &dispatch_table, &wsi_physical_device_entrypoints, false);
 
    struct vk_properties properties;
    infinigpu_get_properties(pdev, &properties);
@@ -152,6 +160,16 @@ infinigpu_physical_device_init(struct infinigpu_physical_device *pdev,
    pdev->vk.supported_sync_types = pdev->sync_types;
 
    pdev->drm_fd = drm_fd;
+
+   /* Bring up WSI (needs vk.instance + the handle + drm_fd — all set by now).
+    * On failure, unwind the vk_physical_device so the caller frees cleanly. */
+   result = infinigpu_init_wsi(pdev);
+   if (result != VK_SUCCESS) {
+      IGPU_TRACE("pdev_init: infinigpu_init_wsi -> %d", result);
+      vk_physical_device_finish(&pdev->vk);
+      return result;
+   }
+
    return VK_SUCCESS;
 }
 
@@ -161,6 +179,9 @@ infinigpu_physical_device_destroy(struct vk_physical_device *vk_pdev)
    struct infinigpu_physical_device *pdev =
       container_of(vk_pdev, struct infinigpu_physical_device, vk);
 
+   /* Tear down WSI before closing drm_fd — wsi_device holds it as display_fd
+    * (referenced, never owned) and must stop using it before we close it. */
+   infinigpu_finish_wsi(pdev);
    if (pdev->drm_fd >= 0)
       close(pdev->drm_fd);
    vk_physical_device_finish(&pdev->vk);

@@ -13,6 +13,8 @@
 
 #include "vk_log.h"
 
+#include <stdlib.h>
+
 VKAPI_ATTR VkResult VKAPI_CALL
 infinigpu_AllocateMemory(VkDevice _device,
                          const VkMemoryAllocateInfo *pAllocateInfo,
@@ -36,9 +38,22 @@ infinigpu_AllocateMemory(VkDevice _device,
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    if (drm_fd < 0) {
-      /* Smoke/dev host without a real infinigpu node: no backing possible. */
-      vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
-      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      /* Smoke/dev host without a real infinigpu DRM node (drm_fd < 0 only ever
+       * happens under INFINIGPU_SMOKE_ANY_NODE — a production guest either has the
+       * node or enumerates no device). Back the allocation with plain host memory
+       * so every CPU-mapped path still works for bring-up: WSI software present
+       * (memcpy from the map), buffer reads, readback. A forwarded DRAW still needs
+       * a real node (no dma_addr), but the whole swapchain/present path is testable.
+       * gem_handle stays 0; FreeMemory frees() rather than munmap+gem_close. */
+      mem->map = malloc(pAllocateInfo->allocationSize);
+      if (!mem->map) {
+         vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+      mem->map_size = pAllocateInfo->allocationSize;
+      mem->gem_handle = 0;
+      *pMemory = infinigpu_device_memory_to_handle(mem);
+      return VK_SUCCESS;
    }
 
    if (infinigpu_dumb_alloc(drm_fd, pAllocateInfo->allocationSize,
@@ -68,10 +83,14 @@ infinigpu_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
    if (!mem)
       return;
 
-   if (mem->map)
-      infinigpu_dumb_unmap(mem->map, mem->map_size);
-   if (dev->physical_device->drm_fd >= 0)
+   if (dev->physical_device->drm_fd < 0) {
+      /* Smoke host-malloc fallback (see AllocateMemory): plain free, no DRM. */
+      free(mem->map);
+   } else {
+      if (mem->map)
+         infinigpu_dumb_unmap(mem->map, mem->map_size);
       infinigpu_gem_close(dev->physical_device->drm_fd, mem->gem_handle);
+   }
    vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
 }
 

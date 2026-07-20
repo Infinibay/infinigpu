@@ -36,6 +36,11 @@
 #include "vk_sync.h"
 #include "vk_sync_timeline.h"
 
+/* Mesa's common WSI layer (VK_KHR_surface/swapchain + headless/display present).
+ * Provides `struct wsi_device` and the three wsi_*_entrypoints tables we merge
+ * into our dispatch tables. Header comes in via idep_vulkan_wsi (meson). */
+#include "wsi_common.h"
+
 /* Generated (vk_entrypoints_gen.py --prefix infinigpu --proto --weak):
  * declares infinigpu_{instance,physical_device,device}_entrypoints tables and
  * VKAPI_ATTR prototypes for every infinigpu_* entrypoint. */
@@ -68,11 +73,22 @@ struct infinigpu_physical_device {
    /* Open fd of /dev/dri/renderD128 whose drm name == "infinigpu". */
    int drm_fd;
 
+   /* Mesa common-WSI state. Embedded (not a pointer): wsi_device_init fills it,
+    * pdev->vk.wsi_device points at it, wsi_device_finish tears it down. Software
+    * present path (sw + wants_linear) — see infinigpu_wsi.c. */
+   struct wsi_device wsi_device;
+
    /* CPU binary sync (+ an emulated timeline built on it) registered as the
     * device's supported sync types — see infinigpu_sync.c. */
    const struct vk_sync_type *sync_types[3];
    struct vk_sync_timeline_type sync_timeline_type;
 };
+
+/* WSI bring-up/teardown (infinigpu_wsi.c). Called from physical-device
+ * init/destroy. init_wsi advertises nothing itself — the surface/swapchain
+ * extension entries live in the instance/device extension tables. */
+VkResult infinigpu_init_wsi(struct infinigpu_physical_device *pdev);
+void infinigpu_finish_wsi(struct infinigpu_physical_device *pdev);
 
 struct infinigpu_queue {
    struct vk_queue vk;

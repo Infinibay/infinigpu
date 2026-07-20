@@ -11,9 +11,20 @@
 #include "vk_alloc.h"
 #include "vk_log.h"
 
-/* Phase 0: advertise no instance extensions. */
+/* Surface/WSI instance extensions. KHR_surface + KHR_get_surface_capabilities2
+ * are the generic swapchain prerequisites (headless present is always compiled
+ * in on non-Windows). KHR_display is added when the build has the KMS display
+ * backend (VK_USE_PLATFORM_DISPLAY_KHR — the -Dplatforms= empty build defines it
+ * whenever the host has KMS+libdrm). No xcb/xlib/wayland client libs are linked,
+ * so those surface extensions are deliberately absent. The entrypoints backing
+ * these come from wsi_instance_entrypoints, merged in infinigpu_CreateInstance. */
 const struct vk_instance_extension_table infinigpu_instance_extensions = {
-   0,
+   .KHR_surface                    = true,
+   .KHR_get_surface_capabilities2  = true,
+   .EXT_headless_surface           = true,
+#ifdef VK_USE_PLATFORM_DISPLAY_KHR
+   .KHR_display                    = true,
+#endif
 };
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -57,6 +68,10 @@ infinigpu_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    struct vk_instance_dispatch_table dispatch_table;
    vk_instance_dispatch_table_from_entrypoints(
       &dispatch_table, &infinigpu_instance_entrypoints, true);
+   /* Merge the common WSI surface entrypoints (vkCreateHeadlessSurfaceEXT,
+    * vkDestroySurfaceKHR, …). overwrite=false: our own entries always win. */
+   vk_instance_dispatch_table_from_entrypoints(
+      &dispatch_table, &wsi_instance_entrypoints, false);
 
    /* vk_instance_init: src/vulkan/runtime/vk_instance.h
     *   (instance, supported_extensions, dispatch_table, pCreateInfo, alloc) */

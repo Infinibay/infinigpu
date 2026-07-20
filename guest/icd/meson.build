@@ -62,6 +62,7 @@ libinfinigpu_files = files(
   'infinigpu_physical_device.c',
   'infinigpu_pipeline.c',
   'infinigpu_sync.c',
+  'infinigpu_wsi.c',
 )
 
 infinigpu_deps = [
@@ -70,6 +71,10 @@ infinigpu_deps = [
   idep_mesautil,
   idep_vulkan_util,
   idep_vulkan_lite_runtime,
+  # Common WSI (VK_KHR_surface/swapchain + headless/display present). link_whole
+  # inside the idep, so our weak entrypoint overloads resolve. Pulls only libdrm
+  # here (-Dplatforms= empty → no xcb/wayland); libudev is optional (hotplug).
+  idep_vulkan_wsi,
 ]
 
 infinigpu_flags = [

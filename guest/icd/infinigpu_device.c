@@ -51,6 +51,11 @@ infinigpu_CreateDevice(VkPhysicalDevice physicalDevice,
    struct vk_device_dispatch_table dispatch_table;
    vk_device_dispatch_table_from_entrypoints(
       &dispatch_table, &infinigpu_device_entrypoints, true);
+   /* Merge the common WSI swapchain entrypoints (vkCreateSwapchainKHR /
+    * AcquireNextImageKHR / QueuePresentKHR / GetSwapchainImagesKHR).
+    * overwrite=false: our own entries always win. */
+   vk_device_dispatch_table_from_entrypoints(
+      &dispatch_table, &wsi_device_entrypoints, false);
 
    /* vk_device_init: src/vulkan/runtime/vk_device.h
     *   (device, physical_device, dispatch_table, pCreateInfo, alloc).
