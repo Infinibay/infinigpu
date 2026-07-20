@@ -25,6 +25,21 @@
 #define INFINIGPU_INDEX_TYPE_U16 0u
 #define INFINIGPU_INDEX_TYPE_U32 1u
 
+/* Mirror of infinigpu_abi::wire::depth_flags (Phase-2d — the ForwardedCmdListTail.depth_flags
+ * bitfield: TEST | WRITE | (depth_compare << COMPARE_SHIFT)). 0 = no depth buffer. */
+#define INFINIGPU_DEPTH_TEST 0x1u
+#define INFINIGPU_DEPTH_WRITE 0x2u
+#define INFINIGPU_DEPTH_COMPARE_SHIFT 4u
+/* Mirror of infinigpu_abi::wire::depth_compare. */
+#define INFINIGPU_DEPTH_CMP_NEVER 0u
+#define INFINIGPU_DEPTH_CMP_LESS 1u
+#define INFINIGPU_DEPTH_CMP_EQUAL 2u
+#define INFINIGPU_DEPTH_CMP_LESS_OR_EQUAL 3u
+#define INFINIGPU_DEPTH_CMP_GREATER 4u
+#define INFINIGPU_DEPTH_CMP_NOT_EQUAL 5u
+#define INFINIGPU_DEPTH_CMP_GREATER_OR_EQUAL 6u
+#define INFINIGPU_DEPTH_CMP_ALWAYS 7u
+
 /* Mirror of infinigpu_abi::wire::vk_vformat (vertex-attribute formats). */
 #define INFINIGPU_VFORMAT_R32_SFLOAT 0u
 #define INFINIGPU_VFORMAT_R32G32_SFLOAT 1u
@@ -78,7 +93,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
     const struct VertexAttrWire *attrs, uint32_t attr_count,
     const uint8_t *vertex_data, uint32_t vertex_data_len,
     const uint8_t *index_data, uint32_t index_data_len, uint32_t index_type,
-    uint32_t topology,
+    uint32_t topology, uint32_t depth_flags,
     const struct DrawCmdWire *draws, uint32_t draw_count);
 
 #endif /* INFINIGPU_FORWARDED_H */

@@ -127,6 +127,27 @@ pub struct DrawCmd {
     pub viewport: [f32; 4],
 }
 
+/// Depth-test state for a forwarded mesh (Phase-2d). Applies to the whole draw list. When present
+/// with `test` or `write` set, the render pass gains a depth attachment and the pipeline a
+/// depth-stencil state — hidden-surface removal for real 3D scenes. `None`/all-off ⇒ no depth
+/// attachment (the 2D / painter's-order path, unchanged).
+#[derive(Clone, Copy)]
+pub struct DepthState {
+    /// Enable the depth test (compare each fragment against the depth buffer).
+    pub test: bool,
+    /// Write passing fragments' depth back to the buffer.
+    pub write: bool,
+    /// Wire compare-op (`infinigpu_abi::wire::depth_compare`); mapped by [`map_compare`].
+    pub compare: u32,
+}
+
+impl DepthState {
+    /// Whether a depth attachment is needed (a pure no-op depth state needs none).
+    fn attachment_needed(&self) -> bool {
+        self.test || self.write
+    }
+}
+
 /// Real mesh geometry forwarded from the guest: one interleaved vertex buffer (binding 0) with a
 /// `vertex_stride` + `attrs` layout, an optional index buffer, and an ordered list of draws. Borrows
 /// the CPU-side bytes; the host uploads them to a GPU buffer just before the draw. This is the
@@ -144,6 +165,8 @@ pub struct Geometry<'a> {
     pub index_u32: bool,
     /// The draws to replay, in order.
     pub draws: &'a [DrawCmd],
+    /// Depth-test state (Phase-2d); `None` ⇒ no depth buffer (2D / painter's order).
+    pub depth: Option<DepthState>,
 }
 
 /// Wire `vk_topology` u32 → `VkPrimitiveTopology`. Unknown values fall back to a triangle list
@@ -167,6 +190,29 @@ fn map_vformat(f: u32) -> vk::Format {
         V::R8G8B8A8_UNORM => vk::Format::R8G8B8A8_UNORM,
         V::R32_UINT => vk::Format::R32_UINT,
         _ => vk::Format::R32G32B32A32_SFLOAT,
+    }
+}
+
+/// The depth attachment format used for forwarded meshes (Phase-2d). `D32_SFLOAT` is required to be
+/// supported as a depth attachment by every Vulkan implementation, so no format-support query is
+/// needed.
+const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+
+/// Wire `depth_compare` u32 → `VkCompareOp`. Unknown values fall back to `LESS_OR_EQUAL` (the
+/// conventional default for a `[0,1]`, 1.0-cleared depth buffer): a fail-safe that still does
+/// sensible hidden-surface removal rather than erroring.
+fn map_compare(c: u32) -> vk::CompareOp {
+    use infinigpu_abi::wire::depth_compare as C;
+    match c {
+        C::NEVER => vk::CompareOp::NEVER,
+        C::LESS => vk::CompareOp::LESS,
+        C::EQUAL => vk::CompareOp::EQUAL,
+        C::LESS_OR_EQUAL => vk::CompareOp::LESS_OR_EQUAL,
+        C::GREATER => vk::CompareOp::GREATER,
+        C::NOT_EQUAL => vk::CompareOp::NOT_EQUAL,
+        C::GREATER_OR_EQUAL => vk::CompareOp::GREATER_OR_EQUAL,
+        C::ALWAYS => vk::CompareOp::ALWAYS,
+        _ => vk::CompareOp::LESS_OR_EQUAL,
     }
 }
 
@@ -250,7 +296,9 @@ pub struct HostGpu {
     /// `INFINIGPU_SCRATCH_CACHE` (default **on**; `=0` restores the per-frame-alloc path); only
     /// takes effect together with the pipeline cache.
     scratch_enabled: bool,
-    scratch_cache: Mutex<HashMap<(u32, u32), SizedScratch>>,
+    /// Keyed by `(width, height, with_depth)` — a depth-testing mesh (Phase-2d) needs a scratch whose
+    /// framebuffer has a depth attachment, distinct from the color-only scratch at the same size.
+    scratch_cache: Mutex<HashMap<(u32, u32, bool), SizedScratch>>,
     /// Opt-in per-phase timing of the cached render path (env `INFINIGPU_BREAKDOWN`); `None` in prod.
     breakdown: Option<Breakdown>,
     /// Micro-opt: spin-poll the fence for up to this many µs before falling back to a blocking
@@ -306,6 +354,9 @@ struct RenderScratch<'a> {
     view: vk::ImageView,
     image: vk::Image,
     img_mem: vk::DeviceMemory,
+    depth_view: vk::ImageView,
+    depth_image: vk::Image,
+    depth_mem: vk::DeviceMemory,
     readback: vk::Buffer,
     rb_mem: vk::DeviceMemory,
     export_buffer: vk::Buffer,
@@ -327,6 +378,9 @@ impl<'a> RenderScratch<'a> {
             view: vk::ImageView::null(),
             image: vk::Image::null(),
             img_mem: vk::DeviceMemory::null(),
+            depth_view: vk::ImageView::null(),
+            depth_image: vk::Image::null(),
+            depth_mem: vk::DeviceMemory::null(),
             readback: vk::Buffer::null(),
             rb_mem: vk::DeviceMemory::null(),
             export_buffer: vk::Buffer::null(),
@@ -348,6 +402,9 @@ impl<'a> RenderScratch<'a> {
         self.view = vk::ImageView::null();
         self.image = vk::Image::null();
         self.img_mem = vk::DeviceMemory::null();
+        self.depth_view = vk::ImageView::null();
+        self.depth_image = vk::Image::null();
+        self.depth_mem = vk::DeviceMemory::null();
         self.readback = vk::Buffer::null();
         self.rb_mem = vk::DeviceMemory::null();
         self.export_buffer = vk::Buffer::null();
@@ -403,6 +460,15 @@ impl Drop for RenderScratch<'_> {
             }
             if self.img_mem != vk::DeviceMemory::null() {
                 d.free_memory(self.img_mem, None);
+            }
+            if self.depth_view != vk::ImageView::null() {
+                d.destroy_image_view(self.depth_view, None);
+            }
+            if self.depth_image != vk::Image::null() {
+                d.destroy_image(self.depth_image, None);
+            }
+            if self.depth_mem != vk::DeviceMemory::null() {
+                d.free_memory(self.depth_mem, None);
             }
         }
     }
@@ -524,6 +590,21 @@ struct PipelineKey {
     /// Hash of the vertex-input state (stride + each attribute's location/format/offset); `0` for
     /// the bufferless empty-vertex-input path so the built-in triangle keys exactly as before.
     vinput_hash: u64,
+    /// Phase-2d depth-stencil state packed as `attachment | test<<1 | write<<2 | compare<<4`; `0`
+    /// (no depth attachment) for the built-in / 2D paths, so their key is unchanged.
+    depth_key: u32,
+}
+
+/// Pack a `ForwardedDraw`'s depth state into the [`PipelineKey`] `depth_key` field. Returns
+/// `(with_depth_attachment, depth_key)`. `0` when no depth attachment is needed.
+fn depth_key_of(draw: &ForwardedDraw) -> (bool, u32) {
+    match draw.geometry.as_ref().and_then(|g| g.depth) {
+        Some(d) if d.test || d.write => {
+            let key = 1 | ((d.test as u32) << 1) | ((d.write as u32) << 2) | ((d.compare & 0x7) << 4);
+            (true, key)
+        }
+        _ => (false, 0),
+    }
 }
 
 /// Content hash of a [`ForwardedDraw`]'s vertex-input layout (binding stride + attributes), folded
@@ -559,7 +640,9 @@ struct CachedPipeline {
 #[derive(Default)]
 struct GpuObjCache {
     shader_modules: HashMap<u64, vk::ShaderModule>,
-    render_passes: HashMap<i32, vk::RenderPass>,
+    /// Keyed by `(color format raw, with_depth)` — the two render-pass variants (Phase-2d added the
+    /// depth variant).
+    render_passes: HashMap<(i32, bool), vk::RenderPass>,
     pipelines: HashMap<PipelineKey, CachedPipeline>,
     /// Cumulative pipeline-cache hit/miss counts (Phase-2 instrumentation): the hit rate quantifies
     /// Fix A's effect — in steady state it should approach 100%.
@@ -611,6 +694,13 @@ struct SizedScratch {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     size: u64,
+    /// Phase-2d depth attachment (image + memory + view), present iff this scratch was built for a
+    /// depth-testing render pass; all null otherwise. The framebuffer above then has depth at
+    /// attachment 1, and the record path adds a depth clear value.
+    has_depth: bool,
+    depth_image: vk::Image,
+    depth_mem: vk::DeviceMemory,
+    depth_view: vk::ImageView,
 }
 
 /// Phase-2b: the guest's mesh uploaded to GPU-visible buffers for **one** submit. Host-visible +
@@ -652,6 +742,11 @@ impl SizedScratch {
         dev.destroy_image_view(self.view, None);
         dev.destroy_image(self.image, None);
         dev.free_memory(self.img_mem, None);
+        if self.has_depth {
+            dev.destroy_image_view(self.depth_view, None);
+            dev.destroy_image(self.depth_image, None);
+            dev.free_memory(self.depth_mem, None);
+        }
     }
 }
 
@@ -939,8 +1034,8 @@ impl HostGpu {
     /// Fix A: build the color render pass (CLEAR → STORE, ending TRANSFER_SRC) for `format`, with
     /// an explicit external subpass dependency ordering the color write before the post-pass
     /// transfer read (the image→buffer readback) — previously left to implicit sync (audit LOW).
-    fn build_render_pass(&self, format: vk::Format) -> R<vk::RenderPass> {
-        let attach = vk::AttachmentDescription::default()
+    fn build_render_pass(&self, format: vk::Format, with_depth: bool) -> R<vk::RenderPass> {
+        let color = vk::AttachmentDescription::default()
             .format(format)
             .samples(vk::SampleCountFlags::TYPE_1)
             .load_op(vk::AttachmentLoadOp::CLEAR)
@@ -949,30 +1044,73 @@ impl HostGpu {
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-        let attachs = [attach];
+        // Phase-2d: an optional depth attachment (index 1). CLEAR at load, no store (transient — the
+        // readback only wants colour). Its own external dependency orders early/late fragment-test
+        // writes after any prior frame's use of the reused image.
+        let depth = vk::AttachmentDescription::default()
+            .format(DEPTH_FORMAT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         let color_ref = [vk::AttachmentReference::default()
             .attachment(0)
             .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-        let subpass = [vk::SubpassDescription::default()
-            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&color_ref)];
-        let deps = [vk::SubpassDependency::default()
+        let depth_ref = vk::AttachmentReference::default()
+            .attachment(1)
+            .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+        let color_dep = vk::SubpassDependency::default()
             .src_subpass(0)
             .dst_subpass(vk::SUBPASS_EXTERNAL)
             .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
             .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
-        let rp = unsafe {
-            self.device.create_render_pass(
-                &vk::RenderPassCreateInfo::default()
-                    .attachments(&attachs)
-                    .subpasses(&subpass)
-                    .dependencies(&deps),
-                None,
-            )?
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        // Order this frame's depth clear/writes after any earlier frame that read the (reused) depth
+        // image — matches the color image's UNDEFINED→CLEAR reuse discipline.
+        let depth_dep = vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS)
+            .dst_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS)
+            .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+
+        let create = |attachs: &[vk::AttachmentDescription],
+                      subpass: &[vk::SubpassDescription],
+                      deps: &[vk::SubpassDependency]|
+         -> R<vk::RenderPass> {
+            Ok(unsafe {
+                self.device.create_render_pass(
+                    &vk::RenderPassCreateInfo::default()
+                        .attachments(attachs)
+                        .subpasses(subpass)
+                        .dependencies(deps),
+                    None,
+                )?
+            })
         };
-        Ok(rp)
+
+        if with_depth {
+            let attachs = [color, depth];
+            let subpass = [vk::SubpassDescription::default()
+                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                .color_attachments(&color_ref)
+                .depth_stencil_attachment(&depth_ref)];
+            let deps = [color_dep, depth_dep];
+            create(&attachs, &subpass, &deps)
+        } else {
+            let attachs = [color];
+            let subpass = [vk::SubpassDescription::default()
+                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                .color_attachments(&color_ref)];
+            let deps = [color_dep];
+            create(&attachs, &subpass, &deps)
+        }
     }
 
     /// Fix A: build the graphics pipeline (+ its empty layout) from two shader modules, with
@@ -1047,7 +1185,22 @@ impl HostGpu {
             .color_write_mask(vk::ColorComponentFlags::RGBA)
             .blend_enable(false)];
         let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attach);
-        let pipeline_ci = vk::GraphicsPipelineCreateInfo::default()
+        // Phase-2d depth-stencil state: present iff the mesh requested a depth attachment (test or
+        // write). The pipeline's depth config MUST agree with the render pass's attachment presence.
+        let depth_state = draw
+            .geometry
+            .as_ref()
+            .and_then(|g| g.depth)
+            .filter(|d| d.attachment_needed())
+            .map(|d| {
+                vk::PipelineDepthStencilStateCreateInfo::default()
+                    .depth_test_enable(d.test)
+                    .depth_write_enable(d.write)
+                    .depth_compare_op(map_compare(d.compare))
+                    .depth_bounds_test_enable(false)
+                    .stencil_test_enable(false)
+            });
+        let mut pipeline_ci = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&input_asm)
@@ -1059,6 +1212,9 @@ impl HostGpu {
             .layout(layout)
             .render_pass(render_pass)
             .subpass(0);
+        if let Some(ds) = depth_state.as_ref() {
+            pipeline_ci = pipeline_ci.depth_stencil_state(ds);
+        }
         let pipeline = unsafe { dev.create_graphics_pipelines(cache, &[pipeline_ci], None) };
         match pipeline {
             Ok(p) => Ok((layout, p[0])),
@@ -1082,9 +1238,10 @@ impl HostGpu {
     ) -> R<(vk::RenderPass, vk::Pipeline)> {
         let dev = &self.device;
         let topology = map_topology(draw.topology);
+        let (with_depth, depth_key) = depth_key_of(draw);
 
         if !self.cache_enabled {
-            let rp = self.build_render_pass(format)?;
+            let rp = self.build_render_pass(format, with_depth)?;
             sc.render_pass = rp;
             let vs = unsafe {
                 dev.create_shader_module(
@@ -1115,6 +1272,7 @@ impl HostGpu {
             topology: topology.as_raw(),
             format: format.as_raw(),
             vinput_hash: hash_vinput(draw),
+            depth_key,
         };
         let mut cache = self.obj_cache.lock().unwrap_or_else(|e| e.into_inner());
         // Fail-closed bound before inserting anything new.
@@ -1126,12 +1284,12 @@ impl HostGpu {
             );
             unsafe { cache.clear(dev) };
         }
-        let fmt_raw = format.as_raw();
-        let rp = match cache.render_passes.get(&fmt_raw) {
+        let rp_key = (format.as_raw(), with_depth);
+        let rp = match cache.render_passes.get(&rp_key) {
             Some(&rp) => rp,
             None => {
-                let rp = self.build_render_pass(format)?;
-                cache.render_passes.insert(fmt_raw, rp);
+                let rp = self.build_render_pass(format, with_depth)?;
+                cache.render_passes.insert(rp_key, rp);
                 rp
             }
         };
@@ -1911,18 +2069,22 @@ impl HostGpu {
         let t0 = bd.map(|_| Instant::now());
         let mut throwaway = RenderScratch::new(dev);
         let (render_pass, pipeline) = self.pipeline_for(&mut throwaway, draw, FORMAT)?;
+        // Phase-2d: a depth-testing mesh needs a scratch whose framebuffer has a depth attachment
+        // matching the render pass. Key the scratch by depth so the two variants never collide.
+        let (with_depth, _) = depth_key_of(draw);
+        let sk = (width, height, with_depth);
 
         let mut cache = self.scratch_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if !cache.contains_key(&(width, height)) {
+        if !cache.contains_key(&sk) {
             if cache.len() >= MAX_CACHED_SCRATCH {
                 for (_, ss) in cache.drain() {
                     unsafe { ss.destroy(dev) };
                 }
             }
-            let ss = self.build_sized_scratch(width, height, render_pass)?;
-            cache.insert((width, height), ss);
+            let ss = self.build_sized_scratch(width, height, render_pass, with_depth)?;
+            cache.insert(sk, ss);
         }
-        let ss = cache.get(&(width, height)).expect("just inserted above");
+        let ss = cache.get(&sk).expect("just inserted above");
         let t_setup = bd.map(|_| Instant::now());
 
         // Phase-2b: upload the mesh (if any) for this submit. Freed after the fence completes below —
@@ -2125,7 +2287,15 @@ impl HostGpu {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
-            let clears = [vk::ClearValue { color: vk::ClearColorValue { float32: bg } }];
+            // Clear values are indexed by attachment: color at 0, and (Phase-2d) depth at 1 cleared
+            // to the far plane (1.0) so LESS/LESS_OR_EQUAL admits the first fragment at every pixel.
+            let color_clear = vk::ClearValue { color: vk::ClearColorValue { float32: bg } };
+            let depth_clear = vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+            };
+            let clears_depth = [color_clear, depth_clear];
+            let clears_color = [color_clear];
+            let clears: &[vk::ClearValue] = if ss.has_depth { &clears_depth } else { &clears_color };
             dev.cmd_begin_render_pass(
                 ss.cmd,
                 &vk::RenderPassBeginInfo::default()
@@ -2135,7 +2305,7 @@ impl HostGpu {
                         offset: vk::Offset2D { x: 0, y: 0 },
                         extent: vk::Extent2D { width, height },
                     })
-                    .clear_values(&clears),
+                    .clear_values(clears),
                 vk::SubpassContents::INLINE,
             );
             dev.cmd_bind_pipeline(ss.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -2348,17 +2518,19 @@ impl HostGpu {
             imports.get(&key).expect("just inserted above").buffer
         }; // the ImportedGuest stays in the map (alive) after the guard drops — `dst` is a handle
 
+        // Zero-copy is the bufferless path (rejected geometry above), so never depth (key: false).
+        let sk = (width, height, false);
         let mut cache = self.scratch_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if !cache.contains_key(&(width, height)) {
+        if !cache.contains_key(&sk) {
             if cache.len() >= MAX_CACHED_SCRATCH {
                 for (_, ss) in cache.drain() {
                     ss.destroy(&self.device);
                 }
             }
-            let ss = self.build_sized_scratch(width, height, render_pass)?;
-            cache.insert((width, height), ss);
+            let ss = self.build_sized_scratch(width, height, render_pass, false)?;
+            cache.insert(sk, ss);
         }
-        let ss = cache.get(&(width, height)).expect("just inserted above");
+        let ss = cache.get(&sk).expect("just inserted above");
 
         self.record_forwarded_frame(ss, render_pass, pipeline, width, height, bg, draw, None, dst)?;
         self.device.reset_fences(&[ss.fence])?;
@@ -2390,6 +2562,7 @@ impl HostGpu {
         width: u32,
         height: u32,
         render_pass: vk::RenderPass,
+        with_depth: bool,
     ) -> R<SizedScratch> {
         const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
         let dev = &self.device;
@@ -2436,12 +2609,63 @@ impl HostGpu {
             )?
         };
         sc.view = view;
-        let views = [view];
+
+        // Phase-2d: a matching depth attachment when the render pass has one. Device-local D32,
+        // registered in the guard so an early `?` frees it. `views[1]` feeds the framebuffer.
+        let (depth_image, depth_mem, depth_view) = if with_depth {
+            let dimg = unsafe {
+                dev.create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(DEPTH_FORMAT)
+                        .extent(vk::Extent3D { width, height, depth: 1 })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )?
+            };
+            sc.depth_image = dimg;
+            let dreq = unsafe { dev.get_image_memory_requirements(dimg) };
+            let dmem = unsafe {
+                dev.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(dreq.size)
+                        .memory_type_index(
+                            self.find_mem(dreq.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?,
+                        ),
+                    None,
+                )?
+            };
+            sc.depth_mem = dmem;
+            unsafe { dev.bind_image_memory(dimg, dmem, 0)? };
+            let dview = unsafe {
+                dev.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(dimg)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(DEPTH_FORMAT)
+                        .subresource_range(depth_range()),
+                    None,
+                )?
+            };
+            sc.depth_view = dview;
+            (dimg, dmem, dview)
+        } else {
+            (vk::Image::null(), vk::DeviceMemory::null(), vk::ImageView::null())
+        };
+
+        let views_depth = [view, depth_view];
+        let views_color = [view];
+        let views: &[vk::ImageView] = if with_depth { &views_depth } else { &views_color };
         let framebuffer = unsafe {
             dev.create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
                     .render_pass(render_pass)
-                    .attachments(&views)
+                    .attachments(views)
                     .width(width)
                     .height(height)
                     .layers(1),
@@ -2507,6 +2731,10 @@ impl HostGpu {
             cmd,
             fence,
             size,
+            has_depth: with_depth,
+            depth_image,
+            depth_mem,
+            depth_view,
         })
     }
 
@@ -2864,6 +3092,16 @@ impl Drop for HostGpu {
 fn color_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(1)
+}
+
+/// Subresource range for a depth attachment view (Phase-2d) — the DEPTH aspect of `DEPTH_FORMAT`.
+fn depth_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::DEPTH)
         .base_mip_level(0)
         .level_count(1)
         .base_array_layer(0)
@@ -3315,6 +3553,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 index_data: &[],
                 index_u32: false,
                 draws: &draws,
+                depth: None,
             }),
         };
         let (w, h) = (256u32, 256u32);
@@ -3427,6 +3666,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 index_data: &index_data,
                 index_u32: false,
                 draws: &draws,
+                depth: None,
             }),
         };
         let bg = [0.0, 0.0, 0.0, 1.0];
@@ -3443,5 +3683,96 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
             "right viewport must be green, got {right:?}"
         );
         eprintln!("forwarded_multidraw_viewports_indexed: OK (left={left:?} right={right:?})");
+    }
+
+    /// Phase-2d: depth testing does real hidden-surface removal. Two triangles occupy the SAME screen
+    /// region at different depths — a NEAR red one (z=0.3) then a FAR green one (z=0.7), drawn in that
+    /// order. Without a depth buffer the last draw wins (painter's order → green). With the depth test
+    /// (`LESS` + write) the nearer red one wins despite being drawn first. Rendering both ways and
+    /// asserting the centre pixel FLIPS red↔green proves the depth attachment, clear-to-far, per-pixel
+    /// compare, and depth write all work — not just that a depth buffer is present.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_depth_test_resolves_occlusion() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        // Vertex shader reads a vec3 position (x, y, z) so each triangle carries its own NDC depth.
+        let vs = compile_wgsl(
+            "struct VOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };\n\
+             @vertex fn main(@location(0) p: vec3<f32>, @location(1) c: vec3<f32>) -> VOut {\n\
+               return VOut(vec4<f32>(p, 1.0), c);\n}",
+            naga::ShaderStage::Vertex,
+        );
+        let fs = compile_wgsl(MESH_FS, naga::ShaderStage::Fragment);
+        // stride = 6 f32 = 24 B: pos(vec3)@0, color(vec3)@12.
+        use infinigpu_abi::wire::vk_vformat as V;
+        let attrs = [
+            VertexAttr { location: 0, format: V::R32G32B32_SFLOAT, offset: 0 },
+            VertexAttr { location: 1, format: V::R32G32B32_SFLOAT, offset: 12 },
+        ];
+        // Same centered triangle twice, differing only in z and colour. Near = red (z=0.3),
+        // far = green (z=0.7). One shared vertex buffer; two draws select their half via vertex_offset.
+        let tri = |z: f32, c: [f32; 3]| {
+            [
+                [-0.7f32, 0.6, z, c[0], c[1], c[2]],
+                [0.7, 0.6, z, c[0], c[1], c[2]],
+                [0.0, -0.7, z, c[0], c[1], c[2]],
+            ]
+        };
+        let mut vv = Vec::new();
+        vv.extend_from_slice(&tri(0.3, [1.0, 0.0, 0.0])); // 0..2 near red
+        vv.extend_from_slice(&tri(0.7, [0.0, 1.0, 0.0])); // 3..5 far green
+        let verts: Vec<u8> = vv.iter().flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes())).collect();
+        // Draw NEAR (red) first, then FAR (green) — so painter's order (no depth) yields green.
+        let draws = [
+            DrawCmd { count: 3, instance_count: 1, first: 0, vertex_offset: 0, viewport: [0.0; 4] },
+            DrawCmd { count: 3, instance_count: 1, first: 3, vertex_offset: 0, viewport: [0.0; 4] },
+        ];
+        let (w, h) = (128u32, 128u32);
+        let bg = [0.0, 0.0, 0.0, 1.0];
+
+        let center = |depth: Option<DepthState>| -> [u8; 4] {
+            let draw = ForwardedDraw {
+                vertex_spirv: &vs,
+                vertex_entry: c"main",
+                fragment_spirv: &fs,
+                fragment_entry: c"main",
+                vertex_count: 0,
+                topology: 0,
+                geometry: Some(Geometry {
+                    vertex_data: &verts,
+                    vertex_stride: 24,
+                    attrs: &attrs,
+                    index_data: &[],
+                    index_u32: false,
+                    draws: &draws,
+                    depth,
+                }),
+            };
+            gpu.render_forwarded(w, h, bg, &draw).expect("depth render").pixel(w / 2, h / 2)
+        };
+
+        // No depth: the last draw (far green) paints over the near red → green wins.
+        let no_depth = center(None);
+        assert!(
+            no_depth[1] > 150 && no_depth[1] > no_depth[0] + 60,
+            "without depth the last-drawn far triangle must win (green), got {no_depth:?}"
+        );
+        // Depth LESS + write: the near red triangle wins despite being drawn first.
+        let with_depth = center(Some(DepthState {
+            test: true,
+            write: true,
+            compare: infinigpu_abi::wire::depth_compare::LESS,
+        }));
+        assert!(
+            with_depth[0] > 150 && with_depth[0] > with_depth[1] + 60,
+            "with depth the nearer triangle must win (red), got {with_depth:?}"
+        );
+        eprintln!("forwarded_depth_test_resolves_occlusion: OK (no_depth={no_depth:?} with_depth={with_depth:?})");
     }
 }

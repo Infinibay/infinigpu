@@ -396,6 +396,36 @@ pub mod index_type {
     pub const U32: u32 = 1;
 }
 
+/// Depth compare-op on the wire (the `compare` sub-field of [`ForwardedCmdListTail::depth_flags`]) —
+/// our own small enum the host maps to `VkCompareOp`. Values 0–7 fit the 3-bit compare sub-field.
+pub mod depth_compare {
+    pub const NEVER: u32 = 0;
+    pub const LESS: u32 = 1;
+    pub const EQUAL: u32 = 2;
+    pub const LESS_OR_EQUAL: u32 = 3;
+    pub const GREATER: u32 = 4;
+    pub const NOT_EQUAL: u32 = 5;
+    pub const GREATER_OR_EQUAL: u32 = 6;
+    pub const ALWAYS: u32 = 7;
+}
+
+/// Bit layout of [`ForwardedCmdListTail::depth_flags`] (Phase-2d). A host adds a depth attachment iff
+/// `TEST | WRITE` is set; the `compare` sub-field (a [`depth_compare`] value) sits in bits 4–6.
+pub mod depth_flags {
+    /// Enable the depth test.
+    pub const TEST: u32 = 1 << 0;
+    /// Write passing fragments' depth to the buffer.
+    pub const WRITE: u32 = 1 << 1;
+    /// Bit offset of the [`depth_compare`] sub-field.
+    pub const COMPARE_SHIFT: u32 = 4;
+    /// Mask (pre-shift applied) selecting the compare sub-field.
+    pub const COMPARE_MASK: u32 = 0x7 << 4;
+    /// Pack a `(test, write, compare)` triple into the field.
+    pub const fn pack(test: bool, write: bool, compare: u32) -> u32 {
+        (test as u32) | ((write as u32) << 1) | ((compare & 0x7) << COMPARE_SHIFT)
+    }
+}
+
 /// Primitive topology on the wire ([`ForwardedDrawTail::topology`]) — our own small enum so the
 /// wire doesn't couple to any Vulkan header's numeric values; the host maps it to the real
 /// `VkPrimitiveTopology`. Phase 1 only needs the triangle list; unknown values map to it.
@@ -492,9 +522,11 @@ pub struct ForwardedCmdListTail {
     pub draw_count: u32,
     /// [`vk_topology`] for every draw in the list.
     pub topology: u32,
-    /// Additive headroom (0 today) — carved into future fields with the min(len, size_of) zero-fill
-    /// rule, so an older host reads a newer guest's tail without breaking.
-    pub _reserved: u32,
+    /// Depth-test state as a [`depth_flags`] bitfield (Phase-2d): `TEST | WRITE | (compare <<
+    /// COMPARE_SHIFT)`. `0` ⇒ no depth buffer (2D / painter's order — the older-guest default, since
+    /// this field was zero-`_reserved` in ABI 0.8's first cut). A host adds a depth attachment iff
+    /// `TEST | WRITE` is set.
+    pub depth_flags: u32,
 }
 
 /// One vertex attribute in a [`ForwardedCmdListTail`] (follows the tail). Describes one input the

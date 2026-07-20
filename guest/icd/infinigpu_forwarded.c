@@ -84,7 +84,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
     const struct VertexAttrWire *attrs, uint32_t attr_count,
     const uint8_t *vertex_data, uint32_t vertex_data_len,
     const uint8_t *index_data, uint32_t index_data_len, uint32_t index_type,
-    uint32_t topology,
+    uint32_t topology, uint32_t depth_flags,
     const struct DrawCmdWire *draws, uint32_t draw_count)
 {
 	const size_t vbytes = (size_t)vspirv_words * 4u;
@@ -130,6 +130,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	tail.index_type = index_type;
 	tail.draw_count = draw_count;
 	tail.topology = topology;
+	tail.depth_flags = depth_flags;
 	memcpy(out + o, &tail, sizeof tail);
 	o += sizeof tail;
 

@@ -23,7 +23,9 @@ pub mod resource;
 
 use dma::DmaTable;
 use infinigpu_abi::regs;
-use infinigpu_replay::{DrawCmd, ForwardedDraw, Frame, Geometry, HostGpu, PresentStats, VertexAttr};
+use infinigpu_replay::{
+    DepthState, DrawCmd, ForwardedDraw, Frame, Geometry, HostGpu, PresentStats, VertexAttr,
+};
 use infinigpu_sched::{BrokerConfig, GpuBroker, VmConfig, VmTicket};
 use log::info;
 use std::collections::HashMap;
@@ -310,6 +312,8 @@ pub struct OwnedGeometry {
     pub index_data: Vec<u8>,
     pub index_u32: bool,
     pub draws: Vec<DrawCmd>,
+    /// Phase-2d depth-test state decoded from `ForwardedCmdListTail::depth_flags`; `None` ⇒ 2D path.
+    pub depth: Option<DepthState>,
 }
 
 impl OwnedForwardedDraw {
@@ -328,6 +332,7 @@ impl OwnedForwardedDraw {
                 index_data: &g.index_data,
                 index_u32: g.index_u32,
                 draws: &g.draws,
+                depth: g.depth,
             }),
         }
     }
@@ -542,6 +547,23 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         return None;
     }
 
+    // Phase-2d: unpack the depth-test state (a `depth_flags` bitfield). `0` ⇒ no depth (2D path).
+    let depth = {
+        use infinigpu_abi::wire::depth_flags as DF;
+        let f = tail.depth_flags;
+        let test = f & DF::TEST != 0;
+        let write = f & DF::WRITE != 0;
+        if test || write {
+            Some(DepthState {
+                test,
+                write,
+                compare: (f & DF::COMPARE_MASK) >> DF::COMPARE_SHIFT,
+            })
+        } else {
+            None
+        }
+    };
+
     Some(OwnedForwardedDraw {
         vertex_spirv,
         fragment_spirv,
@@ -556,6 +578,7 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
             index_data: idata_b.to_vec(),
             index_u32,
             draws,
+            depth,
         }),
     })
 }
@@ -3280,6 +3303,7 @@ mod tests {
         idata: &[u8],
         index_u32: bool,
         topology: u32,
+        depth_flags: u32,
         draws: &[infinigpu_abi::wire::DrawCmdWire],
     ) -> Vec<u8> {
         use infinigpu_abi::wire::{index_type, vk_op, ForwardedCmdListTail, VulkanWorkload};
@@ -3309,7 +3333,7 @@ mod tests {
             index_type: if index_u32 { index_type::U32 } else { index_type::U16 },
             draw_count: draws.len() as u32,
             topology,
-            _reserved: 0,
+            depth_flags,
         };
         let mut p = Vec::new();
         p.extend_from_slice(wl.as_bytes());
@@ -3351,9 +3375,11 @@ mod tests {
             DrawCmdWire { count: 3, instance_count: 1, first: 0, vertex_offset: 0, vp_x: 0.0, vp_y: 0.0, vp_w: 0.0, vp_h: 0.0 },
             DrawCmdWire { count: 3, instance_count: 2, first: 0, vertex_offset: 1, vp_x: 8.0, vp_y: 9.0, vp_w: 10.0, vp_h: 11.0 },
         ];
+        use infinigpu_abi::wire::{depth_compare, depth_flags};
+        let df = depth_flags::pack(true, false, depth_compare::GREATER); // test on, write off
         let payload = encode_forwarded_cmdlist(
             32, 16, [0.1, 0.2, 0.3, 1.0], 0, &vspirv, &fspirv, c"vs", c"fs", 20, &attrs, &vdata,
-            &idata, false, 1, &draws,
+            &idata, false, 1, df, &draws,
         );
 
         let o = decode_forwarded_cmdlist(&payload, CAP).expect("valid cmdlist decodes");
@@ -3373,6 +3399,9 @@ mod tests {
         assert_eq!(g.draws[1].instance_count, 2);
         assert_eq!(g.draws[1].vertex_offset, 1);
         assert_eq!(g.draws[1].viewport, [8.0, 9.0, 10.0, 11.0], "per-draw viewport round-trips");
+        let d = g.depth.expect("depth_flags decodes to a DepthState");
+        assert!(d.test && !d.write, "depth test-on/write-off round-trips");
+        assert_eq!(d.compare, depth_compare::GREATER, "depth compare-op round-trips");
 
         // Hostile → None (fail-closed):
         assert!(decode_forwarded_cmdlist(&payload[..44], CAP).is_none(), "truncated before tail rejected");
@@ -3459,7 +3488,7 @@ mod tests {
         let bg = [0.0f32, 0.0, 0.0, 1.0];
         let scanout_addr = GUEST_BASE + SCAN_OFF as u64;
         let payload = encode_forwarded_cmdlist(
-            w, h, bg, scanout_addr, &vs, &fs, c"main", c"main", 20, &attrs, &vdata, &[], false, 0,
+            w, h, bg, scanout_addr, &vs, &fs, c"main", c"main", 20, &attrs, &vdata, &[], false, 0, 0,
             &draws,
         );
         let sc = infinigpu_abi::wire::SubmitCmd {

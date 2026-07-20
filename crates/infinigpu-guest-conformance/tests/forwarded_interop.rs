@@ -80,6 +80,9 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
         DrawCmdWire { count: 3, instance_count: 4, first: 1, vertex_offset: -2, vp_x: 5.0, vp_y: 6.0, vp_w: 7.0, vp_h: 8.0 },
     ];
 
+    // Depth: TEST | WRITE | (LESS_OR_EQUAL << COMPARE_SHIFT) — exercises the Phase-2d bitfield too.
+    use infinigpu_abi::wire::{depth_compare, depth_flags};
+    let df = depth_flags::pack(true, true, depth_compare::LESS_OR_EQUAL);
     let payload = guest::encode_forwarded_cmdlist(
         640,
         480,
@@ -95,6 +98,7 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
         &index_data,
         false,
         1, // vk_topology::TRIANGLE_STRIP
+        df,
         &draws,
     );
 
@@ -117,4 +121,7 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
     assert_eq!(g.draws[1].first, 1);
     assert_eq!(g.draws[1].vertex_offset, -2, "signed vertex_offset survives");
     assert_eq!(g.draws[1].viewport, [5.0, 6.0, 7.0, 8.0], "per-draw viewport survives");
+    let d = g.depth.expect("depth state decodes from depth_flags");
+    assert!(d.test && d.write, "depth test+write survive the C→Rust round-trip");
+    assert_eq!(d.compare, depth_compare::LESS_OR_EQUAL, "depth compare-op survives");
 }

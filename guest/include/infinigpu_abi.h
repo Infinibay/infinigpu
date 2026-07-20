@@ -492,10 +492,12 @@ struct ForwardedCmdListTail {
    */
   uint32_t topology;
   /**
-   * Additive headroom (0 today) — carved into future fields with the min(len, size_of) zero-fill
-   * rule, so an older host reads a newer guest's tail without breaking.
+   * Depth-test state as a [`depth_flags`] bitfield (Phase-2d): `TEST | WRITE | (compare <<
+   * COMPARE_SHIFT)`. `0` ⇒ no depth buffer (2D / painter's order — the older-guest default, since
+   * this field was zero-`_reserved` in ABI 0.8's first cut). A host adds a depth attachment iff
+   * `TEST | WRITE` is set.
    */
-  uint32_t _reserved;
+  uint32_t depth_flags;
 };
 
 /**
