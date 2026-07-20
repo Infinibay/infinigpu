@@ -159,6 +159,11 @@ infinigpu_AllocateDescriptorSets(VkDevice _device,
       set->pool = pool;
       set->image = NULL;
       set->sampler = NULL;
+      set->tex_binding = 0;
+      set->ubo_buffer = NULL;
+      set->ubo_offset = 0;
+      set->ubo_range = 0;
+      set->ubo_binding = 0;
       list_addtail(&set->link, &pool->sets);
       pDescriptorSets[i] = infinigpu_descriptor_set_to_handle(set);
    }
@@ -185,32 +190,49 @@ infinigpu_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
                                uint32_t descriptorCopyCount,
                                const VkCopyDescriptorSet *pDescriptorCopies)
 {
-   /* Capture the sampled image + sampler each write binds. Only image/sampler descriptors are
-    * forwarded today; buffer descriptors (UBO/SSBO) are a follow-up and are ignored here. The
-    * single-texture case takes element 0. */
+   /* Capture the resources each write binds, and the binding NUMBER (dstBinding) so the host can build
+    * a descriptor-set layout that places them where the shader declares them. A sampled image + sampler
+    * and a uniform buffer can be written into the SAME set at distinct bindings (Phase-2c composition).
+    * The single-resource case takes element 0. */
    for (uint32_t w = 0; w < descriptorWriteCount; w++) {
       const VkWriteDescriptorSet *wr = &pDescriptorWrites[w];
       VK_FROM_HANDLE(infinigpu_descriptor_set, set, wr->dstSet);
-      if (!set || wr->descriptorCount == 0 || !wr->pImageInfo)
+      if (!set || wr->descriptorCount == 0)
          continue;
 
       switch (wr->descriptorType) {
       case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-         if (wr->pImageInfo[0].imageView)
+         if (!wr->pImageInfo)
+            break;
+         if (wr->pImageInfo[0].imageView) {
             set->image = infinigpu_image_view_from_handle(wr->pImageInfo[0].imageView);
+            set->tex_binding = wr->dstBinding;
+         }
          if (wr->pImageInfo[0].sampler)
             set->sampler = infinigpu_sampler_from_handle(wr->pImageInfo[0].sampler);
          break;
       case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-         if (wr->pImageInfo[0].imageView)
+         if (wr->pImageInfo && wr->pImageInfo[0].imageView) {
             set->image = infinigpu_image_view_from_handle(wr->pImageInfo[0].imageView);
+            set->tex_binding = wr->dstBinding;
+         }
          break;
       case VK_DESCRIPTOR_TYPE_SAMPLER:
-         if (wr->pImageInfo[0].sampler)
+         if (wr->pImageInfo && wr->pImageInfo[0].sampler)
             set->sampler = infinigpu_sampler_from_handle(wr->pImageInfo[0].sampler);
          break;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+         /* A UBO (per-frame matrices etc.). Non-dynamic only — dynamic offsets from
+          * CmdBindDescriptorSets are unsupported this iteration. */
+         if (wr->pBufferInfo && wr->pBufferInfo[0].buffer) {
+            set->ubo_buffer = infinigpu_buffer_from_handle(wr->pBufferInfo[0].buffer);
+            set->ubo_offset = wr->pBufferInfo[0].offset;
+            set->ubo_range = wr->pBufferInfo[0].range;
+            set->ubo_binding = wr->dstBinding;
+         }
+         break;
       default:
-         break; /* UBO/SSBO/etc. — not forwarded yet */
+         break; /* SSBO/dynamic/etc. — not forwarded yet */
       }
    }
 

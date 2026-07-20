@@ -30,15 +30,28 @@ fixes the correctness landmines (B1) they expose.
   image, binding 1 = sampler) and a sampler (linear/nearest × repeat/clamp), and binds it for the fragment shader
   to `textureSample`. Host + ABI + device (fail-closed decode: `data_len == w*h*4`) + guest C encoder + cbindgen
   header + conformance interop, all tests green (`forwarded_texture_samples_onto_a_quad` on the A5000; C↔Rust
-  round-trip). Single-texture; multi-texture + UBO/SSBO (larger uniforms, multiple bindings) are the follow-up.
+  round-trip). Single-texture; multi-texture + SSBO (multiple bindings, storage buffers) are the follow-up.
 - **Phase 2c textures — GUEST half DONE too (compile-verified).** The guest ICD now has a real descriptor
   subsystem (`infinigpu_descriptor.c`: layouts/samplers/pools/sets/update, all driver-owned — Mesa backfills
   none), records `CmdBindDescriptorSets` + a `CmdCopyBufferToImage2` texture upload, and at submit reads the
   bound sampled image's RGBA8 + sampler flags into the forwarded command list. So a textured app end-to-end works
   (host was already A5000-verified). Validation app `guest/icd/infinigpu_tex_test.c` (textured quad through the
   full Vulkan API). Runtime render-validation in a GPU VM is the owner-env step.
-- **Next up:** Phase 2c UBO/SSBO via descriptor sets (uniform buffers — the remaining descriptor work: forward
-  buffer contents, not just images); A5 static state (blend/cull/MSAA); Phase 2a (format A6 / loadOp A8).
+- **Phase 2c UBO (uniform buffers) — DONE end-to-end, A5000-verified.** A `var<uniform>` block (e.g. a per-frame
+  MVP `mat4` — the piece push constants can't hold at scale) is forwarded via three new `ForwardedCmdListTail`
+  fields (ABI 0.11, tail 56→68 B): `ubo_len`, `ubo_binding`, and `tex_binding`. The UBO and a texture share **one**
+  descriptor set 0 at distinct declared bindings (UBO@`ubo_binding` VERTEX|FRAGMENT; image@`tex_binding` +
+  sampler@`tex_binding+1` FRAGMENT). The host builds the `VkDescriptorSetLayout` dynamically from a `DescriptorSig`
+  and caches it by signature; the UBO is a HOST_VISIBLE|HOST_COHERENT `UNIFORM_BUFFER` written per submit and bound
+  in the same set as the texture. Device decode is fail-closed (rejects `ubo_len > 65536` and a `ubo_binding` that
+  overlaps the texture bindings, before allocation). Guest ICD captures a `UNIFORM_BUFFER` descriptor write
+  (`infinigpu_descriptor.c`), resolves `VK_WHOLE_SIZE`, and the C encoder emits the UBO blob after push-constants,
+  before texpix. Host + ABI + device (hostile-input rejects) + guest C encoder + cbindgen header + conformance
+  interop, all green — GPU tests `forwarded_uniform_only_offsets_geometry` (UBO offsets geometry in VERTEX) and
+  `forwarded_uniform_and_texture_compose` (UBO + texture compose in one set) pass on the A5000; the texture-only
+  guard `forwarded_texture_samples_onto_a_quad` still passes.
+- **Next up:** SSBO / multiple descriptor sets / multi-texture (storage buffers + more than one set); A5 static
+  state (blend/cull/MSAA); Phase 2a (format A6 / loadOp A8).
 
 The rest of this doc is the original design; the per-phase wire/host/test shape it describes is what the landed
 phases implemented.
@@ -146,7 +159,7 @@ paths. Do this whenever the ABI is bumped for Phase 2b anyway.
 |-------|----------|--------|------|----------|--------|
 | 2a | A6, A8 | S | low | correct colors; overlay passes | todo |
 | 2b | A1, A3, A7, A5-dyn | **L** | med | **any real mesh renders** | **DONE** host/device/wire + guest ICD recording (compile-verified); runtime render-validation pending owner |
-| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) | **push-const transform + textures DONE end-to-end** (host/wire/device + guest ICD recording); UBO/SSBO buffer descriptors todo (**next**) |
+| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) | **push-const transform + textures + UBO DONE end-to-end** (host/wire/device + guest ICD recording; A5000-verified); SSBO / multi-set / multi-texture todo (**next**) |
 | 2d | A4, A5-static | M | med | depth-correct 3D, transparency, MSAA | **A4 depth DONE**; A5 static (blend/cull/MSAA) todo |
 | 2e | A9 | M | med | async frames (with Fix F) | todo |
 

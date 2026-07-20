@@ -262,12 +262,13 @@ infinigpu_CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
    if (pipelineBindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS)
       return;
-   /* The wire forwards a single texture, so record the first bound set that carries a sampled
-    * image. Later sets with an image override earlier ones (last-bound wins, like a real driver). */
+   /* Record the first bound set that carries a forwarded resource — a sampled image and/or a uniform
+    * buffer, composed in one set (Phase-2c). Later sets with a resource override earlier ones
+    * (last-bound wins, like a real driver). Single-set composition: the host binds exactly set 0. */
    for (uint32_t i = 0; i < descriptorSetCount; i++) {
       struct infinigpu_descriptor_set *set =
          infinigpu_descriptor_set_from_handle(pDescriptorSets[i]);
-      if (set && set->image)
+      if (set && (set->image || set->ubo_buffer))
          cmd->bound_desc_set = set;
    }
 }

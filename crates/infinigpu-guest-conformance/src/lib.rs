@@ -79,10 +79,14 @@ unsafe extern "C" {
         depth_flags: u32,
         push_const: *const u8,
         push_const_len: u32,
+        ubo: *const u8,
+        ubo_len: u32,
+        ubo_binding: u32,
         draws: *const u8,
         draw_count: u32,
         texs: *const u8,
         tex_count: u32,
+        tex_binding: u32,
         texpix: *const u8,
         texpix_len: u32,
     ) -> usize;
@@ -113,6 +117,9 @@ pub fn encode_forwarded_cmdlist(
     draws: &[infinigpu_abi::wire::DrawCmdWire],
     texs: &[infinigpu_abi::wire::TextureDescWire],
     texpix: &[u8],
+    ubo: &[u8],
+    ubo_binding: u32,
+    tex_binding: u32,
 ) -> Vec<u8> {
     let cap = 128
         + vspirv.len() * 4
@@ -123,6 +130,7 @@ pub fn encode_forwarded_cmdlist(
         + vertex_data.len()
         + index_data.len()
         + push_const.len()
+        + ubo.len()
         + texpix.len()
         + vertex_entry.to_bytes_with_nul().len()
         + fragment_entry.to_bytes_with_nul().len();
@@ -153,10 +161,14 @@ pub fn encode_forwarded_cmdlist(
             depth_flags,
             push_const.as_ptr(),
             push_const.len() as u32,
+            ubo.as_ptr(),
+            ubo.len() as u32,
+            ubo_binding,
             draws.as_ptr() as *const u8,
             draws.len() as u32,
             texs.as_ptr() as *const u8,
             texs.len() as u32,
+            tex_binding,
             texpix.as_ptr(),
             texpix.len() as u32,
         )

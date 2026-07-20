@@ -439,19 +439,24 @@ struct ForwardedDrawTail {
  *   8. fragment entry-point name — `fragment_entry_len` bytes (incl. trailing NUL).
  * The 4-byte-multiple sections (attrs, draws, `tex_count`×[`TextureDescWire`], both SPIR-V blobs)
  * come first so each stays 4-aligned relative to the tail; the arbitrary-length byte blobs (vertex
- * data, index data, both entry names, push-const bytes, then the concatenated texture pixels) come
- * last, read as raw bytes so their odd lengths never misalign a fixed-layout array. Full order:
+ * data, index data, both entry names, push-const bytes, UBO bytes, then the concatenated texture
+ * pixels) come last, read as raw bytes so their odd lengths never misalign a fixed-layout array.
+ * Full order:
  *   attrs[attr_count] · draws[draw_count] · texs[tex_count] ·
  *   vSPIR-V · fSPIR-V · vertex data · index data · vertex entry · fragment entry ·
- *   push-const bytes · texture pixels (RGBA8, concatenated in `texs` order).
- * `push_const_len` is a transform block (ABI 0.9); `tex_count` textures (ABI 0.10) each bind a
- * sampled image at descriptor set 0 binding `2i` and a sampler at binding `2i+1`. Every length is
+ *   push-const bytes · UBO bytes (`ubo_len`) · texture pixels (RGBA8, concatenated in `texs` order).
+ * `push_const_len` is a transform block (ABI 0.9); `tex_count` textures (ABI 0.10) bind a sampled
+ * image at binding `tex_binding + 2i` and a sampler at `tex_binding + 2i + 1`; the UBO (ABI 0.11)
+ * binds at `ubo_binding` (VERTEX|FRAGMENT). The host builds the descriptor-set-0 layout **dynamically**
+ * from whichever resources are present at their declared bindings, so a UBO and a texture compose in
+ * one set (e.g. UBO@0, image@1, sampler@2). The UBO byte blob is fixed-length (`ubo_len`); the texture
+ * pixels stay the terminal derived region (length = Σ `TextureDescWire::data_len`). Every length is
  * guest-controlled and MUST be bounds-checked against the actual payload length before use
  * (fail-closed).
  *
  * `vertex_stride == 0` means "no vertex buffer" (bufferless, like [`ForwardedDrawTail`] — the
  * shader synthesizes geometry); otherwise binding 0 has that stride and the `attr_count`
- * attributes describe it. 52 bytes, 4-byte aligned.
+ * attributes describe it. 68 bytes, 4-byte aligned.
  */
 struct ForwardedCmdListTail {
   /**
@@ -514,12 +519,31 @@ struct ForwardedCmdListTail {
    */
   uint32_t push_const_len;
   /**
-   * Number of sampled textures (ABI 0.10). `0` ⇒ no descriptor set / no textures. Each is a
-   * [`TextureDescWire`] (in the fixed-array region after the draws) plus its RGBA8 pixels (in the
-   * trailing pixel region). Texture `i` binds at descriptor set 0 binding `2i` (sampled image) +
-   * `2i+1` (sampler), matching a WGSL `texture_2d`/`sampler` pair. Host-bounded (fail-closed).
+   * Number of sampled textures (ABI 0.10). `0` ⇒ no textures. Each is a [`TextureDescWire`] (in the
+   * fixed-array region after the draws) plus its RGBA8 pixels (in the trailing pixel region). Texture
+   * `i` binds at descriptor set 0 binding `tex_binding + 2i` (sampled image) + `tex_binding + 2i + 1`
+   * (sampler), matching a WGSL `texture_2d`/`sampler` pair. Host-bounded (fail-closed).
    */
   uint32_t tex_count;
+  /**
+   * Byte length of the uniform-buffer (UBO) block (ABI 0.11) — a fixed-length byte blob appended
+   * after the push constants and before the trailing texture pixels. `0` ⇒ no UBO. The host uploads
+   * these bytes into a `UNIFORM_BUFFER` bound at descriptor set 0 binding [`ubo_binding`]
+   * (VERTEX|FRAGMENT), so a shader's `var<uniform>` block (e.g. per-frame matrices) reads them.
+   */
+  uint32_t ubo_len;
+  /**
+   * Descriptor-set-0 binding the UBO occupies (ABI 0.11). Ignored when `ubo_len == 0`. Must not fall
+   * inside the texture's binding range `[tex_binding .. tex_binding + 2*tex_count)`.
+   */
+  uint32_t ubo_binding;
+  /**
+   * Base descriptor-set-0 binding of texture 0's sampled image (ABI 0.11); sampler at `tex_binding+1`,
+   * texture `i` at `tex_binding + 2i` / `+ 2i + 1`. `0` (the pre-0.11 default) ⇒ image@0 / sampler@1,
+   * byte- and semantics-identical to ABI 0.10 texture-only command lists. Lets a UBO and a texture
+   * occupy the same set at distinct bindings (UBO@0, image@1, sampler@2), which real apps need.
+   */
+  uint32_t tex_binding;
 };
 
 /**

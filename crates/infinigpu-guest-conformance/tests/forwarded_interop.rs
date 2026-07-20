@@ -93,6 +93,9 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
         data_len: texpix.len() as u32,
         sampler_flags: sampler_flags::LINEAR, // linear filtering, clamp addressing
     }];
+    // A UBO at binding 0 composing with the texture at image@1 / sampler@2 (tex_binding=1) — exercises
+    // the Phase-2c UBO byte blob (after push-const, before texpix) + the binding-composition fields.
+    let ubo: Vec<u8> = (100u8..140).collect(); // 40 recognizable bytes
     let payload = guest::encode_forwarded_cmdlist(
         640,
         480,
@@ -113,6 +116,9 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
         &draws,
         &texs,
         &texpix,
+        &ubo,
+        0, // ubo_binding
+        1, // tex_binding (image@1, sampler@2)
     );
 
     let o = decode_forwarded_cmdlist(&payload, CAP).expect("C-encoded cmdlist must decode");
@@ -142,4 +148,8 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
     assert_eq!((t.width, t.height), (2, 2), "texture dims survive C→Rust");
     assert_eq!(t.rgba, texpix, "texture pixels survive C→Rust (trailing region placement)");
     assert!(t.linear && !t.repeat, "sampler flags survive (linear on, repeat off)");
+    assert_eq!(g.tex_binding, 1, "tex_binding survives C→Rust (image@1 / sampler@2)");
+    let u = g.uniform.expect("ubo bytes decode to a uniform");
+    assert_eq!(u.binding, 0, "ubo binding survives C→Rust");
+    assert_eq!(u.bytes, ubo, "ubo bytes survive C→Rust (blob after push-const, before texpix)");
 }

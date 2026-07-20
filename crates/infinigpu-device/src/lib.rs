@@ -25,7 +25,7 @@ use dma::DmaTable;
 use infinigpu_abi::regs;
 use infinigpu_replay::{
     DepthState, DrawCmd, ForwardedDraw, Frame, Geometry, HostGpu, PresentStats, SamplerCfg, Texture,
-    VertexAttr,
+    UniformBlock, VertexAttr,
 };
 use infinigpu_sched::{BrokerConfig, GpuBroker, VmConfig, VmTicket};
 use log::info;
@@ -319,6 +319,10 @@ pub struct OwnedGeometry {
     pub push_constants: Vec<u8>,
     /// Phase-2c sampled texture (RGBA8 pixels + dims + sampler cfg); `None` ⇒ untextured.
     pub texture: Option<OwnedTexture>,
+    /// Phase-2c base binding of `texture`'s sampled image (sampler at `+1`); `0` ⇒ image@0/sampler@1.
+    pub tex_binding: u32,
+    /// Phase-2c uniform buffer (binding + bytes); `None` ⇒ no UBO. Composes with `texture`.
+    pub uniform: Option<OwnedUniform>,
 }
 
 /// Owning form of a decoded Phase-2c texture (see [`decode_forwarded_cmdlist`]).
@@ -328,6 +332,12 @@ pub struct OwnedTexture {
     pub rgba: Vec<u8>,
     pub linear: bool,
     pub repeat: bool,
+}
+
+/// Owning form of a decoded Phase-2c uniform buffer: the descriptor-set-0 binding + the raw bytes.
+pub struct OwnedUniform {
+    pub binding: u32,
+    pub bytes: Vec<u8>,
 }
 
 impl OwnedForwardedDraw {
@@ -356,6 +366,11 @@ impl OwnedForwardedDraw {
                         linear: t.linear,
                         repeat: t.repeat,
                     },
+                }),
+                tex_binding: g.tex_binding,
+                uniform: g.uniform.as_ref().map(|u| UniformBlock {
+                    binding: u.binding,
+                    bytes: &u.bytes,
                 }),
             }),
         }
@@ -472,10 +487,14 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
     let idata_len = tail.index_data_len as usize;
     let pc_len = tail.push_const_len as usize;
     let tex_count = tail.tex_count as usize;
+    let ubo_len = tail.ubo_len as usize;
+    let ubo_binding = tail.ubo_binding;
+    let tex_binding = tail.tex_binding;
     let stride = tail.vertex_stride;
 
     // Scalar bounds (cheap rejects before any arithmetic on attacker lengths). Push constants are
-    // hardware-capped (256 B on every Vulkan implementation) — reject anything larger fail-closed.
+    // hardware-capped (256 B on every Vulkan implementation) — reject anything larger fail-closed. The
+    // UBO is capped at 64 KiB (the guaranteed `maxUniformBufferRange`); `ubo_len == 0` is valid (no UBO).
     if vlen == 0
         || flen == 0
         || !vlen.is_multiple_of(4)
@@ -493,8 +512,18 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         || idata_len > max_bytes
         || pc_len > 256
         || tex_count > 1
+        || ubo_len > 65536
     {
         return None;
+    }
+    // A UBO and a texture share one descriptor set 0; their bindings must not collide (a well-formed
+    // guest emits distinct bindings, e.g. UBO@0, image@1, sampler@2). Reject an overlap fail-closed.
+    if ubo_len > 0 && tex_count > 0 {
+        let tex_lo = tex_binding;
+        let tex_hi = tex_binding.saturating_add(2 * tex_count as u32); // exclusive
+        if ubo_binding >= tex_lo && ubo_binding < tex_hi {
+            return None;
+        }
     }
     // A command list is the geometry path: it must carry a vertex buffer with a real stride, and the
     // stride must span every attribute. A bufferless draw belongs on the `vk_op::FORWARDED` path.
@@ -504,10 +533,11 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
 
     // Total of the fixed-array + variable-blob sections, in wire order. All checked_* so a hostile
     // length can't wrap. The fixed-size arrays (attrs, draws, texdescs) and the SPIR-V blobs are
-    // 4-multiples and come first; the byte blobs (vertex/index data, two entry names, push constants)
-    // follow so their odd lengths never misalign a fixed array. The RGBA8 texture pixels form the
-    // trailing region — its length isn't in the tail, it's the sum of each texdesc's `data_len`, so
-    // we parse the texdescs (below) before we can bound-check it.
+    // 4-multiples and come first; the byte blobs (vertex/index data, two entry names, push constants,
+    // then the UBO bytes) follow so their odd lengths never misalign a fixed array. The RGBA8 texture
+    // pixels form the trailing region — its length isn't in the tail, it's the sum of each texdesc's
+    // `data_len`, so we parse the texdescs (below) before we can bound-check it; the UBO block (whose
+    // length IS in the tail) therefore precedes it.
     let attrs_bytes = attr_count.checked_mul(size_of::<VertexAttrWire>())?;
     let draws_bytes = draw_count.checked_mul(size_of::<DrawCmdWire>())?;
     let texs_bytes = tex_count.checked_mul(size_of::<TextureDescWire>())?;
@@ -520,7 +550,8 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         .checked_add(idata_len)?
         .checked_add(velen)?
         .checked_add(felen)?
-        .checked_add(pc_len)?;
+        .checked_add(pc_len)?
+        .checked_add(ubo_len)?;
     if total > rest.len() {
         return None;
     }
@@ -534,6 +565,7 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
     let (ventry_b, r) = r.split_at(velen);
     let (fentry_b, r) = r.split_at(felen);
     let (pc_b, r) = r.split_at(pc_len);
+    let (ubo_b, r) = r.split_at(ubo_len);
 
     // Parse the attribute + draw arrays element-by-element (read_from_prefix copies, so the
     // byte-aligned payload needs no 4-alignment).
@@ -630,6 +662,14 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         None
     };
 
+    // Phase-2c: the uniform buffer, if any (`ubo_len == 0` ⇒ none). `ubo_b` was carved as a fixed-length
+    // blob (bounds already enforced by the total-vs-payload check above), so this is a pure copy.
+    let uniform = if ubo_len > 0 {
+        Some(OwnedUniform { binding: ubo_binding, bytes: ubo_b.to_vec() })
+    } else {
+        None
+    };
+
     Some(OwnedForwardedDraw {
         vertex_spirv,
         fragment_spirv,
@@ -647,6 +687,8 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
             depth,
             push_constants: pc_b.to_vec(),
             texture,
+            tex_binding,
+            uniform,
         }),
     })
 }
@@ -3354,8 +3396,8 @@ mod tests {
 
     /// Serialize a mesh into a `vk_op::FORWARDED_CMDLIST` payload exactly as the guest ICD will:
     /// fixed VulkanWorkload → ForwardedCmdListTail → attrs → draws → texdescs → vSPIR-V → fSPIR-V →
-    /// vertex data → index data → vertex entry → fragment entry → push constants → texture pixels
-    /// (the order [`decode_forwarded_cmdlist`] expects).
+    /// vertex data → index data → vertex entry → fragment entry → push constants → UBO bytes →
+    /// texture pixels (the order [`decode_forwarded_cmdlist`] expects).
     #[allow(clippy::too_many_arguments)]
     fn encode_forwarded_cmdlist(
         width: u32,
@@ -3377,6 +3419,9 @@ mod tests {
         draws: &[infinigpu_abi::wire::DrawCmdWire],
         texs: &[infinigpu_abi::wire::TextureDescWire],
         texpix: &[u8],
+        ubo: &[u8],
+        ubo_binding: u32,
+        tex_binding: u32,
     ) -> Vec<u8> {
         use infinigpu_abi::wire::{index_type, vk_op, ForwardedCmdListTail, VulkanWorkload};
         use zerocopy::IntoBytes;
@@ -3408,6 +3453,9 @@ mod tests {
             depth_flags,
             push_const_len: push_const.len() as u32,
             tex_count: texs.len() as u32,
+            ubo_len: ubo.len() as u32,
+            ubo_binding,
+            tex_binding,
         };
         let mut p = Vec::new();
         p.extend_from_slice(wl.as_bytes());
@@ -3428,6 +3476,7 @@ mod tests {
         p.extend_from_slice(ve);
         p.extend_from_slice(fe);
         p.extend_from_slice(push_const);
+        p.extend_from_slice(ubo);
         p.extend_from_slice(texpix);
         p
     }
@@ -3466,9 +3515,12 @@ mod tests {
             data_len: texpix.len() as u32,
             sampler_flags: sampler_flags::LINEAR | sampler_flags::REPEAT,
         }];
+        // A 64-byte UBO at binding 0 composing with the texture at image@1 / sampler@2 (tex_binding=1).
+        let ubo: Vec<u8> = (0u8..64).collect();
         let payload = encode_forwarded_cmdlist(
             32, 16, [0.1, 0.2, 0.3, 1.0], 0, &vspirv, &fspirv, c"vs", c"fs", 20, &attrs, &vdata,
             &idata, false, 1, df, &[0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4], &draws, &texs, &texpix,
+            &ubo, 0, 1,
         );
 
         let o = decode_forwarded_cmdlist(&payload, CAP).expect("valid cmdlist decodes");
@@ -3496,6 +3548,10 @@ mod tests {
         assert_eq!((t.width, t.height), (2, 2), "texture dims round-trip");
         assert_eq!(t.rgba, texpix, "texture pixels round-trip");
         assert!(t.linear && t.repeat, "sampler flags round-trip");
+        assert_eq!(g.tex_binding, 1, "tex_binding round-trips (image@1 / sampler@2)");
+        let u = g.uniform.expect("ubo bytes decode to a uniform");
+        assert_eq!(u.binding, 0, "ubo binding round-trips");
+        assert_eq!(u.bytes, ubo, "ubo bytes round-trip (after push-const, before texpix)");
 
         // Hostile → None (fail-closed):
         assert!(decode_forwarded_cmdlist(&payload[..44], CAP).is_none(), "truncated before tail rejected");
@@ -3508,15 +3564,23 @@ mod tests {
         let mut no_draws = payload.clone();
         no_draws[40 + 36..40 + 40].copy_from_slice(&0u32.to_le_bytes());
         assert!(decode_forwarded_cmdlist(&no_draws, CAP).is_none(), "zero draw_count rejected");
+        // ubo_len (tail @ offset 56) beyond the 64 KiB cap → rejected before any allocation.
+        let mut big_ubo = payload.clone();
+        big_ubo[40 + 56..40 + 60].copy_from_slice(&65537u32.to_le_bytes());
+        assert!(decode_forwarded_cmdlist(&big_ubo, CAP).is_none(), "oversized ubo_len rejected");
+        // ubo_binding (tail @ offset 60) overlapping the texture range [tex_binding .. +2) → rejected.
+        let mut overlap = payload.clone();
+        overlap[40 + 60..40 + 64].copy_from_slice(&1u32.to_le_bytes()); // 1 collides with image@1
+        assert!(decode_forwarded_cmdlist(&overlap, CAP).is_none(), "ubo/texture binding overlap rejected");
         // A texture whose data_len doesn't match width*height*4 is rejected. The single texdesc's
-        // data_len is its 3rd u32; the texdescs sit after VulkanWorkload(40) + tail(56) + attrs + draws.
-        let tex_off = 40 + 56 + attrs.len() * 12 + draws.len() * 32;
+        // data_len is its 3rd u32; the texdescs sit after VulkanWorkload(40) + tail(68) + attrs + draws.
+        let tex_off = 40 + 68 + attrs.len() * 12 + draws.len() * 32;
         let mut bad_texlen = payload.clone();
         bad_texlen[tex_off + 8..tex_off + 12].copy_from_slice(&99u32.to_le_bytes());
         assert!(decode_forwarded_cmdlist(&bad_texlen, CAP).is_none(), "texture data_len mismatch rejected");
-        // bad vertex SPIR-V magic (first vSPIR-V word sits after the VulkanWorkload(40) + tail(56) +
+        // bad vertex SPIR-V magic (first vSPIR-V word sits after the VulkanWorkload(40) + tail(68) +
         // attrs + draws + texdesc arrays).
-        let vspv_off = 40 + 56 + attrs.len() * 12 + draws.len() * 32 + texs.len() * 16;
+        let vspv_off = 40 + 68 + attrs.len() * 12 + draws.len() * 32 + texs.len() * 16;
         let mut bad_magic = payload.clone();
         bad_magic[vspv_off] = bad_magic[vspv_off].wrapping_add(1);
         assert!(decode_forwarded_cmdlist(&bad_magic, CAP).is_none(), "non-SPIR-V vertex blob rejected");
@@ -3589,7 +3653,7 @@ mod tests {
         let scanout_addr = GUEST_BASE + SCAN_OFF as u64;
         let payload = encode_forwarded_cmdlist(
             w, h, bg, scanout_addr, &vs, &fs, c"main", c"main", 20, &attrs, &vdata, &[], false, 0, 0,
-            &[], &draws, &[], &[],
+            &[], &draws, &[], &[], &[], 0, 0,
         );
         let sc = infinigpu_abi::wire::SubmitCmd {
             ctx_id: 0,

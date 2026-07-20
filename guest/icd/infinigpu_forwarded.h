@@ -85,11 +85,15 @@ size_t infinigpu_encode_forwarded(uint8_t *out, size_t cap,
  * SPIR-V lengths are 32-bit WORDS; data lengths are BYTES. `attrs`/`draws`/`texs` are arrays of the
  * wire structs (the caller fills them from the recorded pipeline layout + vkCmdDraw* stream). The
  * texdescs sit in the fixed-array region after the draws; their RGBA8 pixels are the trailing region
- * after the push constants (`texpix`, the concatenation of every texdesc's `data_len` bytes — the
- * host validates `data_len == width*height*4`). `index_data_len == 0` ⇒ non-indexed; `tex_count == 0`
- * ⇒ untextured. Returns the total byte length, or 0 if it would not fit `cap` (or the geometry is
- * degenerate: no vertex buffer / no draws). The caller wraps the result in a SUBMIT_CMD (encoding
- * VULKAN_VENUSLIKE), the same as the bufferless encoder.
+ * (`texpix`). The UBO bytes (`ubo`, `ubo_len`) are a fixed-length blob after the push constants and
+ * before `texpix`; the host uploads them into a UNIFORM_BUFFER at descriptor-set-0 binding `ubo_binding`
+ * (VERTEX|FRAGMENT). `tex_binding` is the sampled image's binding (sampler at `tex_binding+1`); it lets
+ * a UBO and a texture share set 0 at distinct bindings (e.g. UBO@0, image@1, sampler@2). Full section
+ * order: attrs · draws · texdescs · vSPIR-V · fSPIR-V · vertex data · index data · vertex entry ·
+ * fragment entry · push constants · UBO bytes · texture pixels. `index_data_len == 0` ⇒ non-indexed;
+ * `tex_count == 0` ⇒ untextured; `ubo_len == 0` ⇒ no UBO. Returns the total byte length, or 0 if it
+ * would not fit `cap` (or the geometry is degenerate). The caller wraps the result in a SUBMIT_CMD
+ * (encoding VULKAN_VENUSLIKE), the same as the bufferless encoder.
  */
 size_t infinigpu_encode_forwarded_cmdlist(
     uint8_t *out, size_t cap,
@@ -103,8 +107,9 @@ size_t infinigpu_encode_forwarded_cmdlist(
     const uint8_t *index_data, uint32_t index_data_len, uint32_t index_type,
     uint32_t topology, uint32_t depth_flags,
     const uint8_t *push_const, uint32_t push_const_len,
+    const uint8_t *ubo, uint32_t ubo_len, uint32_t ubo_binding,
     const struct DrawCmdWire *draws, uint32_t draw_count,
-    const struct TextureDescWire *texs, uint32_t tex_count,
+    const struct TextureDescWire *texs, uint32_t tex_count, uint32_t tex_binding,
     const uint8_t *texpix, uint32_t texpix_len);
 
 #endif /* INFINIGPU_FORWARDED_H */

@@ -179,6 +179,13 @@ struct infinigpu_descriptor_set {
    struct infinigpu_descriptor_pool *pool;
    struct infinigpu_image_view *image;    /* sampled image bound here (NULL ⇒ none) */
    struct infinigpu_sampler *sampler;     /* sampler bound here (NULL ⇒ none) */
+   uint32_t tex_binding;                  /* dstBinding the sampled image was written at (image@it, sampler@it+1) */
+   /* Phase-2c uniform buffer bound here (NULL ⇒ none). Composes with the texture in the same set at a
+    * distinct binding. `ubo_range == VK_WHOLE_SIZE` ⇒ resolve to total_size - ubo_offset at submit. */
+   struct infinigpu_buffer *ubo_buffer;
+   uint64_t ubo_offset;
+   uint64_t ubo_range;
+   uint32_t ubo_binding;                  /* dstBinding the UBO was written at */
 };
 
 /* A deferred image->buffer copy, executed at submit AFTER the draw so the host

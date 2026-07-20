@@ -287,12 +287,41 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       }
    }
 
+   /* Phase-2c uniform buffer: if a UBO is bound in the (single) descriptor set, forward its bytes so
+    * the host binds them for the shader's var<uniform> block. buf->map already includes the
+    * BindBufferMemory bind offset, so add ONLY the write offset (never double-count). tex_binding is
+    * forwarded so the host places the texture where the shader declares it (composes with the UBO). */
+   const uint8_t *ubo = NULL;
+   uint32_t ubo_len = 0;
+   uint32_t ubo_binding = 0;
+   uint32_t tex_binding = 0;
+   struct infinigpu_descriptor_set *ds = cmd->bound_desc_set;
+   if (ds) {
+      tex_binding = ds->tex_binding;
+      if (ds->ubo_buffer && ds->ubo_buffer->map && ds->ubo_offset < ds->ubo_buffer->total_size) {
+         /* Clamp to the bytes actually in the buffer past the write offset, exactly like the vertex
+          * (vavail) and index (iavail) paths above. A non-conformant app can bind an explicit
+          * VkDescriptorBufferInfo.range that overruns the buffer (offset+range > total_size); without
+          * this clamp the encoder would memcpy past the mapped region — an OOB read of the guest's own
+          * memory. VK_WHOLE_SIZE is already exactly the available bytes. */
+         uint64_t uavail = ds->ubo_buffer->total_size - ds->ubo_offset;
+         uint64_t range = (ds->ubo_range == VK_WHOLE_SIZE) ? uavail : ds->ubo_range;
+         if (range > uavail)
+            range = uavail;
+         if (range > 0 && range <= 65536) {
+            ubo = (const uint8_t *)ds->ubo_buffer->map + ds->ubo_offset;
+            ubo_len = (uint32_t)range;
+            ubo_binding = ds->ubo_binding;
+         }
+      }
+   }
+
    const size_t cap = 256 + vs->spirv_size + fs->spirv_size +
                       strlen(vs->entrypoint) + 1 + strlen(fs->entrypoint) + 1 +
                       (size_t)p->attr_count * sizeof(struct VertexAttrWire) +
                       (size_t)cmd->draw_count * sizeof(struct DrawCmdWire) +
                       (size_t)tex_count * sizeof(struct TextureDescWire) +
-                      vlen + ilen + cmd->push_const_len + texpix_len;
+                      vlen + ilen + cmd->push_const_len + ubo_len + texpix_len;
    uint8_t *payload = malloc(cap);
    if (!payload) {
       free(draws);
@@ -308,8 +337,9 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       vdata, vlen, idata, ilen, cmd->index_type,
       topo, p->depth_flags,
       cmd->push_const, cmd->push_const_len,
+      ubo, ubo_len, ubo_binding,
       draws, cmd->draw_count,
-      tex_count ? &texdesc : NULL, tex_count, texpix, texpix_len);
+      tex_count ? &texdesc : NULL, tex_count, tex_binding, texpix, texpix_len);
    free(draws);
    if (n == 0) {
       free(payload);

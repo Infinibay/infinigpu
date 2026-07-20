@@ -171,10 +171,28 @@ pub struct Geometry<'a> {
     /// `var<push_constant>` / `layout(push_constant)`. Empty ⇒ an empty pipeline layout (no
     /// transform, raw NDC). Applied to the VERTEX|FRAGMENT stages at offset 0 before the draws.
     pub push_constants: &'a [u8],
-    /// One sampled texture (Phase-2c) bound at descriptor set 0 (binding 0 = image, binding 1 =
-    /// sampler), matching a WGSL `texture_2d`/`sampler` pair. `None` ⇒ no descriptor set (untextured).
-    /// The single-texture case; multi-texture is a follow-up.
+    /// One sampled texture (Phase-2c) bound at descriptor set 0 (image = `tex_binding`, sampler =
+    /// `tex_binding + 1`), matching a WGSL `texture_2d`/`sampler` pair. `None` ⇒ untextured. The
+    /// single-texture case; multi-texture is a follow-up.
     pub texture: Option<Texture<'a>>,
+    /// Base binding of `texture`'s sampled image (its sampler is at `tex_binding + 1`). `0` ⇒ image@0 /
+    /// sampler@1 (the pre-UBO default). Non-zero lets a UBO and a texture share set 0 at distinct
+    /// bindings (e.g. UBO@0, image@1, sampler@2). Ignored when `texture` is `None`.
+    pub tex_binding: u32,
+    /// One uniform buffer (Phase-2c) bound at descriptor set 0 binding `uniform.binding`
+    /// (VERTEX|FRAGMENT), for a shader's `var<uniform>` block (e.g. per-frame matrices). `None` ⇒ no
+    /// UBO. Composes with `texture` in the same set at a distinct binding.
+    pub uniform: Option<UniformBlock<'a>>,
+}
+
+/// A forwarded uniform buffer (Phase-2c): a declared descriptor-set-0 binding + the raw bytes the host
+/// uploads into a `UNIFORM_BUFFER` for the shader's `var<uniform>` block to read (VERTEX|FRAGMENT).
+#[derive(Clone, Copy)]
+pub struct UniformBlock<'a> {
+    /// Descriptor-set-0 binding this UBO occupies (must differ from the texture's image/sampler bindings).
+    pub binding: u32,
+    /// The uniform bytes (host uploads verbatim; std140 layout is the shader author's concern).
+    pub bytes: &'a [u8],
 }
 
 /// Sampler configuration for a forwarded [`Texture`].
@@ -344,10 +362,10 @@ pub struct HostGpu {
     /// scanout address rarely changes), so an import is reused across frames. Invalidated via
     /// [`Self::forget_guest_import`] when the device unmaps that guest RAM (else the import dangles).
     guest_imports: Mutex<HashMap<(usize, u64), ImportedGuest>>,
-    /// Phase-2c: the fixed descriptor-set layout for one sampled texture (binding 0 = SAMPLED_IMAGE,
-    /// binding 1 = SAMPLER, FRAGMENT stage). Built lazily on first textured submit and reused (it is
-    /// content-independent). `null` until built; destroyed on drop.
-    tex_set_layout: Mutex<vk::DescriptorSetLayout>,
+    /// Phase-2c: descriptor-set-0 layouts keyed by [`DescriptorSig`] (which resources at which bindings).
+    /// Built lazily per unique signature and reused (content-independent). Bounded to avoid an
+    /// adversarial guest growing it unboundedly; all entries destroyed on drop.
+    desc_set_layouts: Mutex<HashMap<DescriptorSig, vk::DescriptorSetLayout>>,
 }
 
 /// Fix D: a guest-RAM region imported as a `TRANSFER_DST` buffer the GPU can copy a frame into.
@@ -628,15 +646,33 @@ struct PipelineKey {
     /// Phase-2c push-constant block size (bytes); `0` ⇒ an empty pipeline layout. The layout (hence
     /// the pipeline) differs by this, so it is part of the key.
     pc_size: u32,
-    /// Phase-2c: whether the pipeline layout includes the texture descriptor-set layout. The layout
-    /// (hence the pipeline) differs, so it is part of the key.
-    has_texture: bool,
+    /// Phase-2c: the descriptor-set-0 signature (which resources at which bindings). The pipeline layout
+    /// (hence the pipeline) includes the descriptor-set layout built from this, so it is part of the key.
+    /// `None` ⇒ no descriptor set (empty layout, the pre-2c paths).
+    desc_sig: Option<DescriptorSig>,
 }
 
-/// Whether a draw carries a texture (Phase-2c) — its pipeline layout then includes the descriptor-set
-/// layout, so this is part of the [`PipelineKey`].
-fn has_texture_of(draw: &ForwardedDraw) -> bool {
-    draw.geometry.as_ref().is_some_and(|g| g.texture.is_some())
+/// The descriptor-set-0 signature a draw needs (Phase-2c): which resources bind where. The host builds
+/// a `VkDescriptorSetLayout` from this — a `UNIFORM_BUFFER` at `ubo_binding` (VERTEX|FRAGMENT), and/or a
+/// `SAMPLED_IMAGE` at `image_binding` + a `SAMPLER` at `image_binding + 1` (FRAGMENT). Same signature ⇒
+/// same layout ⇒ same pipeline, so it is cached and part of the [`PipelineKey`].
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+struct DescriptorSig {
+    ubo_binding: Option<u32>,
+    image_binding: Option<u32>,
+}
+
+/// The descriptor-set signature a draw needs, or `None` if it binds no descriptor resources (Phase-2c).
+/// A texture binds a sampled image at `tex_binding` (+ sampler at `+1`); a UBO binds at its `binding`.
+fn desc_sig_of(draw: &ForwardedDraw) -> Option<DescriptorSig> {
+    let g = draw.geometry.as_ref()?;
+    let ubo_binding = g.uniform.as_ref().map(|u| u.binding);
+    let image_binding = g.texture.as_ref().map(|_| g.tex_binding);
+    if ubo_binding.is_none() && image_binding.is_none() {
+        None
+    } else {
+        Some(DescriptorSig { ubo_binding, image_binding })
+    }
 }
 
 /// Pack a `ForwardedDraw`'s depth state into the [`PipelineKey`] `depth_key` field. Returns
@@ -787,6 +823,8 @@ impl GeometryGpu {
 /// descriptor pool + set (binding 0 = image, binding 1 = sampler). The staging→image copy + layout
 /// transitions are recorded into the frame's command buffer (before the render pass); everything is
 /// freed after the submit fence. Per submit (texture content varies); a by-id cache is a follow-up.
+/// The descriptor pool + set no longer live here — they live in [`FrameDescriptors`] so a UBO and a
+/// texture can share one set (Phase-2c UBO composition).
 struct TextureGpu {
     staging: vk::Buffer,
     staging_mem: vk::DeviceMemory,
@@ -794,8 +832,6 @@ struct TextureGpu {
     image_mem: vk::DeviceMemory,
     view: vk::ImageView,
     sampler: vk::Sampler,
-    pool: vk::DescriptorPool,
-    set: vk::DescriptorSet,
     width: u32,
     height: u32,
 }
@@ -804,13 +840,56 @@ impl TextureGpu {
     /// # Safety
     /// `dev` must be the owning device and no submit referencing these objects may still be in flight.
     unsafe fn destroy(&self, dev: &ash::Device) {
-        dev.destroy_descriptor_pool(self.pool, None); // frees the set
         dev.destroy_sampler(self.sampler, None);
         dev.destroy_image_view(self.view, None);
         dev.destroy_image(self.image, None);
         dev.free_memory(self.image_mem, None);
         dev.destroy_buffer(self.staging, None);
         dev.free_memory(self.staging_mem, None);
+    }
+}
+
+/// Phase-2c: the guest's uniform buffer uploaded to a host-visible+coherent `UNIFORM_BUFFER` for **one**
+/// submit — the forwarded bytes memcpy straight in (no staging/copy; per submit, a by-id cache is a
+/// follow-up). Freed after the submit fence.
+struct UniformGpu {
+    buffer: vk::Buffer,
+    mem: vk::DeviceMemory,
+}
+
+impl UniformGpu {
+    /// # Safety
+    /// `dev` must be the owning device and no submit referencing the buffer may still be in flight.
+    unsafe fn destroy(&self, dev: &ash::Device) {
+        dev.destroy_buffer(self.buffer, None);
+        dev.free_memory(self.mem, None);
+    }
+}
+
+/// Phase-2c: descriptor set 0 for **one** submit — a pool, the single set allocated from it, and the
+/// resources written into that set (a UBO and/or a texture at their declared bindings). Composing both
+/// into one set is what lets a real app use per-frame uniforms AND a texture at once. Destroyed after
+/// the submit fence (the pool frees the set; the buffer/image objects are freed too).
+struct FrameDescriptors {
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    ubo: Option<UniformGpu>,
+    tex: Option<TextureGpu>,
+}
+
+impl FrameDescriptors {
+    /// # Safety
+    /// `dev` must be the owning device and no submit referencing these objects may still be in flight.
+    unsafe fn destroy(&self, dev: &ash::Device) {
+        if self.pool != vk::DescriptorPool::null() {
+            dev.destroy_descriptor_pool(self.pool, None); // frees the set
+        }
+        if let Some(u) = &self.ubo {
+            u.destroy(dev);
+        }
+        if let Some(t) = &self.tex {
+            t.destroy(dev);
+        }
     }
 }
 
@@ -1028,7 +1107,7 @@ impl HostGpu {
             ext_mem_host,
             host_ptr_align,
             guest_imports: Mutex::new(HashMap::new()),
-            tex_set_layout: Mutex::new(vk::DescriptorSetLayout::null()),
+            desc_set_layouts: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1221,10 +1300,9 @@ impl HostGpu {
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(pc_size)];
-        let set_layouts: Vec<vk::DescriptorSetLayout> = if has_texture_of(draw) {
-            vec![self.tex_set_layout()?]
-        } else {
-            Vec::new()
+        let set_layouts: Vec<vk::DescriptorSetLayout> = match desc_sig_of(draw) {
+            Some(sig) => vec![self.desc_set_layout(sig)?],
+            None => Vec::new(),
         };
         let mut layout_ci = vk::PipelineLayoutCreateInfo::default();
         if pc_size > 0 {
@@ -1379,7 +1457,7 @@ impl HostGpu {
             vinput_hash: hash_vinput(draw),
             depth_key,
             pc_size: push_const_size_of(draw),
-            has_texture: has_texture_of(draw),
+            desc_sig: desc_sig_of(draw),
         };
         let mut cache = self.obj_cache.lock().unwrap_or_else(|e| e.into_inner());
         // Fail-closed bound before inserting anything new.
@@ -2203,13 +2281,17 @@ impl HostGpu {
             }
             _ => None,
         };
-        let tex_gpu = match draw.geometry.as_ref().and_then(|g| g.texture.as_ref()) {
-            Some(t) => {
-                let sl = self.tex_set_layout()?;
-                match self.upload_texture(t, sl) {
-                    Ok(tg) => Some(tg),
+        // Phase-2c: build descriptor set 0 (a UBO and/or a texture, composed into one set) for this
+        // submit. A failure frees the already-uploaded mesh before bailing (no leak).
+        let descs = match desc_sig_of(draw) {
+            Some(sig) => {
+                let g = draw.geometry.as_ref().expect("desc_sig_of ⇒ geometry present");
+                let built = self
+                    .desc_set_layout(sig)
+                    .and_then(|sl| self.build_frame_descriptors(g.uniform.as_ref(), g.texture.as_ref(), g.tex_binding, sl));
+                match built {
+                    Ok(d) => Some(d),
                     Err(e) => {
-                        // Free the already-uploaded mesh before bailing (no leak).
                         if let Some(gg) = geom_gpu {
                             unsafe { gg.destroy(dev) };
                         }
@@ -2221,35 +2303,47 @@ impl HostGpu {
         };
 
         // Single submit thread per device process + fence-wait before return ⇒ no frame N+1 vs. N
-        // hazard on the reused objects; reset the pool + fence and re-record for this frame.
-        self.record_forwarded_frame(
-            ss,
-            render_pass,
-            pipeline,
-            layout,
-            width,
-            height,
-            bg,
-            draw,
-            geom_gpu.as_ref(),
-            tex_gpu.as_ref(),
-            ss.readback,
-        )?;
-        let t_record = bd.map(|_| Instant::now());
-        unsafe {
-            dev.reset_fences(&[ss.fence])?;
-            let cmds = [ss.cmd];
-            let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
-            dev.queue_submit(self.queue, &submit, ss.fence)?;
-        }
-        self.wait_fence(ss.fence)?;
-        // The submit fence is signaled ⇒ the draws no longer reference the mesh/texture; free them.
+        // hazard on the reused objects; reset the pool + fence and re-record for this frame. The
+        // record/submit/wait steps are fallible (device-lost / OOM); on any failure the per-submit
+        // mesh + descriptors (their own VkBuffer/VkDeviceMemory/pool/image) must be freed before we
+        // bail — they have no Drop impl (manual `destroy`), so an early `?` return would otherwise leak
+        // them on the long-lived tenant-shared device. Fold the fallible steps into one result so a
+        // single cleanup arm covers all three exits.
+        let mut t_record = None;
+        let submit_result: R<()> = (|| {
+            self.record_forwarded_frame(
+                ss,
+                render_pass,
+                pipeline,
+                layout,
+                width,
+                height,
+                bg,
+                draw,
+                geom_gpu.as_ref(),
+                descs.as_ref(),
+                ss.readback,
+            )?;
+            t_record = bd.map(|_| Instant::now());
+            unsafe {
+                dev.reset_fences(&[ss.fence])?;
+                let cmds = [ss.cmd];
+                let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+                dev.queue_submit(self.queue, &submit, ss.fence)?;
+            }
+            self.wait_fence(ss.fence)?;
+            Ok(())
+        })();
+        // Whether the submit succeeded or failed, the fence is no longer pending on our objects (on
+        // success it is signaled; on failure the submit never referenced them or the wait returned) ⇒
+        // free the per-submit mesh + descriptors exactly once, then propagate any error.
         if let Some(gg) = geom_gpu {
             unsafe { gg.destroy(dev) };
         }
-        if let Some(tg) = tex_gpu {
-            unsafe { tg.destroy(dev) };
+        if let Some(d) = descs {
+            unsafe { d.destroy(dev) };
         }
+        submit_result?;
         let t_gpu = bd.map(|_| Instant::now());
         // HOST_CACHED readback: invalidate so the GPU's writes are visible before the (cached, fast)
         // read — reading write-combined/uncached memory was ~72% of the hot path. Coherent memory
@@ -2388,41 +2482,71 @@ impl HostGpu {
         Ok(GeometryGpu { vbo, vbo_mem, ibo })
     }
 
-    /// Phase-2c: the fixed one-texture descriptor-set layout (binding 0 = SAMPLED_IMAGE, binding 1 =
-    /// SAMPLER, FRAGMENT), built lazily on first textured submit and reused (content-independent).
-    fn tex_set_layout(&self) -> R<vk::DescriptorSetLayout> {
-        let mut guard = self.tex_set_layout.lock().unwrap_or_else(|e| e.into_inner());
-        if *guard != vk::DescriptorSetLayout::null() {
-            return Ok(*guard);
+    /// Phase-2c: the descriptor-set-0 layout for a [`DescriptorSig`], built dynamically from the present
+    /// resources at their declared bindings (UBO@`ubo_binding` VERTEX|FRAGMENT; SAMPLED_IMAGE@`image_binding`
+    /// + SAMPLER@`image_binding+1` FRAGMENT) and cached by signature. `DescriptorSig{None, Some(0)}` rebuilds
+    /// the exact old fixed texture layout (image@0/sampler@1), so texture-only pipelines are unchanged.
+    fn desc_set_layout(&self, sig: DescriptorSig) -> R<vk::DescriptorSetLayout> {
+        let mut guard = self.desc_set_layouts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sl) = guard.get(&sig) {
+            return Ok(*sl);
         }
-        let bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-        ];
+        // Bound the cache: a well-behaved app uses a handful of signatures; an adversarial guest sending
+        // endless unique (ubo_binding, image_binding) pairs must not grow this without limit. Evict-all
+        // past the cap (mirrors the pipeline-cache posture) — layouts rebuild on demand.
+        const MAX_DESC_SET_LAYOUTS: usize = 64;
+        if guard.len() >= MAX_DESC_SET_LAYOUTS {
+            for (_, sl) in guard.drain() {
+                unsafe { self.device.destroy_descriptor_set_layout(sl, None) };
+            }
+        }
+        let mut bindings: Vec<vk::DescriptorSetLayoutBinding> = Vec::new();
+        if let Some(b) = sig.ubo_binding {
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            );
+        }
+        if let Some(b) = sig.image_binding {
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            );
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b + 1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            );
+        }
         let sl = unsafe {
             self.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
                 None,
             )?
         };
-        *guard = sl;
+        guard.insert(sig, sl);
         Ok(sl)
     }
 
     /// Phase-2c: upload `tex`'s RGBA8 pixels into a per-submit [`TextureGpu`] — a filled host-visible
     /// staging buffer, a device-local sampled image (still UNDEFINED; the record path copies + layout-
-    /// transitions it), a view, a sampler from `tex.sampler`, and a descriptor set (image@0, sampler@1)
-    /// allocated against `set_layout`. Frees every partial allocation on any error. Destroyed after the
-    /// submit fence.
-    fn upload_texture(&self, tex: &Texture, set_layout: vk::DescriptorSetLayout) -> R<TextureGpu> {
+    /// transitions it), a view, and a sampler from `tex.sampler`. Writes the image@`image_binding` +
+    /// sampler@`image_binding + 1` descriptors into the caller-provided `set` (which may also hold a
+    /// UBO). Frees every partial allocation on any error. Destroyed after the submit fence.
+    fn upload_texture_into(
+        &self,
+        tex: &Texture,
+        set: vk::DescriptorSet,
+        image_binding: u32,
+    ) -> R<TextureGpu> {
         let dev = &self.device;
         let (w, h) = (tex.width, tex.height);
         let expected = (w as usize).checked_mul(h as usize).and_then(|p| p.checked_mul(4));
@@ -2430,14 +2554,13 @@ impl HostGpu {
             return Err(format!("bad texture {w}x{h} ({} bytes)", tex.rgba.len()).into());
         }
         // Track partial allocations so any early return frees exactly what was built (no leak on the
-        // long-lived shared device). Handles are added as they succeed; `bail` tears them down.
+        // long-lived shared device). The pool/set are the caller's (build_frame_descriptors) — not ours.
         let mut staging = vk::Buffer::null();
         let mut staging_mem = vk::DeviceMemory::null();
         let mut image = vk::Image::null();
         let mut image_mem = vk::DeviceMemory::null();
         let mut view = vk::ImageView::null();
         let mut sampler = vk::Sampler::null();
-        let mut pool = vk::DescriptorPool::null();
         let mut build = || -> R<TextureGpu> {
             unsafe {
                 // Staging buffer (host-visible|coherent), filled with the pixels.
@@ -2509,19 +2632,7 @@ impl HostGpu {
                     None,
                 )?;
 
-                // Descriptor pool + set (image@0, sampler@1), updated to point at the view + sampler.
-                let sizes = [
-                    vk::DescriptorPoolSize::default().ty(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(1),
-                    vk::DescriptorPoolSize::default().ty(vk::DescriptorType::SAMPLER).descriptor_count(1),
-                ];
-                pool = dev.create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes),
-                    None,
-                )?;
-                let layouts = [set_layout];
-                let set = dev.allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts),
-                )?[0];
+                // Write image@image_binding + sampler@image_binding+1 into the shared set.
                 let img_info = [vk::DescriptorImageInfo::default()
                     .image_view(view)
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
@@ -2529,36 +2640,22 @@ impl HostGpu {
                 let writes = [
                     vk::WriteDescriptorSet::default()
                         .dst_set(set)
-                        .dst_binding(0)
+                        .dst_binding(image_binding)
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                         .image_info(&img_info),
                     vk::WriteDescriptorSet::default()
                         .dst_set(set)
-                        .dst_binding(1)
+                        .dst_binding(image_binding + 1)
                         .descriptor_type(vk::DescriptorType::SAMPLER)
                         .image_info(&smp_info),
                 ];
                 dev.update_descriptor_sets(&writes, &[]);
-                Ok(TextureGpu {
-                    staging,
-                    staging_mem,
-                    image,
-                    image_mem,
-                    view,
-                    sampler,
-                    pool,
-                    set,
-                    width: w,
-                    height: h,
-                })
+                Ok(TextureGpu { staging, staging_mem, image, image_mem, view, sampler, width: w, height: h })
             }
         };
         build().map_err(|e| {
             // Free whatever was built (skip nulls), in dependency-safe order.
             unsafe {
-                if pool != vk::DescriptorPool::null() {
-                    dev.destroy_descriptor_pool(pool, None);
-                }
                 if sampler != vk::Sampler::null() {
                     dev.destroy_sampler(sampler, None);
                 }
@@ -2576,6 +2673,123 @@ impl HostGpu {
                 }
                 if staging_mem != vk::DeviceMemory::null() {
                     dev.free_memory(staging_mem, None);
+                }
+            }
+            e
+        })
+    }
+
+    /// Phase-2c: build descriptor set 0 for one submit from the present resources — a UBO and/or a
+    /// texture, composed into a SINGLE `VkDescriptorSet` at their declared bindings (what lets a real
+    /// app use per-frame uniforms AND a texture at once). Creates a pool sized for the present types,
+    /// allocates one set from `set_layout` (built for the matching [`DescriptorSig`]), uploads+writes
+    /// the UBO (host-visible|coherent `UNIFORM_BUFFER` at `uniform.binding`) and/or the texture
+    /// (image@`image_binding`, sampler@`image_binding + 1`). Frees partials on any error.
+    fn build_frame_descriptors(
+        &self,
+        uniform: Option<&UniformBlock>,
+        tex: Option<&Texture>,
+        image_binding: u32,
+        set_layout: vk::DescriptorSetLayout,
+    ) -> R<FrameDescriptors> {
+        let dev = &self.device;
+        // Reject a degenerate/oversized UBO before allocating anything (mirrors the device decode cap).
+        if let Some(u) = uniform {
+            if u.bytes.is_empty() || u.bytes.len() > 65536 {
+                return Err(format!("bad uniform block ({} bytes)", u.bytes.len()).into());
+            }
+        }
+        let mut pool = vk::DescriptorPool::null();
+        let mut ubo_buf = vk::Buffer::null();
+        let mut ubo_mem = vk::DeviceMemory::null();
+        let mut build = || -> R<FrameDescriptors> {
+            unsafe {
+                let mut sizes: Vec<vk::DescriptorPoolSize> = Vec::new();
+                if uniform.is_some() {
+                    sizes.push(
+                        vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                            .descriptor_count(1),
+                    );
+                }
+                if tex.is_some() {
+                    sizes.push(
+                        vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                            .descriptor_count(1),
+                    );
+                    sizes.push(
+                        vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::SAMPLER)
+                            .descriptor_count(1),
+                    );
+                }
+                pool = dev.create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes),
+                    None,
+                )?;
+                let layouts = [set_layout];
+                let set = dev.allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts),
+                )?[0];
+
+                // UBO first (nothing after it can fail before the texture, which self-cleans on error).
+                let ubo = if let Some(u) = uniform {
+                    ubo_buf = dev.create_buffer(
+                        &vk::BufferCreateInfo::default()
+                            .size(u.bytes.len() as u64)
+                            .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+                            .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                        None,
+                    )?;
+                    let req = dev.get_buffer_memory_requirements(ubo_buf);
+                    ubo_mem = dev.allocate_memory(
+                        &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(
+                            self.find_mem(
+                                req.memory_type_bits,
+                                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                            )?,
+                        ),
+                        None,
+                    )?;
+                    dev.bind_buffer_memory(ubo_buf, ubo_mem, 0)?;
+                    let ptr = dev.map_memory(ubo_mem, 0, u.bytes.len() as u64, vk::MemoryMapFlags::empty())?;
+                    std::ptr::copy_nonoverlapping(u.bytes.as_ptr(), ptr as *mut u8, u.bytes.len());
+                    dev.unmap_memory(ubo_mem);
+                    let binfo = [vk::DescriptorBufferInfo::default()
+                        .buffer(ubo_buf)
+                        .offset(0)
+                        .range(u.bytes.len() as u64)];
+                    let writes = [vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(u.binding)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .buffer_info(&binfo)];
+                    dev.update_descriptor_sets(&writes, &[]);
+                    Some(UniformGpu { buffer: ubo_buf, mem: ubo_mem })
+                } else {
+                    None
+                };
+
+                // Texture last — upload_texture_into writes into the shared set and self-cleans on error.
+                let tgpu = match tex {
+                    Some(t) => Some(self.upload_texture_into(t, set, image_binding)?),
+                    None => None,
+                };
+
+                Ok(FrameDescriptors { pool, set, ubo, tex: tgpu })
+            }
+        };
+        build().map_err(|e| {
+            unsafe {
+                if ubo_buf != vk::Buffer::null() {
+                    dev.destroy_buffer(ubo_buf, None);
+                }
+                if ubo_mem != vk::DeviceMemory::null() {
+                    dev.free_memory(ubo_mem, None);
+                }
+                if pool != vk::DescriptorPool::null() {
+                    dev.destroy_descriptor_pool(pool, None); // frees the set
                 }
             }
             e
@@ -2600,7 +2814,7 @@ impl HostGpu {
         bg: [f32; 4],
         draw: &ForwardedDraw,
         geom: Option<&GeometryGpu>,
-        tex: Option<&TextureGpu>,
+        descs: Option<&FrameDescriptors>,
         dst: vk::Buffer,
     ) -> R<()> {
         let dev = &self.device;
@@ -2613,8 +2827,9 @@ impl HostGpu {
             )?;
             // Phase-2c: upload the texture BEFORE the render pass — transition UNDEFINED→TRANSFER_DST,
             // copy staging→image, transition TRANSFER_DST→SHADER_READ_ONLY so the fragment shader can
-            // sample it. Same command buffer as the render (one submit), so no extra sync needed.
-            if let Some(t) = tex {
+            // sample it. Same command buffer as the render (one submit), so no extra sync needed. (The
+            // UBO needs no barrier/copy — it is host-visible|coherent, written at descriptor-build time.)
+            if let Some(t) = descs.and_then(|d| d.tex.as_ref()) {
                 let to_dst = vk::ImageMemoryBarrier::default()
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -2686,14 +2901,14 @@ impl HostGpu {
                 vk::SubpassContents::INLINE,
             );
             dev.cmd_bind_pipeline(ss.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            // Phase-2c: bind the texture descriptor set (set 0) so the fragment shader can sample it.
-            if let Some(t) = tex {
+            // Phase-2c: bind descriptor set 0 (UBO and/or texture, composed) so the shaders read them.
+            if let Some(d) = descs {
                 dev.cmd_bind_descriptor_sets(
                     ss.cmd,
                     vk::PipelineBindPoint::GRAPHICS,
                     layout,
                     0,
-                    &[t.set],
+                    &[d.set],
                     &[],
                 );
             }
@@ -3481,10 +3696,10 @@ impl Drop for HostGpu {
             // Fix D: free the imported guest-scanout buffers/memory before the device (freeing the
             // VkDeviceMemory does NOT unmap the guest RAM — the import doesn't own it).
             self.forget_all_guest_imports();
-            // Phase-2c: free the cached texture descriptor-set layout, if it was built.
-            let tsl = *self.tex_set_layout.lock().unwrap_or_else(|e| e.into_inner());
-            if tsl != vk::DescriptorSetLayout::null() {
-                self.device.destroy_descriptor_set_layout(tsl, None);
+            // Phase-2c: free every cached descriptor-set layout built for a DescriptorSig.
+            let mut layouts = self.desc_set_layouts.lock().unwrap_or_else(|e| e.into_inner());
+            for (_, sl) in layouts.drain() {
+                self.device.destroy_descriptor_set_layout(sl, None);
             }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -3963,6 +4178,8 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 depth: None,
                 push_constants: &[],
                 texture: None,
+                tex_binding: 0,
+                uniform: None,
             }),
         };
         let (w, h) = (256u32, 256u32);
@@ -4078,6 +4295,8 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 depth: None,
                 push_constants: &[],
                 texture: None,
+                tex_binding: 0,
+                uniform: None,
             }),
         };
         let bg = [0.0, 0.0, 0.0, 1.0];
@@ -4165,6 +4384,8 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     depth,
                     push_constants: &[],
                     texture: None,
+                    tex_binding: 0,
+                    uniform: None,
                 }),
             };
             gpu.render_forwarded(w, h, bg, &draw).expect("depth render").pixel(w / 2, h / 2)
@@ -4276,6 +4497,8 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     depth: None,
                     push_constants: m,
                     texture: None,
+                    tex_binding: 0,
+                    uniform: None,
                 }),
             };
             gpu.render_forwarded(w, h, bg, &draw).expect("transform render")
@@ -4378,6 +4601,8 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     rgba: &tex_px,
                     sampler: SamplerCfg { linear: false, repeat: false },
                 }),
+                tex_binding: 0,
+                uniform: None,
             }),
         };
         let (w, h) = (128u32, 128u32);
@@ -4401,5 +4626,208 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
             );
         }
         eprintln!("forwarded_texture_samples_onto_a_quad: OK (r={red} g={green} b={blue} w={white})");
+    }
+
+    /// Phase-2c UBO: a `var<uniform>` block reaches the VERTEX stage — the shader offsets each vertex
+    /// by the UBO's xy, so a +0.5 NDC x-offset moves the triangle right by ~0.25·w vs a zero offset.
+    /// Proves the host builds a UNIFORM_BUFFER descriptor (VERTEX|FRAGMENT), uploads the bytes, and
+    /// binds it — the piece a real game needs for per-frame matrices.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_uniform_only_offsets_geometry() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let vs = compile_wgsl(
+            "@group(0) @binding(0) var<uniform> u: vec4<f32>;\n\
+             struct VOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };\n\
+             @vertex fn main(@location(0) p: vec2<f32>, @location(1) c: vec3<f32>) -> VOut {\n\
+               return VOut(vec4<f32>(p + u.xy, 0.0, 1.0), c);\n}",
+            naga::ShaderStage::Vertex,
+        );
+        let fs = compile_wgsl(
+            "@fragment fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {\n\
+               return vec4<f32>(c, 1.0);\n}",
+            naga::ShaderStage::Fragment,
+        );
+        use infinigpu_abi::wire::vk_vformat as V;
+        let attrs = [
+            VertexAttr { location: 0, format: V::R32G32_SFLOAT, offset: 0 },
+            VertexAttr { location: 1, format: V::R32G32B32_SFLOAT, offset: 8 },
+        ];
+        // A small red triangle (pos vec2 + color vec3), stride 20.
+        let tri: [[f32; 5]; 3] =
+            [[0.0, -0.3, 1.0, 0.0, 0.0], [-0.3, 0.3, 1.0, 0.0, 0.0], [0.3, 0.3, 1.0, 0.0, 0.0]];
+        let verts: Vec<u8> = tri.iter().flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes())).collect();
+        let draws = [DrawCmd { count: 3, instance_count: 1, first: 0, vertex_offset: 0, viewport: [0.0; 4] }];
+        let (w, h) = (128u32, 128u32);
+        let bg = [0.0, 0.0, 0.0, 1.0];
+
+        let centroid_x = |off: [f32; 4]| -> f32 {
+            let ubo: Vec<u8> = off.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let draw = ForwardedDraw {
+                vertex_spirv: &vs,
+                vertex_entry: c"main",
+                fragment_spirv: &fs,
+                fragment_entry: c"main",
+                vertex_count: 0,
+                topology: 0,
+                geometry: Some(Geometry {
+                    vertex_data: &verts,
+                    vertex_stride: 20,
+                    attrs: &attrs,
+                    index_data: &[],
+                    index_u32: false,
+                    draws: &draws,
+                    depth: None,
+                    push_constants: &[],
+                    texture: None,
+                    tex_binding: 0,
+                    uniform: Some(UniformBlock { binding: 0, bytes: &ubo }),
+                }),
+            };
+            let frame = gpu.render_forwarded(w, h, bg, &draw).expect("uniform render");
+            let (mut sum, mut n) = (0f64, 0f64);
+            for (i, p) in frame.rgba.chunks_exact(4).enumerate() {
+                if p[0] > 128 {
+                    sum += (i as u32 % w) as f64;
+                    n += 1.0;
+                }
+            }
+            assert!(n > 50.0, "the triangle should light many pixels ({n})");
+            (sum / n) as f32
+        };
+        let cx0 = centroid_x([0.0, 0.0, 0.0, 0.0]);
+        let cx_right = centroid_x([0.5, 0.0, 0.0, 0.0]);
+        let shift = cx_right - cx0;
+        let expected = 0.25 * w as f32; // +0.5 NDC = a quarter of the width in pixels
+        assert!(
+            (shift - expected).abs() < w as f32 * 0.06,
+            "UBO x-offset must move the triangle right ~{expected}px; got {shift}px \
+             (cx0={cx0}, cxR={cx_right}) — the UBO didn't reach the vertex stage"
+        );
+        eprintln!("forwarded_uniform_only_offsets_geometry: OK (shift={shift}px ~ {expected}px)");
+    }
+
+    /// Phase-2c composition: a UBO **and** a texture in ONE descriptor set at distinct bindings — the
+    /// gate for real textured, transformed apps. The VS offsets by a UBO (binding 0); the FS samples a
+    /// texture (binding 1) + sampler (binding 2). Asserts BOTH work at once: all four texel colours
+    /// appear (texture composed) AND a +0.5 x-offset shifts the textured quad right (UBO reached VERTEX).
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_uniform_and_texture_compose() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let vs = compile_wgsl(
+            "@group(0) @binding(0) var<uniform> u: vec4<f32>;\n\
+             struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };\n\
+             @vertex fn main(@location(0) p: vec2<f32>, @location(1) uv: vec2<f32>) -> VOut {\n\
+               return VOut(vec4<f32>(p + u.xy, 0.0, 1.0), uv);\n}",
+            naga::ShaderStage::Vertex,
+        );
+        let fs = compile_wgsl(
+            "@group(0) @binding(1) var tex: texture_2d<f32>;\n\
+             @group(0) @binding(2) var samp: sampler;\n\
+             @fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {\n\
+               return textureSample(tex, samp, uv);\n}",
+            naga::ShaderStage::Fragment,
+        );
+        use infinigpu_abi::wire::vk_vformat as V;
+        let attrs = [
+            VertexAttr { location: 0, format: V::R32G32_SFLOAT, offset: 0 },
+            VertexAttr { location: 1, format: V::R32G32_SFLOAT, offset: 8 },
+        ];
+        let quad: [[f32; 4]; 4] =
+            [[-1.0, -1.0, 0.0, 0.0], [1.0, -1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0], [-1.0, 1.0, 0.0, 1.0]];
+        let verts: Vec<u8> = quad.iter().flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes())).collect();
+        let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+        let index_data: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let tex_px: [u8; 16] = [
+            255, 0, 0, 255, 0, 255, 0, 255, // red, green
+            0, 0, 255, 255, 255, 255, 255, 255, // blue, white
+        ];
+        let draws = [DrawCmd { count: 6, instance_count: 1, first: 0, vertex_offset: 0, viewport: [0.0; 4] }];
+        let (w, h) = (128u32, 128u32);
+        let bg = [0.0, 0.0, 0.0, 1.0];
+
+        let render = |off: [f32; 4]| -> Frame {
+            let ubo: Vec<u8> = off.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let draw = ForwardedDraw {
+                vertex_spirv: &vs,
+                vertex_entry: c"main",
+                fragment_spirv: &fs,
+                fragment_entry: c"main",
+                vertex_count: 0,
+                topology: 0,
+                geometry: Some(Geometry {
+                    vertex_data: &verts,
+                    vertex_stride: 16,
+                    attrs: &attrs,
+                    index_data: &index_data,
+                    index_u32: false,
+                    draws: &draws,
+                    depth: None,
+                    push_constants: &[],
+                    texture: Some(Texture {
+                        width: 2,
+                        height: 2,
+                        rgba: &tex_px,
+                        sampler: SamplerCfg { linear: false, repeat: false },
+                    }),
+                    tex_binding: 1, // image@1, sampler@2 — composes with the UBO@0
+                    uniform: Some(UniformBlock { binding: 0, bytes: &ubo }),
+                }),
+            };
+            gpu.render_forwarded(w, h, bg, &draw).expect("composed render")
+        };
+        let centroid_x = |f: &Frame| -> f32 {
+            let (mut sum, mut n) = (0f64, 0f64);
+            for (i, p) in f.rgba.chunks_exact(4).enumerate() {
+                // Any non-background (textured) pixel.
+                if p[0] as u16 + p[1] as u16 + p[2] as u16 > 40 {
+                    sum += (i as u32 % w) as f64;
+                    n += 1.0;
+                }
+            }
+            (sum / n.max(1.0)) as f32
+        };
+
+        let ctrl = render([0.0, 0.0, 0.0, 0.0]);
+        // Texture composed with the UBO: all four texel colours appear in the un-offset render.
+        let (mut red, mut green, mut blue, mut white) = (0u32, 0u32, 0u32, 0u32);
+        for p in ctrl.rgba.chunks_exact(4) {
+            let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+            red += (r > 180 && g < 60 && b < 60) as u32;
+            green += (g > 180 && r < 60 && b < 60) as u32;
+            blue += (b > 180 && r < 60 && g < 60) as u32;
+            white += (r > 180 && g > 180 && b > 180) as u32;
+        }
+        let quad_px = (w * h / 4) as u32;
+        for (name, n) in [("red", red), ("green", green), ("blue", blue), ("white", white)] {
+            assert!(
+                n > quad_px / 2,
+                "texel {name} must fill ~a quadrant ({n}/{quad_px}) — the texture did not compose with the UBO"
+            );
+        }
+        // UBO reached the VERTEX stage while a texture was bound: the textured region shifts right.
+        let shifted = render([0.5, 0.0, 0.0, 0.0]);
+        let shift = centroid_x(&shifted) - centroid_x(&ctrl);
+        assert!(
+            shift > w as f32 * 0.10,
+            "UBO x-offset must shift the textured quad right; got {shift}px — the UBO didn't reach the \
+             vertex stage while a texture was bound in the same set"
+        );
+        eprintln!(
+            "forwarded_uniform_and_texture_compose: OK (shift={shift}px, colours r={red} g={green} b={blue} w={white})"
+        );
     }
 }

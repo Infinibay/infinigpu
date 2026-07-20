@@ -50,7 +50,12 @@ pub const ABI_MAJOR: u16 = 0;
 /// host (it would misparse the trailing sections); gate on `negotiated_minor >= 9` for push constants.
 /// v10 grew the tail again by `tex_count` (52→56 B) + a `TextureDescWire` array + a trailing RGBA8
 /// pixel region — sampled textures via a descriptor set (Phase-2c). Gate on `negotiated_minor >= 10`.
-pub const ABI_MINOR: u16 = 10;
+/// v11 grew the tail by `ubo_len` + `ubo_binding` + `tex_binding` (56→68 B) + a UBO byte blob (after
+/// push-const, before texpix) — a uniform buffer composable with sampled textures. The host builds the
+/// descriptor-set-0 layout dynamically from the present resources at their declared bindings (UBO@`ubo_binding`
+/// VERTEX|FRAGMENT, image@`tex_binding`, sampler@`tex_binding+1`); `tex_binding == 0` keeps 0.10 texture-only
+/// command lists byte-identical. Gate on `negotiated_minor >= 11` before sending a UBO command list.
+pub const ABI_MINOR: u16 = 11;
 
 /// Packed `ABI_VERSION` register value (`major << 16 | minor`).
 pub const fn abi_version() -> u32 {
