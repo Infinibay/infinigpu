@@ -96,10 +96,31 @@ fixes the correctness landmines (B1) they expose.
   from two textures at bindings 0/1 and 2/3). **Scope:** N images in ONE set at consecutive `2i` bindings
   (the common material layout); multiple descriptor SETS and non-consecutive/mixed-format bindings remain a
   follow-up.
+- **WSI — VK_KHR_surface + VK_KHR_swapchain — DONE (software present; wiring verified in-shell).** This is
+  the presentation half, orthogonal to the forwarded-render phases above but the actual **#1 gate to a real
+  game**: without it the ICD advertised no surface/swapchain extensions, so a DXVK/VKD3D app died at
+  `vkCreateInstance`/`vkCreateDevice` with `VK_ERROR_EXTENSION_NOT_PRESENT` before drawing. The driver is now
+  wired into Mesa's common WSI (the lavapipe recipe): `wsi_device_init` with `.sw_device=true` +
+  `wants_linear=true` (the CPU-copy/no-blit path — the common layer allocates each swapchain image as a
+  LINEAR host-visible mapped image via the ICD's OWN entrypoints and memcpy's from that map at present, so
+  there is **zero** hand-written present code — the infinigpu image/memory model already satisfies every
+  obligation). Advertises `KHR_surface` + `KHR_get_surface_capabilities2` + `EXT_headless_surface`
+  (+ `KHR_display` when the KMS backend is built); merges the three `wsi_*_entrypoints` tables; honors the
+  WSI deferred-alloc structs in CreateImage/BindImageMemory2. `display_fd` = the infinigpu primary node, so
+  in a guest `VK_KHR_display` can page-flip a swapchain image onto the infinigpu scanout (the frame the host
+  encodes+streams) — the native VDI present path — but only when the app holds DRM master (gamescope /
+  direct-KMS); otherwise wsi_display self-disables and reports the display surface unsupported (honest, never
+  closes our fd). `infinigpu_wsi_test.c` runs the whole path headlessly on the dev host: instance + both
+  surface extensions → surface → device(`KHR_swapchain`) → swapchain(4 images) → acquire → present all
+  succeed. Adversarially reviewed (6 lenses + verify): malloc-fallback production-unreachability, dispatch
+  merges, image aliasing, extension advertisement all clean; one harness false-pass fixed. **Present-to-SCREEN
+  in a real guest (KMS page-flip / an in-guest compositor) is owner-validated.** Follow-up: a render-target-
+  format field so a BGRA/sRGB swapchain presents with correct channel order / gamma (today the host renders
+  R8G8B8A8; the recon found this is the #3 gap).
 - **Next up:** SSBO (storage buffers) + multiple descriptor sets; MSAA
-  (2d-A5 multisample); Phase 2a (format A6 / loadOp A8); EDS3 dynamic blend + per-draw state if a real game
-  needs them. Then the owner runtime render-validation in a real GPU VM (below) — the one link not yet
-  exercised end-to-end.
+  (2d-A5 multisample); Phase 2a (format A6 / loadOp A8) — now doubly relevant since a swapchain is BGRA/sRGB;
+  EDS3 dynamic blend + per-draw state if a real game needs them. Then the owner runtime render-validation in a
+  real GPU VM (below) — the one link not yet exercised end-to-end.
 
 The rest of this doc is the original design; the per-phase wire/host/test shape it describes is what the landed
 phases implemented.
