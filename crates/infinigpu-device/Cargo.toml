@@ -44,3 +44,6 @@ path = "src/bin/broker_demo.rs"
 [[bin]]
 name = "infinigpu-jailed-replay-demo"
 path = "src/bin/jailed_replay_demo.rs"
+
+[dev-dependencies]
+naga = { version = "30.0.0", default-features = false, features = ["wgsl-in", "spv-out"] }

@@ -28,3 +28,6 @@ path = "src/bin/replay_server.rs"
 [[bin]]
 name = "infinigpu-replay-triangle"
 path = "src/bin/triangle.rs"
+
+[dev-dependencies]
+naga = { version = "30.0.0", default-features = false, features = ["wgsl-in", "spv-out"] }

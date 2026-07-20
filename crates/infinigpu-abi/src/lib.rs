@@ -73,6 +73,14 @@ mod layout_asserts {
     // entry-name strings follow it in the payload (variable length).
     const _: () = assert!(size_of::<ForwardedDrawTail>() == 24);
     const _: () = assert!(align_of::<ForwardedDrawTail>() == 4);
+    // ForwardedCmdListTail (vk_op::FORWARDED_CMDLIST): 12×u32 = 48, 4-byte aligned. Its trailing
+    // VertexAttrWire[] / DrawCmdWire[] arrays are 4-multiples so they stay 4-aligned after the tail.
+    const _: () = assert!(size_of::<ForwardedCmdListTail>() == 48);
+    const _: () = assert!(align_of::<ForwardedCmdListTail>() == 4);
+    const _: () = assert!(size_of::<VertexAttrWire>() == 12);
+    const _: () = assert!(align_of::<VertexAttrWire>() == 4);
+    const _: () = assert!(size_of::<DrawCmdWire>() == 32);
+    const _: () = assert!(align_of::<DrawCmdWire>() == 4);
     const _: () = assert!(size_of::<ScanoutPresent>() == 24);
     const _: () = assert!(offset_of!(ScanoutPresent, scanout_addr) == 16);
     // ScanoutPresentDamaged is a ScanoutPresent superset (same prefix + scanout_addr@16)
@@ -111,7 +119,7 @@ mod tests {
             abi_version(),
             (u32::from(ABI_MAJOR) << 16) | u32::from(ABI_MINOR)
         );
-        assert_eq!(abi_version(), 0x0000_0006);
+        assert_eq!(abi_version(), 0x0000_0008);
     }
 
     #[test]

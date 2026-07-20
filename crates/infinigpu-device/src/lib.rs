@@ -23,7 +23,7 @@ pub mod resource;
 
 use dma::DmaTable;
 use infinigpu_abi::regs;
-use infinigpu_replay::{ForwardedDraw, Frame, HostGpu, PresentStats};
+use infinigpu_replay::{DrawCmd, ForwardedDraw, Frame, Geometry, HostGpu, PresentStats, VertexAttr};
 use infinigpu_sched::{BrokerConfig, GpuBroker, VmConfig, VmTicket};
 use log::info;
 use std::collections::HashMap;
@@ -295,6 +295,21 @@ pub struct OwnedForwardedDraw {
     pub fragment_entry: std::ffi::CString,
     pub vertex_count: u32,
     pub topology: u32,
+    /// Phase-2b command list (`vk_op::FORWARDED_CMDLIST`): the owned mesh — a vertex buffer, optional
+    /// index buffer, attribute layout, and draw list. `None` for a bufferless `vk_op::FORWARDED`.
+    pub geometry: Option<OwnedGeometry>,
+}
+
+/// Owning form of a decoded Phase-2b mesh (see [`decode_forwarded_cmdlist`]). Holds the vertex/index
+/// bytes + attribute/draw arrays so a borrowing [`Geometry`] can be built inside the `'static` GPU
+/// run closure.
+pub struct OwnedGeometry {
+    pub vertex_data: Vec<u8>,
+    pub vertex_stride: u32,
+    pub attrs: Vec<VertexAttr>,
+    pub index_data: Vec<u8>,
+    pub index_u32: bool,
+    pub draws: Vec<DrawCmd>,
 }
 
 impl OwnedForwardedDraw {
@@ -306,6 +321,14 @@ impl OwnedForwardedDraw {
             fragment_entry: &self.fragment_entry,
             vertex_count: self.vertex_count,
             topology: self.topology,
+            geometry: self.geometry.as_ref().map(|g| Geometry {
+                vertex_data: &g.vertex_data,
+                vertex_stride: g.vertex_stride,
+                attrs: &g.attrs,
+                index_data: &g.index_data,
+                index_u32: g.index_u32,
+                draws: &g.draws,
+            }),
         }
     }
 }
@@ -374,7 +397,6 @@ pub fn decode_forwarded(payload: &[u8], max_bytes: usize) -> Option<OwnedForward
     // SharedGpu runs one VkDevice across tenants (ADR-0003 per-VM jailed replay process is the
     // deferred real isolation), that would wedge co-tenants. Full validation (spirv-val) / process
     // isolation is tracked for a later phase; this is defense-in-depth, not a security boundary.
-    const SPIRV_MAGIC: u32 = 0x0723_0203;
     if vertex_spirv.first() != Some(&SPIRV_MAGIC) || fragment_spirv.first() != Some(&SPIRV_MAGIC) {
         return None;
     }
@@ -386,6 +408,155 @@ pub fn decode_forwarded(payload: &[u8], max_bytes: usize) -> Option<OwnedForward
         fragment_entry: cstr(fentry_b)?,
         vertex_count: tail.vertex_count,
         topology: tail.topology,
+        geometry: None,
+    })
+}
+
+/// SPIR-V magic word (`OpMagic`); the first word of every valid module. Shared by both forwarded
+/// decoders as a cheap defense-in-depth gate before the driver's compiler sees the blob.
+const SPIRV_MAGIC: u32 = 0x0723_0203;
+
+/// Decode a [`ForwardedCmdListTail`](infinigpu_abi::wire::ForwardedCmdListTail) + its trailing
+/// sections (attributes, draws, two SPIR-V blobs, vertex/index data, two entry names) that follow
+/// the fixed [`VulkanWorkload`] in a `vk_op::FORWARDED_CMDLIST` payload. This is the Phase-2b path:
+/// a real mesh with a vertex buffer, optional index buffer, and multi-draw. Fully bounds-checked
+/// against hostile guest input — every declared length must fit the remaining payload without
+/// overflow, SPIR-V blobs are non-empty word streams starting with the magic, and the counts are
+/// capped. Returns `None` on ANY violation (caller drops + retires, fail-closed). Public so the
+/// off-VM conformance test can drive it with the guest encoder's bytes.
+pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<OwnedForwardedDraw> {
+    use infinigpu_abi::wire::{
+        DrawCmdWire, ForwardedCmdListTail, VertexAttrWire, VulkanWorkload,
+    };
+    use zerocopy::FromBytes;
+
+    let tail_bytes = payload.get(size_of::<VulkanWorkload>()..)?;
+    let (tail, rest) = ForwardedCmdListTail::read_from_prefix(tail_bytes).ok()?;
+
+    let vlen = tail.vertex_spirv_len as usize;
+    let flen = tail.fragment_spirv_len as usize;
+    let velen = tail.vertex_entry_len as usize;
+    let felen = tail.fragment_entry_len as usize;
+    let attr_count = tail.attr_count as usize;
+    let draw_count = tail.draw_count as usize;
+    let vdata_len = tail.vertex_data_len as usize;
+    let idata_len = tail.index_data_len as usize;
+    let stride = tail.vertex_stride;
+
+    // Scalar bounds (cheap rejects before any arithmetic on attacker lengths).
+    if vlen == 0
+        || flen == 0
+        || !vlen.is_multiple_of(4)
+        || !flen.is_multiple_of(4)
+        || vlen > max_bytes
+        || flen > max_bytes
+        || velen == 0
+        || felen == 0
+        || velen > 256
+        || felen > 256
+        || draw_count == 0
+        || draw_count > 4096
+        || attr_count > 32
+        || vdata_len > max_bytes
+        || idata_len > max_bytes
+    {
+        return None;
+    }
+    // A command list is the geometry path: it must carry a vertex buffer with a real stride, and the
+    // stride must span every attribute. A bufferless draw belongs on the `vk_op::FORWARDED` path.
+    if stride == 0 || vdata_len == 0 || !vdata_len.is_multiple_of(stride as usize) {
+        return None;
+    }
+
+    // Total of the eight trailing sections, in wire order. All checked_* so a hostile length can't
+    // wrap. Sections 1–2 (fixed-size arrays) and 3–4 (SPIR-V) are 4-multiples; the byte blobs 5–8
+    // come last so their odd lengths never misalign a fixed array.
+    let attrs_bytes = attr_count.checked_mul(size_of::<VertexAttrWire>())?;
+    let draws_bytes = draw_count.checked_mul(size_of::<DrawCmdWire>())?;
+    let total = attrs_bytes
+        .checked_add(draws_bytes)?
+        .checked_add(vlen)?
+        .checked_add(flen)?
+        .checked_add(vdata_len)?
+        .checked_add(idata_len)?
+        .checked_add(velen)?
+        .checked_add(felen)?;
+    if total > rest.len() {
+        return None;
+    }
+    let (attrs_b, r) = rest.split_at(attrs_bytes);
+    let (draws_b, r) = r.split_at(draws_bytes);
+    let (vspirv_b, r) = r.split_at(vlen);
+    let (fspirv_b, r) = r.split_at(flen);
+    let (vdata_b, r) = r.split_at(vdata_len);
+    let (idata_b, r) = r.split_at(idata_len);
+    let (ventry_b, r) = r.split_at(velen);
+    let (fentry_b, _) = r.split_at(felen);
+
+    // Parse the attribute + draw arrays element-by-element (read_from_prefix copies, so the
+    // byte-aligned payload needs no 4-alignment).
+    let mut attrs = Vec::with_capacity(attr_count);
+    let mut ab = attrs_b;
+    for _ in 0..attr_count {
+        let (a, next) = VertexAttrWire::read_from_prefix(ab).ok()?;
+        ab = next;
+        attrs.push(VertexAttr {
+            location: a.location,
+            format: a.format,
+            offset: a.offset,
+        });
+    }
+    let mut draws = Vec::with_capacity(draw_count);
+    let mut db = draws_b;
+    for _ in 0..draw_count {
+        let (d, next) = DrawCmdWire::read_from_prefix(db).ok()?;
+        db = next;
+        draws.push(DrawCmd {
+            count: d.count,
+            instance_count: d.instance_count,
+            first: d.first,
+            vertex_offset: d.vertex_offset,
+            viewport: [d.vp_x, d.vp_y, d.vp_w, d.vp_h],
+        });
+    }
+
+    let to_words = |b: &[u8]| -> Vec<u32> {
+        b.chunks_exact(4)
+            .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+    let cstr = |b: &[u8]| -> Option<std::ffi::CString> {
+        let nul = b.iter().position(|&c| c == 0)?;
+        std::ffi::CString::new(&b[..nul]).ok()
+    };
+    let vertex_spirv = to_words(vspirv_b);
+    let fragment_spirv = to_words(fspirv_b);
+    if vertex_spirv.first() != Some(&SPIRV_MAGIC) || fragment_spirv.first() != Some(&SPIRV_MAGIC) {
+        return None;
+    }
+
+    let index_u32 = tail.index_type == infinigpu_abi::wire::index_type::U32;
+    // A non-empty index buffer must be a whole number of indices of the declared width.
+    let idx_stride = if index_u32 { 4 } else { 2 };
+    if !idata_len.is_multiple_of(idx_stride) {
+        return None;
+    }
+
+    Some(OwnedForwardedDraw {
+        vertex_spirv,
+        fragment_spirv,
+        vertex_entry: cstr(ventry_b)?,
+        fragment_entry: cstr(fentry_b)?,
+        vertex_count: 0,
+        topology: tail.topology,
+        geometry: Some(OwnedGeometry {
+            vertex_data: vdata_b.to_vec(),
+            vertex_stride: stride,
+            attrs,
+            index_data: idata_b.to_vec(),
+            index_u32,
+            draws,
+        }),
     })
 }
 use vfio_bindings::bindings::vfio::{
@@ -1399,15 +1570,28 @@ impl InfinigpuBackend {
         // (after the prewarm opened the GPU) so the hot path just branches on a bool.
         let use_zerocopy =
             self.zerocopy_scanout && scanout_addr != 0 && self.shared_gpu.supports_zerocopy();
-        let (wait_us, render_us, dma_us, presented) = if op == vk_op::FORWARDED {
-            // Phase-1 own-ICD path: the guest ICD forwarded a real app's shaders + draw. Decode
-            // the tail + SPIR-V (fail-closed on hostile input), then replay it on the GPU.
-            let Some(fwd) = decode_forwarded(payload, MAX_CMD_BYTES as usize) else {
+        let (wait_us, render_us, dma_us, presented) = if op == vk_op::FORWARDED
+            || op == vk_op::FORWARDED_CMDLIST
+        {
+            // Own-ICD path: the guest ICD forwarded a real app's shaders + draw. `FORWARDED` is the
+            // Phase-1 bufferless single draw; `FORWARDED_CMDLIST` is the Phase-2b real mesh (vertex/
+            // index buffers + multi-draw). Decode the matching tail (fail-closed on hostile input),
+            // then replay it on the GPU.
+            let decoded = if op == vk_op::FORWARDED_CMDLIST {
+                decode_forwarded_cmdlist(payload, MAX_CMD_BYTES as usize)
+            } else {
+                decode_forwarded(payload, MAX_CMD_BYTES as usize)
+            };
+            let Some(fwd) = decoded else {
                 log::warn!("vulkan submit ctx={ctx}: malformed forwarded draw — dropped");
                 self.ring_retired[ctx] = sc.seqno;
                 return;
             };
             decode_us = t_start.elapsed().as_micros() as u64;
+
+            // Zero-copy scanout is bufferless-only (the mesh path uploads + frees vertex buffers per
+            // submit and goes through the one-copy present); force it off for a command list.
+            let use_zerocopy = use_zerocopy && fwd.geometry.is_none();
 
             // Fix D zero-copy: resolve the scanout to a page-aligned host pointer in guest RAM and
             // have the GPU DMA straight into it — no readback buffer, no CPU copy. The imported size
@@ -2874,6 +3058,7 @@ mod tests {
             fragment_entry: c"fragmain",
             vertex_count: 5,
             topology: 1,
+            geometry: None,
         };
         let payload = encode_forwarded(32, 16, [0.1, 0.2, 0.3, 1.0], 0, &draw);
 
@@ -3072,5 +3257,261 @@ mod tests {
 
         unsafe { libc::munmap(ram as *mut libc::c_void, size) };
         eprintln!("forwarded_e2e_colors_correct_and_elides: OK (lit={lit1}, elided 1, invalidation re-renders)");
+    }
+
+    // ---- Phase-2b: FORWARDED_CMDLIST (real mesh: vertex/index buffers + multi-draw) -------------
+
+    /// Serialize a mesh into a `vk_op::FORWARDED_CMDLIST` payload exactly as the guest ICD will:
+    /// fixed VulkanWorkload → ForwardedCmdListTail → attrs → draws → vSPIR-V → fSPIR-V → vertex data
+    /// → index data → vertex entry → fragment entry (the order [`decode_forwarded_cmdlist`] expects).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_forwarded_cmdlist(
+        width: u32,
+        height: u32,
+        bg: [f32; 4],
+        scanout_addr: u64,
+        vspirv: &[u32],
+        fspirv: &[u32],
+        ventry: &std::ffi::CStr,
+        fentry: &std::ffi::CStr,
+        stride: u32,
+        attrs: &[infinigpu_abi::wire::VertexAttrWire],
+        vdata: &[u8],
+        idata: &[u8],
+        index_u32: bool,
+        topology: u32,
+        draws: &[infinigpu_abi::wire::DrawCmdWire],
+    ) -> Vec<u8> {
+        use infinigpu_abi::wire::{index_type, vk_op, ForwardedCmdListTail, VulkanWorkload};
+        use zerocopy::IntoBytes;
+
+        let vspv = spirv_bytes(vspirv);
+        let fspv = spirv_bytes(fspirv);
+        let ve = ventry.to_bytes_with_nul();
+        let fe = fentry.to_bytes_with_nul();
+        let wl = VulkanWorkload {
+            op: vk_op::FORWARDED_CMDLIST,
+            width,
+            height,
+            _pad: 0,
+            bg,
+            scanout_addr,
+        };
+        let tail = ForwardedCmdListTail {
+            vertex_spirv_len: vspv.len() as u32,
+            fragment_spirv_len: fspv.len() as u32,
+            vertex_entry_len: ve.len() as u32,
+            fragment_entry_len: fe.len() as u32,
+            vertex_stride: stride,
+            attr_count: attrs.len() as u32,
+            vertex_data_len: vdata.len() as u32,
+            index_data_len: idata.len() as u32,
+            index_type: if index_u32 { index_type::U32 } else { index_type::U16 },
+            draw_count: draws.len() as u32,
+            topology,
+            _reserved: 0,
+        };
+        let mut p = Vec::new();
+        p.extend_from_slice(wl.as_bytes());
+        p.extend_from_slice(tail.as_bytes());
+        for a in attrs {
+            p.extend_from_slice(a.as_bytes());
+        }
+        for d in draws {
+            p.extend_from_slice(d.as_bytes());
+        }
+        p.extend_from_slice(&vspv);
+        p.extend_from_slice(&fspv);
+        p.extend_from_slice(vdata);
+        p.extend_from_slice(idata);
+        p.extend_from_slice(ve);
+        p.extend_from_slice(fe);
+        p
+    }
+
+    /// The command-list decoder round-trips a real mesh and rejects hostile inputs fail-closed — no
+    /// GPU needed. Proves the byte layout + bounds checks (attrs/draws arrays, vertex/index blobs,
+    /// stride vs. data, the two SPIR-V magics) the host relies on before it hands guest-controlled
+    /// geometry to the driver.
+    #[test]
+    fn forwarded_cmdlist_decodes_and_rejects_hostile() {
+        use infinigpu_abi::wire::{vk_vformat, DrawCmdWire, VertexAttrWire};
+        const CAP: usize = 64 * 1024 * 1024;
+        const MAGIC: u32 = 0x0723_0203;
+        let vspirv: [u32; 3] = [MAGIC, 0xAAAA_AAAA, 0xBBBB_BBBB];
+        let fspirv: [u32; 4] = [MAGIC, 0xCCCC_CCCC, 0xDDDD_DDDD, 0xEEEE_EEEE];
+        let attrs = [
+            VertexAttrWire { location: 0, format: vk_vformat::R32G32_SFLOAT, offset: 0 },
+            VertexAttrWire { location: 1, format: vk_vformat::R32G32B32_SFLOAT, offset: 8 },
+        ];
+        // 3 vertices × stride 20; a u16 index buffer of 3 indices.
+        let vdata = vec![0u8; 60];
+        let idata: Vec<u8> = [0u16, 1, 2].iter().flat_map(|i| i.to_le_bytes()).collect();
+        let draws = [
+            DrawCmdWire { count: 3, instance_count: 1, first: 0, vertex_offset: 0, vp_x: 0.0, vp_y: 0.0, vp_w: 0.0, vp_h: 0.0 },
+            DrawCmdWire { count: 3, instance_count: 2, first: 0, vertex_offset: 1, vp_x: 8.0, vp_y: 9.0, vp_w: 10.0, vp_h: 11.0 },
+        ];
+        let payload = encode_forwarded_cmdlist(
+            32, 16, [0.1, 0.2, 0.3, 1.0], 0, &vspirv, &fspirv, c"vs", c"fs", 20, &attrs, &vdata,
+            &idata, false, 1, &draws,
+        );
+
+        let o = decode_forwarded_cmdlist(&payload, CAP).expect("valid cmdlist decodes");
+        assert_eq!(o.vertex_spirv, vspirv);
+        assert_eq!(o.fragment_spirv, fspirv);
+        assert_eq!(o.vertex_entry.as_c_str(), c"vs");
+        assert_eq!(o.fragment_entry.as_c_str(), c"fs");
+        assert_eq!(o.topology, 1);
+        let g = o.geometry.expect("cmdlist carries geometry");
+        assert_eq!(g.vertex_stride, 20);
+        assert_eq!(g.vertex_data, vdata);
+        assert_eq!(g.index_data, idata);
+        assert!(!g.index_u32);
+        assert_eq!(g.attrs.len(), 2);
+        assert_eq!((g.attrs[1].location, g.attrs[1].format, g.attrs[1].offset), (1, vk_vformat::R32G32B32_SFLOAT, 8));
+        assert_eq!(g.draws.len(), 2, "both draws round-trip (multi-draw)");
+        assert_eq!(g.draws[1].instance_count, 2);
+        assert_eq!(g.draws[1].vertex_offset, 1);
+        assert_eq!(g.draws[1].viewport, [8.0, 9.0, 10.0, 11.0], "per-draw viewport round-trips");
+
+        // Hostile → None (fail-closed):
+        assert!(decode_forwarded_cmdlist(&payload[..44], CAP).is_none(), "truncated before tail rejected");
+        assert!(decode_forwarded_cmdlist(&payload[..payload.len() - 4], CAP).is_none(), "short payload rejected");
+        // stride = 0 (offset: VulkanWorkload 40 + tail's 5th u32 = 40 + 16) → not the geometry path.
+        let mut bad_stride = payload.clone();
+        bad_stride[40 + 16..40 + 20].copy_from_slice(&0u32.to_le_bytes());
+        assert!(decode_forwarded_cmdlist(&bad_stride, CAP).is_none(), "zero stride rejected");
+        // draw_count = 0 (tail's 10th u32 = 40 + 36) → nothing to draw.
+        let mut no_draws = payload.clone();
+        no_draws[40 + 36..40 + 40].copy_from_slice(&0u32.to_le_bytes());
+        assert!(decode_forwarded_cmdlist(&no_draws, CAP).is_none(), "zero draw_count rejected");
+        // bad vertex SPIR-V magic (first vSPIR-V word sits after tail(48)+attrs(24)+draws(64) = 136,
+        // plus the VulkanWorkload(40) = payload offset 176).
+        let vspv_off = 40 + 48 + attrs.len() * 12 + draws.len() * 32;
+        let mut bad_magic = payload.clone();
+        bad_magic[vspv_off] = bad_magic[vspv_off].wrapping_add(1);
+        assert!(decode_forwarded_cmdlist(&bad_magic, CAP).is_none(), "non-SPIR-V vertex blob rejected");
+    }
+
+    /// WGSL → SPIR-V via naga (pure-Rust; no glslang) so the device GPU test drives a real VBO-reading
+    /// shader through the wire decoder, not a fixed built-in.
+    fn compile_wgsl(src: &str, stage: naga::ShaderStage) -> Vec<u32> {
+        let module = naga::front::wgsl::parse_str(src).expect("wgsl parse");
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("wgsl validate");
+        let pipe = naga::back::spv::PipelineOptions {
+            shader_stage: stage,
+            entry_point: "main".to_string(),
+        };
+        naga::back::spv::write_vec(&module, &info, &naga::back::spv::Options::default(), Some(&pipe))
+            .expect("spv emit")
+    }
+
+    /// Full device path for a real mesh on real silicon: a `vk_op::FORWARDED_CMDLIST` submit carrying
+    /// a VBO-reading shader + a vertex buffer must be decoded by [`decode_forwarded_cmdlist`], have
+    /// its buffers uploaded, be drawn on the physical GPU, and DMA'd to the guest scanout. Verifies
+    /// the mesh actually rendered (a coloured triangle in the centre, background at the corners) —
+    /// the guest→host→GPU→scanout round-trip that lets a real app draw geometry. GPU-gated.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_cmdlist_e2e_renders_mesh_to_scanout() {
+        use infinigpu_abi::wire::{vk_vformat, DrawCmdWire, VertexAttrWire};
+        use std::os::unix::io::FromRawFd;
+
+        let vs = compile_wgsl(
+            "struct VOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };\n\
+             @vertex fn main(@location(0) p: vec2<f32>, @location(1) c: vec3<f32>) -> VOut {\n\
+               return VOut(vec4<f32>(p, 0.0, 1.0), c);\n}",
+            naga::ShaderStage::Vertex,
+        );
+        let fs = compile_wgsl(
+            "@fragment fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {\n\
+               return vec4<f32>(c, 1.0);\n}",
+            naga::ShaderStage::Fragment,
+        );
+        // Centered triangle, pure R/G/B vertices. stride = 5 f32 = 20 B.
+        let verts: [[f32; 5]; 3] = [
+            [-0.6, 0.5, 1.0, 0.0, 0.0],
+            [0.6, 0.5, 0.0, 1.0, 0.0],
+            [0.0, -0.6, 0.0, 0.0, 1.0],
+        ];
+        let mut vdata = Vec::new();
+        for v in &verts {
+            for f in v {
+                vdata.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        let attrs = [
+            VertexAttrWire { location: 0, format: vk_vformat::R32G32_SFLOAT, offset: 0 },
+            VertexAttrWire { location: 1, format: vk_vformat::R32G32B32_SFLOAT, offset: 8 },
+        ];
+        let draws = [DrawCmdWire { count: 3, instance_count: 1, first: 0, vertex_offset: 0, vp_x: 0.0, vp_y: 0.0, vp_w: 0.0, vp_h: 0.0 }];
+
+        const GUEST_BASE: u64 = 0xD000_0000;
+        const SCAN_OFF: usize = 0x1000;
+        let (w, h): (u32, u32) = (128, 128);
+        let fb_bytes = (w * h * 4) as usize;
+        let size = SCAN_OFF + fb_bytes + 0x1000;
+        let bg = [0.0f32, 0.0, 0.0, 1.0];
+        let scanout_addr = GUEST_BASE + SCAN_OFF as u64;
+        let payload = encode_forwarded_cmdlist(
+            w, h, bg, scanout_addr, &vs, &fs, c"main", c"main", 20, &attrs, &vdata, &[], false, 0,
+            &draws,
+        );
+        let sc = infinigpu_abi::wire::SubmitCmd {
+            ctx_id: 0,
+            encoding: infinigpu_abi::wire::encoding::VULKAN_VENUSLIKE,
+            payload_len: payload.len() as u32,
+            flags: 0,
+            seqno: 9,
+            in_fence: 0,
+            out_fence: 9,
+        };
+
+        let fd = unsafe { libc::memfd_create(c"vkmesh".as_ptr(), 0) };
+        assert!(fd >= 0);
+        assert_eq!(unsafe { libc::ftruncate(fd, size as libc::off_t) }, 0);
+        let ram = unsafe {
+            libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
+        } as *mut u8;
+        assert_ne!(ram as *mut libc::c_void, libc::MAP_FAILED);
+
+        let mut b = InfinigpuBackend::new();
+        let file = unsafe { <std::fs::File as FromRawFd>::from_raw_fd(fd) };
+        b.dma.map(GUEST_BASE, 0, size as u64, file).unwrap();
+        if b.shared_gpu.device_name().is_none() {
+            eprintln!("skipping: no GPU");
+            unsafe { libc::munmap(ram as *mut libc::c_void, size) };
+            return;
+        }
+
+        b.submit_vulkan(&sc, &payload, 0);
+        assert_eq!(b.ring_retired[0], 9, "the mesh fence retired");
+        assert_eq!(b.vulkan_submits, 1);
+
+        let px = unsafe { std::slice::from_raw_parts(ram.add(SCAN_OFF), fb_bytes) };
+        let pixel = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+        // All three vertex colours must appear (VBO colours flow through) and the corners stay bg.
+        let (mut red, mut green, mut blue) = (0u32, 0u32, 0u32);
+        for p in px.chunks_exact(4) {
+            let (r, g, bl) = (p[0] as i32, p[1] as i32, p[2] as i32);
+            red += (r > 150 && r - g > 60 && r - bl > 60) as u32;
+            green += (g > 150 && g - r > 60 && g - bl > 60) as u32;
+            blue += (bl > 150 && bl - r > 60 && bl - g > 60) as u32;
+        }
+        assert!(red > 30 && green > 30 && blue > 30, "mesh colours on scanout (r={red} g={green} b={blue})");
+        for (cx, cy) in [(2, 2), (w - 3, 2), (2, h - 3), (w - 3, h - 3)] {
+            let c = pixel(cx, cy);
+            assert!(c[0] < 20 && c[1] < 20 && c[2] < 20, "corner ({cx},{cy}) is background, got {c:?}");
+        }
+        eprintln!("forwarded_cmdlist_e2e_renders_mesh_to_scanout: OK (r={red} g={green} b={blue})");
+        unsafe { libc::munmap(ram as *mut libc::c_void, size) };
     }
 }

@@ -40,8 +40,12 @@ pub const ABI_MAJOR: u16 = 0;
 /// payload transport (`desc_flags::PAYLOAD_ABS` + `Descriptor::payload_addr` — a large SUBMIT_CMD
 /// body, e.g. a forwarded draw's KBs of SPIR-V, DMA-read from an absolute guest address instead of
 /// the fixed per-slot ring payload region; the guest ICD's `driver_submit` needs it to carry real
-/// shaders that never fit inline).
-pub const ABI_MINOR: u16 = 7;
+/// shaders that never fit inline). v8 added the Phase-2b forwarded command list (`vk_op::FORWARDED_CMDLIST`
+/// + `ForwardedCmdListTail` + `VertexAttrWire`/`DrawCmdWire` + `vk_vformat`/`index_type` — a real mesh
+/// with a vertex buffer, optional index buffer, vertex-input layout, and multi-draw; the op that lets
+/// any vertex-buffered app render. A guest gates on `negotiated_minor >= 8` before sending it, since an
+/// older host would fall through to the clear default).
+pub const ABI_MINOR: u16 = 8;
 
 /// Packed `ABI_VERSION` register value (`major << 16 | minor`).
 pub const fn abi_version() -> u32 {

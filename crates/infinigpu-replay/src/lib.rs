@@ -83,13 +83,67 @@ pub struct ForwardedDraw<'a> {
     /// Fragment-stage SPIR-V + entry point. May alias `vertex_spirv` for a combined module.
     pub fragment_spirv: &'a [u32],
     pub fragment_entry: &'a CStr,
-    /// Vertices for the `draw(vertex_count, 1, 0, 0)` (no vertex buffers — SM-generated).
+    /// Vertices for the `draw(vertex_count, 1, 0, 0)` (no vertex buffers — SM-generated). Ignored
+    /// when [`geometry`](Self::geometry) is `Some` (the geometry's draw list drives the draws).
     pub vertex_count: u32,
     /// Primitive topology as the wire's `infinigpu_abi::wire::vk_topology` u32 (0 = triangle
     /// list, 1 = triangle strip). Kept as a plain u32 so this public API — and the host device
     /// crate that builds a `ForwardedDraw` from the wire — need not depend on ash/Vulkan headers;
     /// [`map_topology`] converts it just before pipeline creation.
     pub topology: u32,
+    /// Phase-2b command list: real mesh geometry (a vertex buffer + optional index buffer + a
+    /// vertex-input layout + an ordered draw list). `None` ⇒ the Phase-1 bufferless path (one
+    /// `draw(vertex_count)`, empty vertex input) — the built-in triangle and fullscreen passes.
+    /// `Some` ⇒ the pipeline gets a non-empty vertex-input state and the record path binds the
+    /// buffers and replays each draw. This is the field that lets any real vertex-buffered app render.
+    pub geometry: Option<Geometry<'a>>,
+}
+
+/// One vertex attribute: what the vertex shader reads at `location`, its format, and its byte
+/// offset within a vertex. Formats are the wire's `infinigpu_abi::wire::vk_vformat` u32 (mapped by
+/// [`map_vformat`]) so this public API needn't depend on ash — same discipline as [`topology`].
+///
+/// [`topology`]: ForwardedDraw::topology
+#[derive(Clone, Copy)]
+pub struct VertexAttr {
+    pub location: u32,
+    /// Wire `vk_vformat` u32.
+    pub format: u32,
+    pub offset: u32,
+}
+
+/// One draw in a forwarded command list — a `vkCmdDraw`/`vkCmdDrawIndexed` with its own viewport.
+#[derive(Clone, Copy)]
+pub struct DrawCmd {
+    /// `vertex_count` (non-indexed) or `index_count` (indexed, i.e. [`Geometry::index_data`] set).
+    pub count: u32,
+    /// Instance count; `0` is treated as `1`.
+    pub instance_count: u32,
+    /// `first_vertex` (non-indexed) or `first_index` (indexed).
+    pub first: u32,
+    /// Added to every index before the vertex fetch (indexed only). Signed.
+    pub vertex_offset: i32,
+    /// Viewport `(x, y, w, h)` in pixels; `w == 0.0` ⇒ the full render target.
+    pub viewport: [f32; 4],
+}
+
+/// Real mesh geometry forwarded from the guest: one interleaved vertex buffer (binding 0) with a
+/// `vertex_stride` + `attrs` layout, an optional index buffer, and an ordered list of draws. Borrows
+/// the CPU-side bytes; the host uploads them to a GPU buffer just before the draw. This is the
+/// "make a real mesh render" payload (Phase-2b) — everything the fixed built-in triangle path lacks.
+pub struct Geometry<'a> {
+    /// Interleaved vertex bytes (binding 0). Empty is invalid when the draw list is non-empty.
+    pub vertex_data: &'a [u8],
+    /// Bytes per vertex (binding 0 stride). Must be non-zero when `vertex_data` is non-empty.
+    pub vertex_stride: u32,
+    /// Vertex-input attribute layout the vertex shader reads.
+    pub attrs: &'a [VertexAttr],
+    /// Index bytes; empty ⇒ non-indexed draws.
+    pub index_data: &'a [u8],
+    /// `true` ⇒ 32-bit indices, `false` ⇒ 16-bit.
+    pub index_u32: bool,
+    /// The draws to replay, in order.
+    pub draws: &'a [DrawCmd],
 }
 
 /// Wire `vk_topology` u32 → `VkPrimitiveTopology`. Unknown values fall back to a triangle list
@@ -98,6 +152,21 @@ fn map_topology(t: u32) -> vk::PrimitiveTopology {
     match t {
         1 => vk::PrimitiveTopology::TRIANGLE_STRIP,
         _ => vk::PrimitiveTopology::TRIANGLE_LIST,
+    }
+}
+
+/// Wire `vk_vformat` u32 → `VkFormat` for a vertex attribute. Unknown values fall back to the widest
+/// float (RGBA32F): a fail-safe, since the driver reads at most the declared vertex stride and never
+/// past the bound buffer, so a bogus format can't induce an out-of-bounds fetch.
+fn map_vformat(f: u32) -> vk::Format {
+    use infinigpu_abi::wire::vk_vformat as V;
+    match f {
+        V::R32_SFLOAT => vk::Format::R32_SFLOAT,
+        V::R32G32_SFLOAT => vk::Format::R32G32_SFLOAT,
+        V::R32G32B32_SFLOAT => vk::Format::R32G32B32_SFLOAT,
+        V::R8G8B8A8_UNORM => vk::Format::R8G8B8A8_UNORM,
+        V::R32_UINT => vk::Format::R32_UINT,
+        _ => vk::Format::R32G32B32A32_SFLOAT,
     }
 }
 
@@ -113,6 +182,7 @@ impl<'a> ForwardedDraw<'a> {
             fragment_entry: c"fs_main",
             vertex_count: 3,
             topology: 0, // vk_topology::TRIANGLE_LIST
+            geometry: None,
         }
     }
 }
@@ -442,14 +512,38 @@ fn hash_spirv(data: &[u32]) -> u64 {
 }
 
 /// Key for a reusable graphics pipeline: the two shader blobs (by hash), the primitive topology,
-/// and the color format. Resolution is deliberately absent — the pipeline uses dynamic
-/// viewport+scissor so one entry serves every frame size (Fix A).
+/// the color format, and the vertex-input layout (Phase-2b — a mesh's stride+attributes change the
+/// pipeline). Resolution is deliberately absent — the pipeline uses dynamic viewport+scissor so one
+/// entry serves every frame size (Fix A).
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 struct PipelineKey {
     vs_hash: u64,
     fs_hash: u64,
     topology: i32,
     format: i32,
+    /// Hash of the vertex-input state (stride + each attribute's location/format/offset); `0` for
+    /// the bufferless empty-vertex-input path so the built-in triangle keys exactly as before.
+    vinput_hash: u64,
+}
+
+/// Content hash of a [`ForwardedDraw`]'s vertex-input layout (binding stride + attributes), folded
+/// into [`PipelineKey`] so two meshes with different layouts get different pipelines but the same
+/// mesh reuses one. Returns `0` when there is no vertex buffer (empty vertex input) — the Phase-1
+/// bufferless key, unchanged.
+fn hash_vinput(draw: &ForwardedDraw) -> u64 {
+    let Some(g) = draw.geometry.as_ref() else {
+        return 0;
+    };
+    if g.vertex_stride == 0 {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (g.vertex_stride as u64).rotate_left(1);
+    for a in g.attrs {
+        for v in [a.location, a.format, a.offset] {
+            h = (h ^ v as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
 }
 
 #[derive(Clone, Copy)]
@@ -517,6 +611,32 @@ struct SizedScratch {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     size: u64,
+}
+
+/// Phase-2b: the guest's mesh uploaded to GPU-visible buffers for **one** submit. Host-visible +
+/// coherent so the forwarded bytes memcpy straight in (no staging buffer/copy — correctness-first;
+/// a by-id resource cache that skips re-uploading a static mesh every frame is a perf follow-up, see
+/// `docs/3D-COMPLETENESS-ROADMAP.md`). Created per submit and destroyed only after that submit's
+/// fence completes — the recorded draws reference these buffers until then.
+struct GeometryGpu {
+    vbo: vk::Buffer,
+    vbo_mem: vk::DeviceMemory,
+    /// `(buffer, memory)` — `None` for non-indexed geometry.
+    ibo: Option<(vk::Buffer, vk::DeviceMemory)>,
+}
+
+impl GeometryGpu {
+    /// # Safety
+    /// `dev` must be the device the buffers were created on, and no command buffer referencing them
+    /// may still be executing (the caller waits the submit fence first).
+    unsafe fn destroy(&self, dev: &ash::Device) {
+        dev.destroy_buffer(self.vbo, None);
+        dev.free_memory(self.vbo_mem, None);
+        if let Some((b, m)) = self.ibo {
+            dev.destroy_buffer(b, None);
+            dev.free_memory(m, None);
+        }
+    }
 }
 
 impl SizedScratch {
@@ -881,7 +1001,34 @@ impl HostGpu {
                 .module(fs_module)
                 .name(draw.fragment_entry),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        // Vertex input (Phase-2b): a non-empty binding+attribute layout when the draw carries a
+        // vertex buffer, else the empty state (bufferless — the built-in triangle path, unchanged).
+        // The `bindings`/`attrs` Vecs must outlive `create_graphics_pipelines`, so they live here.
+        let (bindings, attrs): (
+            Vec<vk::VertexInputBindingDescription>,
+            Vec<vk::VertexInputAttributeDescription>,
+        ) = match draw.geometry.as_ref() {
+            Some(g) if g.vertex_stride != 0 => (
+                vec![vk::VertexInputBindingDescription::default()
+                    .binding(0)
+                    .stride(g.vertex_stride)
+                    .input_rate(vk::VertexInputRate::VERTEX)],
+                g.attrs
+                    .iter()
+                    .map(|a| {
+                        vk::VertexInputAttributeDescription::default()
+                            .location(a.location)
+                            .binding(0)
+                            .format(map_vformat(a.format))
+                            .offset(a.offset)
+                    })
+                    .collect(),
+            ),
+            _ => (Vec::new(), Vec::new()),
+        };
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attrs);
         let input_asm = vk::PipelineInputAssemblyStateCreateInfo::default().topology(topology);
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
@@ -967,6 +1114,7 @@ impl HostGpu {
             fs_hash,
             topology: topology.as_raw(),
             format: format.as_raw(),
+            vinput_hash: hash_vinput(draw),
         };
         let mut cache = self.obj_cache.lock().unwrap_or_else(|e| e.into_inner());
         // Fail-closed bound before inserting anything new.
@@ -1777,9 +1925,29 @@ impl HostGpu {
         let ss = cache.get(&(width, height)).expect("just inserted above");
         let t_setup = bd.map(|_| Instant::now());
 
+        // Phase-2b: upload the mesh (if any) for this submit. Freed after the fence completes below —
+        // the recorded draws reference the buffers until then. A failure here is a clean early return
+        // (the scratch is untouched, upload_geometry frees its own partials).
+        let geom_gpu = match draw.geometry.as_ref() {
+            Some(g) if g.vertex_stride != 0 && !g.vertex_data.is_empty() => {
+                Some(self.upload_geometry(g)?)
+            }
+            _ => None,
+        };
+
         // Single submit thread per device process + fence-wait before return ⇒ no frame N+1 vs. N
         // hazard on the reused objects; reset the pool + fence and re-record for this frame.
-        self.record_forwarded_frame(ss, render_pass, pipeline, width, height, bg, draw, ss.readback)?;
+        self.record_forwarded_frame(
+            ss,
+            render_pass,
+            pipeline,
+            width,
+            height,
+            bg,
+            draw,
+            geom_gpu.as_ref(),
+            ss.readback,
+        )?;
         let t_record = bd.map(|_| Instant::now());
         unsafe {
             dev.reset_fences(&[ss.fence])?;
@@ -1788,6 +1956,10 @@ impl HostGpu {
             dev.queue_submit(self.queue, &submit, ss.fence)?;
         }
         self.wait_fence(ss.fence)?;
+        // The submit fence is signaled ⇒ the draws no longer reference the mesh buffers; free them.
+        if let Some(gg) = geom_gpu {
+            unsafe { gg.destroy(dev) };
+        }
         let t_gpu = bd.map(|_| Instant::now());
         // HOST_CACHED readback: invalidate so the GPU's writes are visible before the (cached, fast)
         // read — reading write-combined/uncached memory was ~72% of the hot path. Coherent memory
@@ -1854,10 +2026,84 @@ impl HostGpu {
         Ok(Frame { width, height, rgba })
     }
 
+    /// Phase-2b: upload `g`'s vertex (and optional index) bytes into fresh host-visible+coherent GPU
+    /// buffers for one submit. The forwarded bytes are memcpy'd straight in (coherent ⇒ no flush).
+    /// On any failure every partial allocation is freed before returning (no leak on the shared
+    /// device). The returned [`GeometryGpu`] must be destroyed after the submit fence completes.
+    fn upload_geometry(&self, g: &Geometry) -> R<GeometryGpu> {
+        let dev = &self.device;
+        // Create a host-visible|coherent buffer sized to `data`, memcpy `data` in, return it.
+        let mk = |data: &[u8], usage: vk::BufferUsageFlags| -> R<(vk::Buffer, vk::DeviceMemory)> {
+            if data.is_empty() {
+                return Err("empty geometry buffer".into());
+            }
+            unsafe {
+                let buf = dev.create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(data.len() as u64)
+                        .usage(usage)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )?;
+                // From here on, free `buf` (and later `mem`) on any early return.
+                let cleanup_buf = |e: Box<dyn std::error::Error>| {
+                    dev.destroy_buffer(buf, None);
+                    e
+                };
+                let req = dev.get_buffer_memory_requirements(buf);
+                let mt = self
+                    .find_mem(
+                        req.memory_type_bits,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )
+                    .map_err(cleanup_buf)?;
+                let mem = dev
+                    .allocate_memory(
+                        &vk::MemoryAllocateInfo::default()
+                            .allocation_size(req.size)
+                            .memory_type_index(mt),
+                        None,
+                    )
+                    .map_err(|e| cleanup_buf(e.into()))?;
+                let cleanup_both = |e: Box<dyn std::error::Error>| {
+                    dev.free_memory(mem, None);
+                    dev.destroy_buffer(buf, None);
+                    e
+                };
+                dev.bind_buffer_memory(buf, mem, 0)
+                    .map_err(|e| cleanup_both(e.into()))?;
+                let ptr = dev
+                    .map_memory(mem, 0, data.len() as u64, vk::MemoryMapFlags::empty())
+                    .map_err(|e| cleanup_both(e.into()))?;
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
+                dev.unmap_memory(mem); // coherent → the write is visible to the GPU without a flush
+                Ok((buf, mem))
+            }
+        };
+        let (vbo, vbo_mem) = mk(g.vertex_data, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+        let ibo = if g.index_data.is_empty() {
+            None
+        } else {
+            match mk(g.index_data, vk::BufferUsageFlags::INDEX_BUFFER) {
+                Ok(x) => Some(x),
+                Err(e) => {
+                    unsafe {
+                        dev.destroy_buffer(vbo, None);
+                        dev.free_memory(vbo_mem, None);
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        Ok(GeometryGpu { vbo, vbo_mem, ibo })
+    }
+
     /// Record one forwarded-draw frame into `ss`'s command buffer — clear to `bg`, draw, then copy
     /// the result image into `dst` (the persistent readback buffer for the present path, or an
-    /// imported guest-scanout buffer for the Fix-D zero-copy path). Resets the pool first; one submit
-    /// thread per process ⇒ no in-flight hazard on the reused command buffer.
+    /// imported guest-scanout buffer for the Fix-D zero-copy path). When `geom` is `Some` (Phase-2b),
+    /// binds the mesh's vertex/index buffers and replays [`Geometry::draws`] (multi-draw, per-draw
+    /// viewport); otherwise issues the single bufferless `draw(vertex_count)`. Resets the pool first;
+    /// one submit thread per process ⇒ no in-flight hazard on the reused command buffer.
     #[allow(clippy::too_many_arguments)]
     fn record_forwarded_frame(
         &self,
@@ -1868,6 +2114,7 @@ impl HostGpu {
         height: u32,
         bg: [f32; 4],
         draw: &ForwardedDraw,
+        geom: Option<&GeometryGpu>,
         dst: vk::Buffer,
     ) -> R<()> {
         let dev = &self.device;
@@ -1892,18 +2139,8 @@ impl HostGpu {
                 vk::SubpassContents::INLINE,
             );
             dev.cmd_bind_pipeline(ss.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            dev.cmd_set_viewport(
-                ss.cmd,
-                0,
-                &[vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: width as f32,
-                    height: height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                }],
-            );
+            // Scissor is full-frame for every draw; the per-draw viewport (below) is what places
+            // geometry, and a full-frame scissor never clips it (geometry stays inside its viewport).
             dev.cmd_set_scissor(
                 ss.cmd,
                 0,
@@ -1912,7 +2149,63 @@ impl HostGpu {
                     extent: vk::Extent2D { width, height },
                 }],
             );
-            dev.cmd_draw(ss.cmd, draw.vertex_count, 1, 0, 0);
+            let full_viewport = vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: width as f32,
+                height: height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            match (geom, draw.geometry.as_ref()) {
+                // Phase-2b: real mesh — bind the vertex (and optional index) buffer, then replay each
+                // forwarded draw with its own viewport.
+                (Some(gg), Some(g)) => {
+                    dev.cmd_bind_vertex_buffers(ss.cmd, 0, &[gg.vbo], &[0]);
+                    if let Some((ibo, _)) = gg.ibo {
+                        let it = if g.index_u32 {
+                            vk::IndexType::UINT32
+                        } else {
+                            vk::IndexType::UINT16
+                        };
+                        dev.cmd_bind_index_buffer(ss.cmd, ibo, 0, it);
+                    }
+                    let indexed = gg.ibo.is_some();
+                    for d in g.draws {
+                        let vp = if d.viewport[2] > 0.0 {
+                            vk::Viewport {
+                                x: d.viewport[0],
+                                y: d.viewport[1],
+                                width: d.viewport[2],
+                                height: d.viewport[3],
+                                min_depth: 0.0,
+                                max_depth: 1.0,
+                            }
+                        } else {
+                            full_viewport
+                        };
+                        dev.cmd_set_viewport(ss.cmd, 0, &[vp]);
+                        let inst = d.instance_count.max(1);
+                        if indexed {
+                            dev.cmd_draw_indexed(
+                                ss.cmd,
+                                d.count,
+                                inst,
+                                d.first,
+                                d.vertex_offset,
+                                0,
+                            );
+                        } else {
+                            dev.cmd_draw(ss.cmd, d.count, inst, d.first, 0);
+                        }
+                    }
+                }
+                // Phase-1 bufferless path: one shader-synthesized draw over the whole frame.
+                _ => {
+                    dev.cmd_set_viewport(ss.cmd, 0, &[full_viewport]);
+                    dev.cmd_draw(ss.cmd, draw.vertex_count, 1, 0, 0);
+                }
+            }
             dev.cmd_end_render_pass(ss.cmd);
             let region = vk::BufferImageCopy::default()
                 .image_subresource(
@@ -2026,6 +2319,14 @@ impl HostGpu {
         guest_ptr: *mut u8,
     ) -> R<()> {
         const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+        // Zero-copy scanout is the bufferless present fast path (Fix D). A Phase-2b mesh draw would
+        // need its vertex buffers uploaded + freed per submit anyway, so it goes through the copy
+        // present path instead; reject it here rather than silently drop the geometry and render a
+        // bufferless frame (which would be wrong output, not just slow). The device never routes a
+        // command-list draw here, so this is defense-in-depth.
+        if draw.geometry.is_some() {
+            return Err("render_forwarded_zerocopy: geometry draws use the copy present path".into());
+        }
         let size = (width as u64) * (height as u64) * 4;
         let key = (guest_ptr as usize, size);
 
@@ -2059,7 +2360,7 @@ impl HostGpu {
         }
         let ss = cache.get(&(width, height)).expect("just inserted above");
 
-        self.record_forwarded_frame(ss, render_pass, pipeline, width, height, bg, draw, dst)?;
+        self.record_forwarded_frame(ss, render_pass, pipeline, width, height, bg, draw, None, dst)?;
         self.device.reset_fences(&[ss.fence])?;
         let cmds = [ss.cmd];
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
@@ -2894,6 +3195,7 @@ mod tests {
             fragment_entry: c"fs_main",
             vertex_count: 3,
             topology: 0,
+            geometry: None,
         };
         for i in 0..64 {
             assert!(
@@ -2906,5 +3208,240 @@ mod tests {
             .render_forwarded(w, h, bg, &ForwardedDraw::builtin_triangle())
             .expect("a good forwarded render still succeeds after the error flood");
         assert_eq!((good.width, good.height), (w, h));
+    }
+
+    // ---- Phase-2b: real mesh (vertex buffers, multi-draw, per-viewport, indexed) ---------------
+
+    /// Compile a WGSL shader for one stage to SPIR-V words with naga (a pure-Rust compiler — no
+    /// glslang/glslc needed), forcing a single entry point named `main`. Lets these tests author
+    /// real VBO-reading shaders offline, so the geometry path is exercised with actual meshes rather
+    /// than only the built-in bufferless triangle.
+    fn compile_wgsl(src: &str, stage: naga::ShaderStage) -> Vec<u32> {
+        let module = naga::front::wgsl::parse_str(src).expect("wgsl parse");
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("wgsl validate");
+        let pipe = naga::back::spv::PipelineOptions {
+            shader_stage: stage,
+            entry_point: "main".to_string(),
+        };
+        naga::back::spv::write_vec(
+            &module,
+            &info,
+            &naga::back::spv::Options::default(),
+            Some(&pipe),
+        )
+        .expect("spv emit")
+    }
+
+    /// Vertex shader reading `pos: vec2 @location(0)` + `color: vec3 @location(1)` from the VBO.
+    const MESH_VS: &str = r#"
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };
+@vertex
+fn main(@location(0) p: vec2<f32>, @location(1) c: vec3<f32>) -> VOut {
+    return VOut(vec4<f32>(p, 0.0, 1.0), c);
+}
+"#;
+    /// Fragment shader emitting the interpolated vertex colour.
+    const MESH_FS: &str = r#"
+@fragment
+fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
+    return vec4<f32>(c, 1.0);
+}
+"#;
+
+    /// Pack `[x, y, r, g, b]` vertices (stride 20B) into a VBO byte blob.
+    fn pack_verts(verts: &[[f32; 5]]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(verts.len() * 20);
+        for v in verts {
+            for f in v {
+                b.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        b
+    }
+
+    /// The pos(vec2)+color(vec3) attribute layout for [`MESH_VS`], stride 20.
+    fn mesh_attrs() -> [VertexAttr; 2] {
+        use infinigpu_abi::wire::vk_vformat as V;
+        [
+            VertexAttr { location: 0, format: V::R32G32_SFLOAT, offset: 0 },
+            VertexAttr { location: 1, format: V::R32G32B32_SFLOAT, offset: 8 },
+        ]
+    }
+
+    /// A forwarded VBO triangle renders **the mesh's own geometry and colours** — not the built-in
+    /// triangle. Proves the whole Phase-2b path on real silicon: non-empty vertex-input state, a
+    /// bound vertex buffer, per-vertex attributes flowing to the fragment shader. The triangle is
+    /// placed at known NDC positions with pure R/G/B vertices, so: its centroid is a blended
+    /// interior pixel (R+G+B ≈ 255, the barycentric sum of three unit-sum colours); the region near
+    /// the blue vertex is blue-dominant; and the frame corners (outside the triangle) stay
+    /// background. A gl_VertexIndex shader ignoring the VBO could not produce this.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_vbo_triangle_renders_mesh_colors() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let vs = compile_wgsl(MESH_VS, naga::ShaderStage::Vertex);
+        let fs = compile_wgsl(MESH_FS, naga::ShaderStage::Fragment);
+        assert_ne!(vs, fs, "vertex and fragment SPIR-V must be distinct modules");
+        // Upward-pointing triangle, centered. Vulkan clip space: +y is DOWN. Pure R/G/B vertices.
+        let verts = pack_verts(&[
+            [-0.6, 0.5, 1.0, 0.0, 0.0],  // bottom-left  = red
+            [0.6, 0.5, 0.0, 1.0, 0.0],   // bottom-right = green
+            [0.0, -0.6, 0.0, 0.0, 1.0],  // top-center   = blue
+        ]);
+        let attrs = mesh_attrs();
+        let draws = [DrawCmd { count: 3, instance_count: 1, first: 0, vertex_offset: 0, viewport: [0.0; 4] }];
+        let draw = ForwardedDraw {
+            vertex_spirv: &vs,
+            vertex_entry: c"main",
+            fragment_spirv: &fs,
+            fragment_entry: c"main",
+            vertex_count: 0,
+            topology: 0,
+            geometry: Some(Geometry {
+                vertex_data: &verts,
+                vertex_stride: 20,
+                attrs: &attrs,
+                index_data: &[],
+                index_u32: false,
+                draws: &draws,
+            }),
+        };
+        let (w, h) = (256u32, 256u32);
+        let bg = [0.0, 0.0, 0.0, 1.0];
+        let frame = gpu.render_forwarded(w, h, bg, &draw).expect("mesh render");
+        assert_eq!(frame.rgba.len(), (w * h * 4) as usize);
+
+        // NDC -> pixel: px = (ndc.x*0.5+0.5)*W, py = (ndc.y*0.5+0.5)*H.
+        let px = |nx: f32| ((nx * 0.5 + 0.5) * w as f32).round().clamp(0.0, (w - 1) as f32) as u32;
+        let py = |ny: f32| ((ny * 0.5 + 0.5) * h as f32).round().clamp(0.0, (h - 1) as f32) as u32;
+
+        // Centroid at NDC (0, 0.133): a blended interior pixel. Unit-sum colours ⇒ R+G+B ≈ 255.
+        let c = frame.pixel(px(0.0), py(0.133));
+        let sum = c[0] as u32 + c[1] as u32 + c[2] as u32;
+        assert!(
+            (215..=295).contains(&sum),
+            "centroid must be a blended interior pixel (R+G+B≈255), got {c:?} sum={sum}"
+        );
+        assert_eq!(c[3], 255, "alpha opaque");
+
+        // All three pure vertex colours must render *somewhere* — proof the per-vertex colour
+        // attribute flows from the VBO through to the fragment output. (Orientation-agnostic: which
+        // screen corner each vertex lands in depends on clip-space handedness, but a shader ignoring
+        // the VBO could never produce a distinct red AND green AND blue region.)
+        let (mut red, mut green, mut blue) = (0u32, 0u32, 0u32);
+        for p in frame.rgba.chunks_exact(4) {
+            let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+            if r > 150 && r - g > 60 && r - b > 60 {
+                red += 1;
+            }
+            if g > 150 && g - r > 60 && g - b > 60 {
+                green += 1;
+            }
+            if b > 150 && b - r > 60 && b - g > 60 {
+                blue += 1;
+            }
+        }
+        assert!(
+            red > 40 && green > 40 && blue > 40,
+            "each vertex colour must render a region (red={red} green={green} blue={blue})"
+        );
+
+        // The four corners are outside the triangle → background.
+        for (cx, cy) in [(2, 2), (w - 3, 2), (2, h - 3), (w - 3, h - 3)] {
+            let p = frame.pixel(cx, cy);
+            assert!(
+                p[0] < 20 && p[1] < 20 && p[2] < 20,
+                "corner ({cx},{cy}) must be background, got {p:?}"
+            );
+        }
+
+        // Determinism: a second render is byte-identical (cached pipeline + re-uploaded VBO).
+        let f2 = gpu.render_forwarded(w, h, bg, &draw).expect("mesh render 2");
+        assert_eq!(frame.rgba, f2.rgba, "mesh render must be deterministic");
+        eprintln!("forwarded_vbo_triangle_renders_mesh_colors: OK (centroid sum={sum})");
+    }
+
+    /// Multi-draw + per-draw viewport + indexed draw, all in one submit. Draw #1 fills the LEFT half
+    /// (its own viewport) with a red indexed quad; draw #2 fills the RIGHT half with a green indexed
+    /// quad — from a single shared vertex+index buffer. Proves: `cmd_draw_indexed`, a bound index
+    /// buffer, more than one draw per submit, and that each draw's viewport places it independently.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_multidraw_viewports_indexed() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let vs = compile_wgsl(MESH_VS, naga::ShaderStage::Vertex);
+        let fs = compile_wgsl(MESH_FS, naga::ShaderStage::Fragment);
+        // A fullscreen quad in NDC (covers the whole of whatever viewport it's drawn into). Verts
+        // 0..3 red, 4..7 green — the vertex_offset selects which colour set a draw uses.
+        let quad = |cr: f32, cg: f32, cb: f32| {
+            [
+                [-1.0, -1.0, cr, cg, cb],
+                [1.0, -1.0, cr, cg, cb],
+                [1.0, 1.0, cr, cg, cb],
+                [-1.0, 1.0, cr, cg, cb],
+            ]
+        };
+        let mut v = Vec::new();
+        v.extend_from_slice(&quad(1.0, 0.0, 0.0)); // 0..3 red
+        v.extend_from_slice(&quad(0.0, 1.0, 0.0)); // 4..7 green
+        let verts = pack_verts(&v);
+        let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+        let index_data: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let attrs = mesh_attrs();
+        let (w, h) = (256u32, 128u32);
+        let hw = w as f32 / 2.0;
+        let draws = [
+            // Left half: red quad (vertices 0..3).
+            DrawCmd { count: 6, instance_count: 1, first: 0, vertex_offset: 0, viewport: [0.0, 0.0, hw, h as f32] },
+            // Right half: green quad (same 6 indices + vertex_offset 4 → vertices 4..7).
+            DrawCmd { count: 6, instance_count: 1, first: 0, vertex_offset: 4, viewport: [hw, 0.0, hw, h as f32] },
+        ];
+        let draw = ForwardedDraw {
+            vertex_spirv: &vs,
+            vertex_entry: c"main",
+            fragment_spirv: &fs,
+            fragment_entry: c"main",
+            vertex_count: 0,
+            topology: 0,
+            geometry: Some(Geometry {
+                vertex_data: &verts,
+                vertex_stride: 20,
+                attrs: &attrs,
+                index_data: &index_data,
+                index_u32: false,
+                draws: &draws,
+            }),
+        };
+        let bg = [0.0, 0.0, 0.0, 1.0];
+        let frame = gpu.render_forwarded(w, h, bg, &draw).expect("multidraw render");
+
+        let left = frame.pixel(w / 4, h / 2);
+        let right = frame.pixel(3 * w / 4, h / 2);
+        assert!(
+            left[0] > 200 && left[1] < 40 && left[2] < 40,
+            "left viewport must be red, got {left:?}"
+        );
+        assert!(
+            right[1] > 200 && right[0] < 40 && right[2] < 40,
+            "right viewport must be green, got {right:?}"
+        );
+        eprintln!("forwarded_multidraw_viewports_indexed: OK (left={left:?} right={right:?})");
     }
 }

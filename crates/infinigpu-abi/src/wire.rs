@@ -360,6 +360,40 @@ pub mod vk_op {
     /// followed by a [`ForwardedDrawTail`] + the SPIR-V blobs + entry-point names; the host
     /// compiles the forwarded SPIR-V with the real driver and replays the draw (no fixed op).
     pub const FORWARDED: u32 = 2;
+    /// **Forwarded command list** (Phase-2b, `docs/3D-COMPLETENESS-ROADMAP.md`): the superset of
+    /// [`FORWARDED`] that carries a real mesh — a vertex buffer (+ optional index buffer), a
+    /// vertex-input layout, and an ordered list of draws (multi-draw) each with its own viewport.
+    /// The [`VulkanWorkload`] is followed by a [`ForwardedCmdListTail`] and its trailing sections
+    /// (see that struct's docs). This is the op that makes any real vertex-buffered geometry render;
+    /// [`FORWARDED`] remains the bufferless single-draw fast path (the built-in triangle, fullscreen
+    /// shader passes). Both share the same SPIR-V-compile + present machinery host-side.
+    pub const FORWARDED_CMDLIST: u32 = 3;
+}
+
+/// Vertex-attribute formats on the wire ([`VertexAttrWire::format`]) — our own small enum so the
+/// wire doesn't couple to any Vulkan header's numeric values; the host maps each to the real
+/// `VkFormat`. Covers the attribute types a typical mesh vertex uses (float position/normal/uv +
+/// packed 8-bit colour). Unknown values map host-side to the widest float (fail-safe: the driver
+/// reads at most the declared stride, never past the vertex buffer).
+pub mod vk_vformat {
+    /// `float` — one 32-bit float.
+    pub const R32_SFLOAT: u32 = 0;
+    /// `vec2` — two 32-bit floats (2D position / UV).
+    pub const R32G32_SFLOAT: u32 = 1;
+    /// `vec3` — three 32-bit floats (position / normal / colour).
+    pub const R32G32B32_SFLOAT: u32 = 2;
+    /// `vec4` — four 32-bit floats (colour / tangent).
+    pub const R32G32B32A32_SFLOAT: u32 = 3;
+    /// Packed 8-bit-per-channel normalized colour (`u8[4]` → `vec4` in `[0,1]`).
+    pub const R8G8B8A8_UNORM: u32 = 4;
+    /// One 32-bit unsigned integer (e.g. a packed colour / index id read as `uint`).
+    pub const R32_UINT: u32 = 5;
+}
+
+/// Index-buffer element width ([`ForwardedCmdListTail::index_type`]).
+pub mod index_type {
+    pub const U16: u32 = 0;
+    pub const U32: u32 = 1;
 }
 
 /// Primitive topology on the wire ([`ForwardedDrawTail::topology`]) — our own small enum so the
@@ -413,6 +447,92 @@ pub struct ForwardedDrawTail {
     pub vertex_entry_len: u32,
     /// Byte length of the fragment entry-point name (incl. trailing NUL).
     pub fragment_entry_len: u32,
+}
+
+/// Trailing header for a [`vk_op::FORWARDED_CMDLIST`] draw (Phase-2b command list). Sits
+/// immediately after the fixed [`VulkanWorkload`] and is followed, **in this exact order**, by:
+///   1. `attr_count` × [`VertexAttrWire`]  (12 B each, 4-aligned),
+///   2. `draw_count` × [`DrawCmdWire`]     (32 B each, 4-aligned),
+///   3. vertex-stage SPIR-V — `vertex_spirv_len` bytes (multiple of 4),
+///   4. fragment-stage SPIR-V — `fragment_spirv_len` bytes,
+///   5. vertex-buffer data — `vertex_data_len` bytes (arbitrary length),
+///   6. index-buffer data — `index_data_len` bytes (0 ⇒ non-indexed draws),
+///   7. vertex entry-point name — `vertex_entry_len` bytes (incl. trailing NUL),
+///   8. fragment entry-point name — `fragment_entry_len` bytes (incl. trailing NUL).
+/// Sections 1–4 are all 4-byte-multiples so each stays 4-aligned relative to the tail (the tail is
+/// 12×u32 = 48 B); the arbitrary-length byte blobs (5–8) come last, read as raw bytes so their odd
+/// lengths never misalign a fixed-layout array. Every length is guest-controlled and MUST be
+/// bounds-checked against the actual payload length before use (fail-closed).
+///
+/// `vertex_stride == 0` means "no vertex buffer" (bufferless, like [`ForwardedDrawTail`] — the
+/// shader synthesizes geometry); otherwise binding 0 has that stride and the `attr_count`
+/// attributes describe it. 48 bytes, 4-byte aligned.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct ForwardedCmdListTail {
+    /// Byte length of the vertex-stage SPIR-V blob.
+    pub vertex_spirv_len: u32,
+    /// Byte length of the fragment-stage SPIR-V blob.
+    pub fragment_spirv_len: u32,
+    /// Byte length of the vertex entry-point name (incl. trailing NUL).
+    pub vertex_entry_len: u32,
+    /// Byte length of the fragment entry-point name (incl. trailing NUL).
+    pub fragment_entry_len: u32,
+    /// Bytes per vertex (binding 0 stride); `0` ⇒ bufferless (no vertex buffer bound).
+    pub vertex_stride: u32,
+    /// Number of [`VertexAttrWire`]s that follow (0 when bufferless).
+    pub attr_count: u32,
+    /// Byte length of the vertex-buffer data blob.
+    pub vertex_data_len: u32,
+    /// Byte length of the index-buffer data blob; `0` ⇒ non-indexed draws.
+    pub index_data_len: u32,
+    /// [`index_type`] (ignored when `index_data_len == 0`).
+    pub index_type: u32,
+    /// Number of [`DrawCmdWire`]s that follow (≥ 1 for anything to render).
+    pub draw_count: u32,
+    /// [`vk_topology`] for every draw in the list.
+    pub topology: u32,
+    /// Additive headroom (0 today) — carved into future fields with the min(len, size_of) zero-fill
+    /// rule, so an older host reads a newer guest's tail without breaking.
+    pub _reserved: u32,
+}
+
+/// One vertex attribute in a [`ForwardedCmdListTail`] (follows the tail). Describes one input the
+/// vertex shader reads from binding 0. 12 bytes, 4-aligned.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct VertexAttrWire {
+    /// `layout(location = N)` in the vertex shader.
+    pub location: u32,
+    /// [`vk_vformat`].
+    pub format: u32,
+    /// Byte offset of this attribute within one vertex.
+    pub offset: u32,
+}
+
+/// One draw command in a [`ForwardedCmdListTail`] (follows the attribute array). Mirrors a guest
+/// `vkCmdDraw`/`vkCmdDrawIndexed`. Whether it is indexed is decided list-wide by
+/// `index_data_len != 0` (a single index buffer serves the list — the common "one mesh, many draws"
+/// shape). 32 bytes, 4-aligned.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct DrawCmdWire {
+    /// `vertex_count` (non-indexed) or `index_count` (indexed).
+    pub count: u32,
+    /// Instance count (`0` is treated as `1` host-side).
+    pub instance_count: u32,
+    /// `first_vertex` (non-indexed) or `first_index` (indexed).
+    pub first: u32,
+    /// Value added to every index before fetching a vertex (indexed only). **Signed.**
+    pub vertex_offset: i32,
+    /// Viewport x (pixels).
+    pub vp_x: f32,
+    /// Viewport y (pixels).
+    pub vp_y: f32,
+    /// Viewport width (pixels); `0` ⇒ use the full render target.
+    pub vp_w: f32,
+    /// Viewport height (pixels).
+    pub vp_h: f32,
 }
 
 /// `DISPLAY_SCANOUT` payload (see [`encoding::DISPLAY_SCANOUT`]): the guest's real
