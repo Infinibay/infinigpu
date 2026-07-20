@@ -12,6 +12,7 @@
 
 #include "infinigpu_private.h"
 #include "infinigpu_forwarded.h"
+#include "infinigpu_abi.h"    /* VertexAttrWire / DrawCmdWire — the cmdlist encoder's arrays */
 #include "infinigpu_kmd.h"
 
 #include <stdlib.h>
@@ -154,6 +155,117 @@ infinigpu_run_copy(const struct infinigpu_pending_copy *pc)
              src + (uint64_t)y * img->row_pitch, (size_t)w * bpp);
 }
 
+/* Phase-2b: forward a real mesh (bound vertex/index buffers + multi-draw) via the command-list
+ * encoder. The bound pipeline captured a non-zero vertex stride, so the app reads a vertex buffer;
+ * we read its host-mapped bytes (whole vertices from the bound offset to the buffer end), build the
+ * attr/draw wire arrays, and encode. Textures/UBO descriptors are a follow-up (passed empty). */
+static VkResult
+infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buffer *cmd,
+                         struct infinigpu_pipeline *p,
+                         const struct infinigpu_pipeline_stage *vs,
+                         const struct infinigpu_pipeline_stage *fs,
+                         struct infinigpu_image *img)
+{
+   int drm_fd = dev->physical_device->drm_fd;
+   const uint32_t width = img->vk.extent.width;
+   const uint32_t height = img->vk.extent.height;
+   float bg[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+   if (cmd->has_clear)
+      for (int c = 0; c < 4; c++)
+         bg[c] = cmd->clear_value.float32[c];
+
+   const uint32_t topo =
+      (p->topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
+         ? INFINIGPU_VK_TOPOLOGY_TRIANGLE_STRIP
+         : INFINIGPU_VK_TOPOLOGY_TRIANGLE_LIST;
+
+   /* Vertex buffer: whole vertices from the CmdBindVertexBuffers offset to the buffer end. */
+   struct infinigpu_buffer *vb = cmd->vbuf;
+   if (!vb || !vb->map || cmd->vbuf_offset >= vb->total_size)
+      return vk_errorf(dev, VK_ERROR_UNKNOWN, "cmdlist draw without a valid vertex buffer");
+   const uint8_t *vdata = (const uint8_t *)vb->map + cmd->vbuf_offset;
+   uint64_t vavail = vb->total_size - cmd->vbuf_offset;
+   uint32_t vlen = (uint32_t)((vavail / p->vertex_stride) * p->vertex_stride);
+   if (vlen == 0)
+      return vk_errorf(dev, VK_ERROR_UNKNOWN, "vertex buffer smaller than one vertex");
+
+   /* Index buffer: forwarded only if a draw is indexed (the host treats index presence as global,
+    * so a command buffer must not mix indexed and non-indexed draws — content rarely does). */
+   bool any_indexed = false;
+   for (uint32_t i = 0; i < cmd->draw_count; i++)
+      if (cmd->draws[i].indexed) {
+         any_indexed = true;
+         break;
+      }
+   const uint8_t *idata = NULL;
+   uint32_t ilen = 0;
+   if (any_indexed) {
+      struct infinigpu_buffer *ib = cmd->ibuf;
+      if (!ib || !ib->map || cmd->ibuf_offset >= ib->total_size)
+         return vk_errorf(dev, VK_ERROR_UNKNOWN, "indexed draw without a valid index buffer");
+      uint32_t istride = (cmd->index_type == INFINIGPU_INDEX_TYPE_U32) ? 4u : 2u;
+      idata = (const uint8_t *)ib->map + cmd->ibuf_offset;
+      uint64_t iavail = ib->total_size - cmd->ibuf_offset;
+      ilen = (uint32_t)((iavail / istride) * istride);
+   }
+
+   /* Wire arrays: attrs from the pipeline's captured vertex-input, draws from the recorded list. */
+   struct VertexAttrWire attrs[INFINIGPU_MAX_ATTRS];
+   for (uint32_t a = 0; a < p->attr_count; a++) {
+      attrs[a].location = p->attrs[a].location;
+      attrs[a].format = p->attrs[a].format;
+      attrs[a].offset = p->attrs[a].offset;
+   }
+   struct DrawCmdWire *draws = malloc(sizeof(*draws) * cmd->draw_count);
+   if (!draws)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   for (uint32_t i = 0; i < cmd->draw_count; i++) {
+      draws[i].count = cmd->draws[i].count;
+      draws[i].instance_count = cmd->draws[i].instance_count;
+      draws[i].first = cmd->draws[i].first;
+      draws[i].vertex_offset = cmd->draws[i].vertex_offset;
+      draws[i].vp_x = cmd->draws[i].viewport[0];
+      draws[i].vp_y = cmd->draws[i].viewport[1];
+      draws[i].vp_w = cmd->draws[i].viewport[2];
+      draws[i].vp_h = cmd->draws[i].viewport[3];
+   }
+
+   const size_t cap = 256 + vs->spirv_size + fs->spirv_size +
+                      strlen(vs->entrypoint) + 1 + strlen(fs->entrypoint) + 1 +
+                      (size_t)p->attr_count * sizeof(struct VertexAttrWire) +
+                      (size_t)cmd->draw_count * sizeof(struct DrawCmdWire) +
+                      vlen + ilen + cmd->push_const_len;
+   uint8_t *payload = malloc(cap);
+   if (!payload) {
+      free(draws);
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   /* scanout_addr=0: the KMD overwrites it with the target BO's dma_addr. */
+   const size_t n = infinigpu_encode_forwarded_cmdlist(
+      payload, cap, width, height, bg, 0,
+      vs->spirv, vs->spirv_size / 4, fs->spirv, fs->spirv_size / 4,
+      vs->entrypoint, fs->entrypoint,
+      p->vertex_stride, attrs, p->attr_count,
+      vdata, vlen, idata, ilen, cmd->index_type,
+      topo, p->depth_flags,
+      cmd->push_const, cmd->push_const_len,
+      draws, cmd->draw_count,
+      NULL, 0, NULL, 0);
+   free(draws);
+   if (n == 0) {
+      free(payload);
+      return vk_errorf(dev, VK_ERROR_UNKNOWN, "cmdlist payload did not fit");
+   }
+
+   const int ret = infinigpu_submit_forwarded(drm_fd, img->mem->gem_handle,
+                                               width, height, payload, (uint32_t)n);
+   free(payload);
+   if (ret != 0)
+      return vk_errorf(dev, VK_ERROR_DEVICE_LOST, "SUBMIT_FORWARDED failed (%d)", ret);
+   return VK_SUCCESS;
+}
+
 /* Forward one command buffer's recorded draw to the host, then run its deferred
  * copies. A command buffer with no draw (e.g. a pure clear/copy) skips the ioctl. */
 static VkResult
@@ -180,40 +292,48 @@ infinigpu_replay_cmd_buffer(struct infinigpu_device *dev,
          return vk_errorf(dev, VK_ERROR_UNKNOWN,
                           "color attachment has no bound memory");
 
-      const uint32_t width = img->vk.extent.width;
-      const uint32_t height = img->vk.extent.height;
-      float bg[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-      if (cmd->has_clear)
-         for (int c = 0; c < 4; c++)
-            bg[c] = cmd->clear_value.float32[c];
+      /* Phase-2b: a pipeline that reads a vertex buffer (non-zero stride) takes the command-list
+       * path (real mesh); otherwise the Phase-1 bufferless path (SM-generated vertices). */
+      if (p->vertex_stride > 0 && cmd->vbuf) {
+         VkResult r = infinigpu_replay_cmdlist(dev, cmd, p, vs, fs, img);
+         if (r != VK_SUCCESS)
+            return r;
+      } else {
+         const uint32_t width = img->vk.extent.width;
+         const uint32_t height = img->vk.extent.height;
+         float bg[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+         if (cmd->has_clear)
+            for (int c = 0; c < 4; c++)
+               bg[c] = cmd->clear_value.float32[c];
 
-      const uint32_t topo =
-         (p->topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
-            ? INFINIGPU_VK_TOPOLOGY_TRIANGLE_STRIP
-            : INFINIGPU_VK_TOPOLOGY_TRIANGLE_LIST;
+         const uint32_t topo =
+            (p->topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
+               ? INFINIGPU_VK_TOPOLOGY_TRIANGLE_STRIP
+               : INFINIGPU_VK_TOPOLOGY_TRIANGLE_LIST;
 
-      const size_t cap = 128 + vs->spirv_size + fs->spirv_size +
-                         strlen(vs->entrypoint) + 1 + strlen(fs->entrypoint) + 1;
-      uint8_t *payload = malloc(cap);
-      if (!payload)
-         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         const size_t cap = 128 + vs->spirv_size + fs->spirv_size +
+                            strlen(vs->entrypoint) + 1 + strlen(fs->entrypoint) + 1;
+         uint8_t *payload = malloc(cap);
+         if (!payload)
+            return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-      /* scanout_addr=0: the KMD overwrites it with the target BO's dma_addr. */
-      const size_t n = infinigpu_encode_forwarded(
-         payload, cap, width, height, bg, 0, cmd->draw_vertex_count, topo,
-         vs->spirv, vs->spirv_size / 4, fs->spirv, fs->spirv_size / 4,
-         vs->entrypoint, fs->entrypoint);
-      if (n == 0) {
+         /* scanout_addr=0: the KMD overwrites it with the target BO's dma_addr. */
+         const size_t n = infinigpu_encode_forwarded(
+            payload, cap, width, height, bg, 0, cmd->draw_vertex_count, topo,
+            vs->spirv, vs->spirv_size / 4, fs->spirv, fs->spirv_size / 4,
+            vs->entrypoint, fs->entrypoint);
+         if (n == 0) {
+            free(payload);
+            return vk_errorf(dev, VK_ERROR_UNKNOWN, "forwarded payload did not fit");
+         }
+
+         const int ret = infinigpu_submit_forwarded(drm_fd, img->mem->gem_handle,
+                                                     width, height, payload, (uint32_t)n);
          free(payload);
-         return vk_errorf(dev, VK_ERROR_UNKNOWN, "forwarded payload did not fit");
+         if (ret != 0)
+            return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
+                             "SUBMIT_FORWARDED failed (%d)", ret);
       }
-
-      const int ret = infinigpu_submit_forwarded(drm_fd, img->mem->gem_handle,
-                                                  width, height, payload, (uint32_t)n);
-      free(payload);
-      if (ret != 0)
-         return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
-                          "SUBMIT_FORWARDED failed (%d)", ret);
    }
 
    for (uint32_t c = 0; c < cmd->copy_count; c++)

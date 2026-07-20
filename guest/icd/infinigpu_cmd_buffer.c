@@ -11,6 +11,9 @@
  */
 
 #include "infinigpu_private.h"
+#include "infinigpu_forwarded.h"
+
+#include <string.h>
 
 #include "vk_alloc.h"
 #include "vk_command_buffer.h"
@@ -24,7 +27,26 @@ infinigpu_cmd_reset_state(struct infinigpu_cmd_buffer *cmd)
    cmd->has_clear = false;
    cmd->draw_vertex_count = 0;
    cmd->draw_count = 0;
+   cmd->vbuf = NULL;
+   cmd->vbuf_offset = 0;
+   cmd->ibuf = NULL;
+   cmd->ibuf_offset = 0;
+   cmd->index_type = INFINIGPU_INDEX_TYPE_U16;
+   cmd->has_dyn_viewport = false;
+   cmd->push_const_len = 0;
    cmd->copy_count = 0;
+}
+
+/* The viewport in effect for a draw: the last CmdSetViewport, else all-zero so the host falls back
+ * to the full render target (its `viewport[2] == 0` convention). */
+static void
+infinigpu_current_viewport(const struct infinigpu_cmd_buffer *cmd, float out[4])
+{
+   if (cmd->has_dyn_viewport) {
+      memcpy(out, cmd->dyn_viewport, sizeof(float) * 4);
+   } else {
+      out[0] = out[1] = out[2] = out[3] = 0.0f;
+   }
 }
 
 static void
@@ -129,15 +151,121 @@ infinigpu_CmdEndRendering(VkCommandBuffer commandBuffer)
    /* Nothing to flush at record time — the draw is forwarded at submit. */
 }
 
+/* Append a recorded draw to the multi-draw list (shared by CmdDraw + CmdDrawIndexed). Silently caps
+ * at INFINIGPU_MAX_DRAWS — a command buffer with more draws than that overflows the static list; we
+ * flag it so the submit fails closed rather than dropping geometry. */
+static void
+infinigpu_record_draw(struct infinigpu_cmd_buffer *cmd, uint32_t count,
+                      uint32_t instance_count, uint32_t first, int32_t vertex_offset,
+                      bool indexed)
+{
+   if (cmd->draw_count >= INFINIGPU_MAX_DRAWS) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+   struct infinigpu_draw *d = &cmd->draws[cmd->draw_count++];
+   d->count = count;
+   d->instance_count = instance_count;
+   d->first = first;
+   d->vertex_offset = vertex_offset;
+   d->indexed = indexed;
+   infinigpu_current_viewport(cmd, d->viewport);
+   /* Kept for the bufferless fallback (no vertex buffer bound): the last non-indexed vertexCount. */
+   if (!indexed)
+      cmd->draw_vertex_count = count;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 infinigpu_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
                   uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
-   /* Record the draw; a single forwarded submit replays the bound pipeline's
-    * shaders over vertexCount vertices at submit time. */
-   cmd->draw_vertex_count = vertexCount;
-   cmd->draw_count++;
+   /* Record the draw; a single forwarded submit replays the bound pipeline's shaders over the
+    * bound vertex buffer (or SM-generated vertices if none) at submit time. */
+   infinigpu_record_draw(cmd, vertexCount, instanceCount, firstVertex, 0, false);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
+                         uint32_t instanceCount, uint32_t firstIndex,
+                         int32_t vertexOffset, uint32_t firstInstance)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   infinigpu_record_draw(cmd, indexCount, instanceCount, firstIndex, vertexOffset, true);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding,
+                                uint32_t bindingCount, const VkBuffer *pBuffers,
+                                const VkDeviceSize *pOffsets, const VkDeviceSize *pSizes,
+                                const VkDeviceSize *pStrides)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   /* The wire carries a single interleaved binding 0; capture it, ignore higher bindings. */
+   for (uint32_t i = 0; i < bindingCount; i++) {
+      if (firstBinding + i != 0)
+         continue;
+      cmd->vbuf = pBuffers ? infinigpu_buffer_from_handle(pBuffers[i]) : NULL;
+      cmd->vbuf_offset = pOffsets ? pOffsets[i] : 0;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdBindIndexBuffer2(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                              VkDeviceSize offset, VkDeviceSize size, VkIndexType indexType)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   cmd->ibuf = infinigpu_buffer_from_handle(buffer);
+   cmd->ibuf_offset = offset;
+   cmd->index_type = (indexType == VK_INDEX_TYPE_UINT32) ? INFINIGPU_INDEX_TYPE_U32
+                                                         : INFINIGPU_INDEX_TYPE_U16;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetViewport(VkCommandBuffer commandBuffer, uint32_t firstViewport,
+                         uint32_t viewportCount, const VkViewport *pViewports)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   /* We forward a single viewport per draw; capture viewport 0. */
+   if (firstViewport == 0 && viewportCount >= 1) {
+      cmd->dyn_viewport[0] = pViewports[0].x;
+      cmd->dyn_viewport[1] = pViewports[0].y;
+      cmd->dyn_viewport[2] = pViewports[0].width;
+      cmd->dyn_viewport[3] = pViewports[0].height;
+      cmd->has_dyn_viewport = true;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetViewportWithCount(VkCommandBuffer commandBuffer, uint32_t viewportCount,
+                                  const VkViewport *pViewports)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   if (viewportCount >= 1) {
+      cmd->dyn_viewport[0] = pViewports[0].x;
+      cmd->dyn_viewport[1] = pViewports[0].y;
+      cmd->dyn_viewport[2] = pViewports[0].width;
+      cmd->dyn_viewport[3] = pViewports[0].height;
+      cmd->has_dyn_viewport = true;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
+                           VkShaderStageFlags stageFlags, uint32_t offset, uint32_t size,
+                           const void *pValues)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   /* Place the bytes at their declared offset; the host applies the whole block at offset 0 to
+    * VERTEX|FRAGMENT. Bound to the 256 B hardware max (the host rejects anything larger). */
+   uint64_t end = (uint64_t)offset + size;
+   if (end > INFINIGPU_MAX_PUSH_CONST) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+   memcpy(cmd->push_const + offset, pValues, size);
+   if (end > cmd->push_const_len)
+      cmd->push_const_len = (uint32_t)end;
 }
 
 VKAPI_ATTR void VKAPI_CALL

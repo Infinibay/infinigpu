@@ -11,6 +11,7 @@
  */
 
 #include "infinigpu_private.h"
+#include "infinigpu_forwarded.h"
 
 #include <string.h>
 
@@ -18,6 +19,23 @@
 #include "vk_log.h"
 #include "vk_object.h"
 #include "vk_util.h"
+
+/* Map a VkFormat used for a vertex attribute to the wire `vk_vformat`. The host's `map_vformat`
+ * has a safe fallback, but we only forward the formats the encoder documents; an unrecognized
+ * attribute format forwards as RGBA32F (won't crash, may misread — rare in practice). */
+static uint32_t
+infinigpu_map_vformat(VkFormat f)
+{
+   switch (f) {
+   case VK_FORMAT_R32_SFLOAT:          return INFINIGPU_VFORMAT_R32_SFLOAT;
+   case VK_FORMAT_R32G32_SFLOAT:       return INFINIGPU_VFORMAT_R32G32_SFLOAT;
+   case VK_FORMAT_R32G32B32_SFLOAT:    return INFINIGPU_VFORMAT_R32G32B32_SFLOAT;
+   case VK_FORMAT_R32G32B32A32_SFLOAT: return INFINIGPU_VFORMAT_R32G32B32A32_SFLOAT;
+   case VK_FORMAT_R8G8B8A8_UNORM:      return INFINIGPU_VFORMAT_R8G8B8A8_UNORM;
+   case VK_FORMAT_R32_UINT:            return INFINIGPU_VFORMAT_R32_UINT;
+   default:                            return INFINIGPU_VFORMAT_R32G32B32A32_SFLOAT;
+   }
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL
 infinigpu_CreateShaderModule(VkDevice _device,
@@ -120,6 +138,43 @@ infinigpu_graphics_pipeline_init(struct infinigpu_device *dev,
    p->topology = ci->pInputAssemblyState
                     ? ci->pInputAssemblyState->topology
                     : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+   /* Phase-2b: capture the vertex-input layout (binding 0 only — the wire is single-binding).
+    * `vertex_stride` stays 0 when the pipeline reads no vertex buffer, which routes submit to the
+    * bufferless FORWARDED path (SM-generated vertices, e.g. a fullscreen triangle). */
+   const VkPipelineVertexInputStateCreateInfo *vi = ci->pVertexInputState;
+   if (vi) {
+      for (uint32_t b = 0; b < vi->vertexBindingDescriptionCount; b++) {
+         if (vi->pVertexBindingDescriptions[b].binding == 0) {
+            p->vertex_stride = vi->pVertexBindingDescriptions[b].stride;
+            break;
+         }
+      }
+      for (uint32_t a = 0; a < vi->vertexAttributeDescriptionCount; a++) {
+         const VkVertexInputAttributeDescription *ad = &vi->pVertexAttributeDescriptions[a];
+         if (ad->binding != 0)
+            continue; /* multi-binding not on the wire yet — binding-0 attrs only */
+         if (p->attr_count >= INFINIGPU_MAX_ATTRS)
+            return vk_errorf(dev, VK_ERROR_UNKNOWN, "too many vertex attributes");
+         p->attrs[p->attr_count].location = ad->location;
+         p->attrs[p->attr_count].format = infinigpu_map_vformat(ad->format);
+         p->attrs[p->attr_count].offset = ad->offset;
+         p->attr_count++;
+      }
+   }
+
+   /* Phase-2d: pack the depth-test state into a ForwardedCmdListTail.depth_flags bitfield. VkCompareOp
+    * values (0..7) match INFINIGPU_DEPTH_CMP_* exactly. Ignored on the bufferless path (stride 0). */
+   const VkPipelineDepthStencilStateCreateInfo *ds = ci->pDepthStencilState;
+   if (ds && (ds->depthTestEnable || ds->depthWriteEnable)) {
+      uint32_t df = 0;
+      if (ds->depthTestEnable)
+         df |= INFINIGPU_DEPTH_TEST;
+      if (ds->depthWriteEnable)
+         df |= INFINIGPU_DEPTH_WRITE;
+      df |= ((uint32_t)ds->depthCompareOp) << INFINIGPU_DEPTH_COMPARE_SHIFT;
+      p->depth_flags = df;
+   }
 
    for (uint32_t i = 0; i < ci->stageCount; i++) {
       VkResult r = infinigpu_pipeline_add_stage(dev, p, &ci->pStages[i]);

@@ -48,6 +48,13 @@ extern "C" {
 /* A graphics pipeline forwards at most a vertex + fragment stage for now. */
 #define INFINIGPU_MAX_STAGES 2
 
+/* Phase-2b recording limits. The wire is single-binding (interleaved binding 0), so we capture
+ * at most this many vertex-input attributes and this many draws per command buffer, and cap
+ * push constants at the Vulkan hardware maximum (256 B). */
+#define INFINIGPU_MAX_ATTRS 16
+#define INFINIGPU_MAX_DRAWS 512
+#define INFINIGPU_MAX_PUSH_CONST 256
+
 struct infinigpu_instance {
    struct vk_instance vk;
 };
@@ -114,12 +121,27 @@ struct infinigpu_pipeline_stage {
    uint32_t spirv_size;          /* bytes */
 };
 
+/* One captured vertex-input attribute (binding 0), pre-mapped to a wire `vk_vformat`. */
+struct infinigpu_vertex_attr {
+   uint32_t location;
+   uint32_t format;   /* infinigpu_abi vk_vformat (INFINIGPU_VFORMAT_*) */
+   uint32_t offset;
+};
+
 struct infinigpu_pipeline {
    struct vk_object_base base;
    VkPipelineBindPoint bind_point;
    VkPrimitiveTopology topology;
    uint32_t stage_count;
    struct infinigpu_pipeline_stage stages[INFINIGPU_MAX_STAGES];
+
+   /* Phase-2b vertex-input capture (binding 0 only — the wire is single-binding). `vertex_stride`
+    * 0 ⇒ the pipeline reads no vertex buffer, so submit uses the bufferless FORWARDED path. */
+   uint32_t vertex_stride;
+   uint32_t attr_count;
+   struct infinigpu_vertex_attr attrs[INFINIGPU_MAX_ATTRS];
+   /* Phase-2d depth-test state, pre-packed as a ForwardedCmdListTail.depth_flags bitfield (0 ⇒ none). */
+   uint32_t depth_flags;
 };
 
 /* A dummy pipeline cache (we never cache — SPIR-V is forwarded, not compiled). */
@@ -139,6 +161,16 @@ struct infinigpu_pending_copy {
    VkExtent3D image_extent;
 };
 
+/* One recorded draw (CmdDraw / CmdDrawIndexed) with the dynamic viewport in effect. */
+struct infinigpu_draw {
+   uint32_t count;            /* vertexCount (non-indexed) or indexCount (indexed) */
+   uint32_t instance_count;
+   uint32_t first;           /* firstVertex or firstIndex */
+   int32_t vertex_offset;    /* CmdDrawIndexed vertexOffset (0 for non-indexed) */
+   bool indexed;
+   float viewport[4];        /* (x,y,w,h); w == 0 ⇒ host uses the full render target */
+};
+
 /* ---- VkCommandBuffer: direct-record model (no enqueue/replay) ---- */
 struct infinigpu_cmd_buffer {
    struct vk_command_buffer vk;  /* MUST be first */
@@ -150,8 +182,20 @@ struct infinigpu_cmd_buffer {
    VkRect2D render_area;
    VkClearColorValue clear_value;               /* pColorAttachments[0].clearValue (LOAD_OP_CLEAR) */
    bool has_clear;
-   uint32_t draw_vertex_count;                  /* last CmdDraw vertexCount (0 = no draw yet) */
-   uint32_t draw_count;                         /* number of draws recorded */
+   uint32_t draw_vertex_count;                  /* last CmdDraw vertexCount (bufferless fallback path) */
+   uint32_t draw_count;                         /* number of draws recorded (entries in draws[]) */
+
+   /* Phase-2b bound geometry (binding 0 + index buffer) + the multi-draw list. */
+   struct infinigpu_buffer *vbuf;               /* CmdBindVertexBuffers2 binding 0 */
+   uint64_t vbuf_offset;
+   struct infinigpu_buffer *ibuf;               /* CmdBindIndexBuffer2 */
+   uint64_t ibuf_offset;
+   uint32_t index_type;                         /* INFINIGPU_INDEX_TYPE_U16 / _U32 */
+   bool has_dyn_viewport;
+   float dyn_viewport[4];                       /* last CmdSetViewport viewport 0 (x,y,w,h) */
+   struct infinigpu_draw draws[INFINIGPU_MAX_DRAWS];
+   uint32_t push_const_len;                      /* highest push-constant byte written */
+   uint8_t push_const[INFINIGPU_MAX_PUSH_CONST]; /* CmdPushConstants payload (offset-placed) */
 
    struct infinigpu_pending_copy copies[INFINIGPU_MAX_COPIES];
    uint32_t copy_count;
