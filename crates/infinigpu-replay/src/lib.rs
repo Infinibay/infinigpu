@@ -171,6 +171,30 @@ pub struct Geometry<'a> {
     /// `var<push_constant>` / `layout(push_constant)`. Empty ⇒ an empty pipeline layout (no
     /// transform, raw NDC). Applied to the VERTEX|FRAGMENT stages at offset 0 before the draws.
     pub push_constants: &'a [u8],
+    /// One sampled texture (Phase-2c) bound at descriptor set 0 (binding 0 = image, binding 1 =
+    /// sampler), matching a WGSL `texture_2d`/`sampler` pair. `None` ⇒ no descriptor set (untextured).
+    /// The single-texture case; multi-texture is a follow-up.
+    pub texture: Option<Texture<'a>>,
+}
+
+/// Sampler configuration for a forwarded [`Texture`].
+#[derive(Clone, Copy)]
+pub struct SamplerCfg {
+    /// Linear min+mag filtering; `false` ⇒ nearest.
+    pub linear: bool,
+    /// Repeat/wrap addressing; `false` ⇒ clamp-to-edge.
+    pub repeat: bool,
+}
+
+/// A sampled texture forwarded from the guest: tightly-packed `R8G8B8A8_UNORM` pixels + a sampler
+/// config. The host uploads the pixels to a device-local image, transitions it to shader-read, and
+/// binds it (plus a sampler) through a descriptor set for the fragment shader to `textureSample`.
+pub struct Texture<'a> {
+    pub width: u32,
+    pub height: u32,
+    /// `width*height*4` RGBA8 bytes.
+    pub rgba: &'a [u8],
+    pub sampler: SamplerCfg,
 }
 
 /// Wire `vk_topology` u32 → `VkPrimitiveTopology`. Unknown values fall back to a triangle list
@@ -320,6 +344,10 @@ pub struct HostGpu {
     /// scanout address rarely changes), so an import is reused across frames. Invalidated via
     /// [`Self::forget_guest_import`] when the device unmaps that guest RAM (else the import dangles).
     guest_imports: Mutex<HashMap<(usize, u64), ImportedGuest>>,
+    /// Phase-2c: the fixed descriptor-set layout for one sampled texture (binding 0 = SAMPLED_IMAGE,
+    /// binding 1 = SAMPLER, FRAGMENT stage). Built lazily on first textured submit and reused (it is
+    /// content-independent). `null` until built; destroyed on drop.
+    tex_set_layout: Mutex<vk::DescriptorSetLayout>,
 }
 
 /// Fix D: a guest-RAM region imported as a `TRANSFER_DST` buffer the GPU can copy a frame into.
@@ -600,6 +628,15 @@ struct PipelineKey {
     /// Phase-2c push-constant block size (bytes); `0` ⇒ an empty pipeline layout. The layout (hence
     /// the pipeline) differs by this, so it is part of the key.
     pc_size: u32,
+    /// Phase-2c: whether the pipeline layout includes the texture descriptor-set layout. The layout
+    /// (hence the pipeline) differs, so it is part of the key.
+    has_texture: bool,
+}
+
+/// Whether a draw carries a texture (Phase-2c) — its pipeline layout then includes the descriptor-set
+/// layout, so this is part of the [`PipelineKey`].
+fn has_texture_of(draw: &ForwardedDraw) -> bool {
+    draw.geometry.as_ref().is_some_and(|g| g.texture.is_some())
 }
 
 /// Pack a `ForwardedDraw`'s depth state into the [`PipelineKey`] `depth_key` field. Returns
@@ -742,6 +779,38 @@ impl GeometryGpu {
             dev.destroy_buffer(b, None);
             dev.free_memory(m, None);
         }
+    }
+}
+
+/// Phase-2c: a sampled texture uploaded to the GPU for **one** submit — a host-visible staging buffer
+/// (filled with the guest's RGBA8), a device-local sampled image, its view, a sampler, and a
+/// descriptor pool + set (binding 0 = image, binding 1 = sampler). The staging→image copy + layout
+/// transitions are recorded into the frame's command buffer (before the render pass); everything is
+/// freed after the submit fence. Per submit (texture content varies); a by-id cache is a follow-up.
+struct TextureGpu {
+    staging: vk::Buffer,
+    staging_mem: vk::DeviceMemory,
+    image: vk::Image,
+    image_mem: vk::DeviceMemory,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    width: u32,
+    height: u32,
+}
+
+impl TextureGpu {
+    /// # Safety
+    /// `dev` must be the owning device and no submit referencing these objects may still be in flight.
+    unsafe fn destroy(&self, dev: &ash::Device) {
+        dev.destroy_descriptor_pool(self.pool, None); // frees the set
+        dev.destroy_sampler(self.sampler, None);
+        dev.destroy_image_view(self.view, None);
+        dev.destroy_image(self.image, None);
+        dev.free_memory(self.image_mem, None);
+        dev.destroy_buffer(self.staging, None);
+        dev.free_memory(self.staging_mem, None);
     }
 }
 
@@ -959,6 +1028,7 @@ impl HostGpu {
             ext_mem_host,
             host_ptr_align,
             guest_imports: Mutex::new(HashMap::new()),
+            tex_set_layout: Mutex::new(vk::DescriptorSetLayout::null()),
         })
     }
 
@@ -1144,15 +1214,24 @@ impl HostGpu {
     ) -> R<(vk::PipelineLayout, vk::Pipeline)> {
         let dev = &self.device;
         // Phase-2c: a push-constant range (VERTEX|FRAGMENT, offset 0) when the mesh carries a
-        // transform block, else an empty layout (the built-in / no-transform path, unchanged).
+        // transform block, and the texture descriptor-set layout (set 0) when it carries a texture,
+        // else an empty layout (the built-in / no-transform path, unchanged).
         let pc_size = push_const_size_of(draw);
         let pc_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(pc_size)];
+        let set_layouts: Vec<vk::DescriptorSetLayout> = if has_texture_of(draw) {
+            vec![self.tex_set_layout()?]
+        } else {
+            Vec::new()
+        };
         let mut layout_ci = vk::PipelineLayoutCreateInfo::default();
         if pc_size > 0 {
             layout_ci = layout_ci.push_constant_ranges(&pc_ranges);
+        }
+        if !set_layouts.is_empty() {
+            layout_ci = layout_ci.set_layouts(&set_layouts);
         }
         let layout = unsafe { dev.create_pipeline_layout(&layout_ci, None)? };
         let stages = [
@@ -1300,6 +1379,7 @@ impl HostGpu {
             vinput_hash: hash_vinput(draw),
             depth_key,
             pc_size: push_const_size_of(draw),
+            has_texture: has_texture_of(draw),
         };
         let mut cache = self.obj_cache.lock().unwrap_or_else(|e| e.into_inner());
         // Fail-closed bound before inserting anything new.
@@ -2114,14 +2194,30 @@ impl HostGpu {
         let ss = cache.get(&sk).expect("just inserted above");
         let t_setup = bd.map(|_| Instant::now());
 
-        // Phase-2b: upload the mesh (if any) for this submit. Freed after the fence completes below —
-        // the recorded draws reference the buffers until then. A failure here is a clean early return
-        // (the scratch is untouched, upload_geometry frees its own partials).
+        // Phase-2b/2c: upload the mesh + texture (if any) for this submit. Freed after the fence
+        // completes below — the recorded draws reference them until then. A failure here is a clean
+        // early return (the scratch is untouched; each upload frees its own partials).
         let geom_gpu = match draw.geometry.as_ref() {
             Some(g) if g.vertex_stride != 0 && !g.vertex_data.is_empty() => {
                 Some(self.upload_geometry(g)?)
             }
             _ => None,
+        };
+        let tex_gpu = match draw.geometry.as_ref().and_then(|g| g.texture.as_ref()) {
+            Some(t) => {
+                let sl = self.tex_set_layout()?;
+                match self.upload_texture(t, sl) {
+                    Ok(tg) => Some(tg),
+                    Err(e) => {
+                        // Free the already-uploaded mesh before bailing (no leak).
+                        if let Some(gg) = geom_gpu {
+                            unsafe { gg.destroy(dev) };
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            None => None,
         };
 
         // Single submit thread per device process + fence-wait before return ⇒ no frame N+1 vs. N
@@ -2136,6 +2232,7 @@ impl HostGpu {
             bg,
             draw,
             geom_gpu.as_ref(),
+            tex_gpu.as_ref(),
             ss.readback,
         )?;
         let t_record = bd.map(|_| Instant::now());
@@ -2146,9 +2243,12 @@ impl HostGpu {
             dev.queue_submit(self.queue, &submit, ss.fence)?;
         }
         self.wait_fence(ss.fence)?;
-        // The submit fence is signaled ⇒ the draws no longer reference the mesh buffers; free them.
+        // The submit fence is signaled ⇒ the draws no longer reference the mesh/texture; free them.
         if let Some(gg) = geom_gpu {
             unsafe { gg.destroy(dev) };
+        }
+        if let Some(tg) = tex_gpu {
+            unsafe { tg.destroy(dev) };
         }
         let t_gpu = bd.map(|_| Instant::now());
         // HOST_CACHED readback: invalidate so the GPU's writes are visible before the (cached, fast)
@@ -2288,6 +2388,200 @@ impl HostGpu {
         Ok(GeometryGpu { vbo, vbo_mem, ibo })
     }
 
+    /// Phase-2c: the fixed one-texture descriptor-set layout (binding 0 = SAMPLED_IMAGE, binding 1 =
+    /// SAMPLER, FRAGMENT), built lazily on first textured submit and reused (content-independent).
+    fn tex_set_layout(&self) -> R<vk::DescriptorSetLayout> {
+        let mut guard = self.tex_set_layout.lock().unwrap_or_else(|e| e.into_inner());
+        if *guard != vk::DescriptorSetLayout::null() {
+            return Ok(*guard);
+        }
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let sl = unsafe {
+            self.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )?
+        };
+        *guard = sl;
+        Ok(sl)
+    }
+
+    /// Phase-2c: upload `tex`'s RGBA8 pixels into a per-submit [`TextureGpu`] — a filled host-visible
+    /// staging buffer, a device-local sampled image (still UNDEFINED; the record path copies + layout-
+    /// transitions it), a view, a sampler from `tex.sampler`, and a descriptor set (image@0, sampler@1)
+    /// allocated against `set_layout`. Frees every partial allocation on any error. Destroyed after the
+    /// submit fence.
+    fn upload_texture(&self, tex: &Texture, set_layout: vk::DescriptorSetLayout) -> R<TextureGpu> {
+        let dev = &self.device;
+        let (w, h) = (tex.width, tex.height);
+        let expected = (w as usize).checked_mul(h as usize).and_then(|p| p.checked_mul(4));
+        if w == 0 || h == 0 || w > 16384 || h > 16384 || expected != Some(tex.rgba.len()) {
+            return Err(format!("bad texture {w}x{h} ({} bytes)", tex.rgba.len()).into());
+        }
+        // Track partial allocations so any early return frees exactly what was built (no leak on the
+        // long-lived shared device). Handles are added as they succeed; `bail` tears them down.
+        let mut staging = vk::Buffer::null();
+        let mut staging_mem = vk::DeviceMemory::null();
+        let mut image = vk::Image::null();
+        let mut image_mem = vk::DeviceMemory::null();
+        let mut view = vk::ImageView::null();
+        let mut sampler = vk::Sampler::null();
+        let mut pool = vk::DescriptorPool::null();
+        let mut build = || -> R<TextureGpu> {
+            unsafe {
+                // Staging buffer (host-visible|coherent), filled with the pixels.
+                staging = dev.create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(tex.rgba.len() as u64)
+                        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )?;
+                let sreq = dev.get_buffer_memory_requirements(staging);
+                staging_mem = dev.allocate_memory(
+                    &vk::MemoryAllocateInfo::default().allocation_size(sreq.size).memory_type_index(
+                        self.find_mem(
+                            sreq.memory_type_bits,
+                            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )?,
+                    ),
+                    None,
+                )?;
+                dev.bind_buffer_memory(staging, staging_mem, 0)?;
+                let ptr = dev.map_memory(staging_mem, 0, tex.rgba.len() as u64, vk::MemoryMapFlags::empty())?;
+                std::ptr::copy_nonoverlapping(tex.rgba.as_ptr(), ptr as *mut u8, tex.rgba.len());
+                dev.unmap_memory(staging_mem);
+
+                // Device-local sampled image.
+                image = dev.create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )?;
+                let ireq = dev.get_image_memory_requirements(image);
+                image_mem = dev.allocate_memory(
+                    &vk::MemoryAllocateInfo::default().allocation_size(ireq.size).memory_type_index(
+                        self.find_mem(ireq.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?,
+                    ),
+                    None,
+                )?;
+                dev.bind_image_memory(image, image_mem, 0)?;
+                view = dev.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .subresource_range(color_range()),
+                    None,
+                )?;
+                let filter = if tex.sampler.linear { vk::Filter::LINEAR } else { vk::Filter::NEAREST };
+                let addr = if tex.sampler.repeat {
+                    vk::SamplerAddressMode::REPEAT
+                } else {
+                    vk::SamplerAddressMode::CLAMP_TO_EDGE
+                };
+                sampler = dev.create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(filter)
+                        .min_filter(filter)
+                        .address_mode_u(addr)
+                        .address_mode_v(addr)
+                        .address_mode_w(addr),
+                    None,
+                )?;
+
+                // Descriptor pool + set (image@0, sampler@1), updated to point at the view + sampler.
+                let sizes = [
+                    vk::DescriptorPoolSize::default().ty(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(1),
+                    vk::DescriptorPoolSize::default().ty(vk::DescriptorType::SAMPLER).descriptor_count(1),
+                ];
+                pool = dev.create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes),
+                    None,
+                )?;
+                let layouts = [set_layout];
+                let set = dev.allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts),
+                )?[0];
+                let img_info = [vk::DescriptorImageInfo::default()
+                    .image_view(view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let smp_info = [vk::DescriptorImageInfo::default().sampler(sampler)];
+                let writes = [
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&img_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(&smp_info),
+                ];
+                dev.update_descriptor_sets(&writes, &[]);
+                Ok(TextureGpu {
+                    staging,
+                    staging_mem,
+                    image,
+                    image_mem,
+                    view,
+                    sampler,
+                    pool,
+                    set,
+                    width: w,
+                    height: h,
+                })
+            }
+        };
+        build().map_err(|e| {
+            // Free whatever was built (skip nulls), in dependency-safe order.
+            unsafe {
+                if pool != vk::DescriptorPool::null() {
+                    dev.destroy_descriptor_pool(pool, None);
+                }
+                if sampler != vk::Sampler::null() {
+                    dev.destroy_sampler(sampler, None);
+                }
+                if view != vk::ImageView::null() {
+                    dev.destroy_image_view(view, None);
+                }
+                if image != vk::Image::null() {
+                    dev.destroy_image(image, None);
+                }
+                if image_mem != vk::DeviceMemory::null() {
+                    dev.free_memory(image_mem, None);
+                }
+                if staging != vk::Buffer::null() {
+                    dev.destroy_buffer(staging, None);
+                }
+                if staging_mem != vk::DeviceMemory::null() {
+                    dev.free_memory(staging_mem, None);
+                }
+            }
+            e
+        })
+    }
+
     /// Record one forwarded-draw frame into `ss`'s command buffer — clear to `bg`, draw, then copy
     /// the result image into `dst` (the persistent readback buffer for the present path, or an
     /// imported guest-scanout buffer for the Fix-D zero-copy path). When `geom` is `Some` (Phase-2b),
@@ -2306,6 +2600,7 @@ impl HostGpu {
         bg: [f32; 4],
         draw: &ForwardedDraw,
         geom: Option<&GeometryGpu>,
+        tex: Option<&TextureGpu>,
         dst: vk::Buffer,
     ) -> R<()> {
         let dev = &self.device;
@@ -2316,6 +2611,59 @@ impl HostGpu {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
+            // Phase-2c: upload the texture BEFORE the render pass — transition UNDEFINED→TRANSFER_DST,
+            // copy staging→image, transition TRANSFER_DST→SHADER_READ_ONLY so the fragment shader can
+            // sample it. Same command buffer as the render (one submit), so no extra sync needed.
+            if let Some(t) = tex {
+                let to_dst = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .image(t.image)
+                    .subresource_range(color_range());
+                dev.cmd_pipeline_barrier(
+                    ss.cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_dst],
+                );
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(0)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D { width: t.width, height: t.height, depth: 1 });
+                dev.cmd_copy_buffer_to_image(
+                    ss.cmd,
+                    t.staging,
+                    t.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+                let to_read = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .image(t.image)
+                    .subresource_range(color_range());
+                dev.cmd_pipeline_barrier(
+                    ss.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_read],
+                );
+            }
             // Clear values are indexed by attachment: color at 0, and (Phase-2d) depth at 1 cleared
             // to the far plane (1.0) so LESS/LESS_OR_EQUAL admits the first fragment at every pixel.
             let color_clear = vk::ClearValue { color: vk::ClearColorValue { float32: bg } };
@@ -2338,6 +2686,17 @@ impl HostGpu {
                 vk::SubpassContents::INLINE,
             );
             dev.cmd_bind_pipeline(ss.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            // Phase-2c: bind the texture descriptor set (set 0) so the fragment shader can sample it.
+            if let Some(t) = tex {
+                dev.cmd_bind_descriptor_sets(
+                    ss.cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    layout,
+                    0,
+                    &[t.set],
+                    &[],
+                );
+            }
             // Phase-2c: push the transform block (if any) before the draws. The layout's push-const
             // range (built in build_pipeline) matches these bytes at offset 0, VERTEX|FRAGMENT.
             let pc = draw.geometry.as_ref().map(|g| g.push_constants).unwrap_or(&[]);
@@ -2573,7 +2932,7 @@ impl HostGpu {
         }
         let ss = cache.get(&sk).expect("just inserted above");
 
-        self.record_forwarded_frame(ss, render_pass, pipeline, layout, width, height, bg, draw, None, dst)?;
+        self.record_forwarded_frame(ss, render_pass, pipeline, layout, width, height, bg, draw, None, None, dst)?;
         self.device.reset_fences(&[ss.fence])?;
         let cmds = [ss.cmd];
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
@@ -3122,6 +3481,11 @@ impl Drop for HostGpu {
             // Fix D: free the imported guest-scanout buffers/memory before the device (freeing the
             // VkDeviceMemory does NOT unmap the guest RAM — the import doesn't own it).
             self.forget_all_guest_imports();
+            // Phase-2c: free the cached texture descriptor-set layout, if it was built.
+            let tsl = *self.tex_set_layout.lock().unwrap_or_else(|e| e.into_inner());
+            if tsl != vk::DescriptorSetLayout::null() {
+                self.device.destroy_descriptor_set_layout(tsl, None);
+            }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -3598,6 +3962,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 draws: &draws,
                 depth: None,
                 push_constants: &[],
+                texture: None,
             }),
         };
         let (w, h) = (256u32, 256u32);
@@ -3712,6 +4077,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 draws: &draws,
                 depth: None,
                 push_constants: &[],
+                texture: None,
             }),
         };
         let bg = [0.0, 0.0, 0.0, 1.0];
@@ -3798,6 +4164,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     draws: &draws,
                     depth,
                     push_constants: &[],
+                    texture: None,
                 }),
             };
             gpu.render_forwarded(w, h, bg, &draw).expect("depth render").pixel(w / 2, h / 2)
@@ -3908,6 +4275,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     draws: &draws,
                     depth: None,
                     push_constants: m,
+                    texture: None,
                 }),
             };
             gpu.render_forwarded(w, h, bg, &draw).expect("transform render")
@@ -3936,5 +4304,102 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
         eprintln!(
             "forwarded_push_constant_transform_moves_geometry: OK (identity@({ix:.0},{iy:.0}) → translate shifted dx={dx:.0} dy={dy:.0})"
         );
+    }
+
+    /// Phase-2c: a **sampled texture** actually renders. A fullscreen quad with UVs samples a 2×2
+    /// four-colour texture (red / green / blue / white) through a descriptor set (image@0, sampler@1)
+    /// with nearest filtering, so each screen quadrant shows one texel. Asserting all four distinct
+    /// texel colours appear proves the whole path: staging upload, the UNDEFINED→TRANSFER_DST→
+    /// SHADER_READ_ONLY layout transitions, the sampler, the descriptor-set layout/pool/set + bind,
+    /// and `textureSample` reading the interpolated UV attribute. This is the gate for textured apps.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn forwarded_texture_samples_onto_a_quad() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let vs = compile_wgsl(
+            "struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };\n\
+             @vertex fn main(@location(0) p: vec2<f32>, @location(1) uv: vec2<f32>) -> VOut {\n\
+               return VOut(vec4<f32>(p, 0.0, 1.0), uv);\n}",
+            naga::ShaderStage::Vertex,
+        );
+        let fs = compile_wgsl(
+            "@group(0) @binding(0) var tex: texture_2d<f32>;\n\
+             @group(0) @binding(1) var samp: sampler;\n\
+             @fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {\n\
+               return textureSample(tex, samp, uv);\n}",
+            naga::ShaderStage::Fragment,
+        );
+        // Fullscreen quad: pos(vec2)@0 + uv(vec2)@8, stride 16.
+        use infinigpu_abi::wire::vk_vformat as V;
+        let attrs = [
+            VertexAttr { location: 0, format: V::R32G32_SFLOAT, offset: 0 },
+            VertexAttr { location: 1, format: V::R32G32_SFLOAT, offset: 8 },
+        ];
+        let quad: [[f32; 4]; 4] = [
+            [-1.0, -1.0, 0.0, 0.0],
+            [1.0, -1.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [-1.0, 1.0, 0.0, 1.0],
+        ];
+        let verts: Vec<u8> = quad.iter().flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes())).collect();
+        let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+        let index_data: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        // 2×2 RGBA8: red, green / blue, white.
+        let tex_px: [u8; 16] = [
+            255, 0, 0, 255, 0, 255, 0, 255, // row 0: red, green
+            0, 0, 255, 255, 255, 255, 255, 255, // row 1: blue, white
+        ];
+        let draws = [DrawCmd { count: 6, instance_count: 1, first: 0, vertex_offset: 0, viewport: [0.0; 4] }];
+        let draw = ForwardedDraw {
+            vertex_spirv: &vs,
+            vertex_entry: c"main",
+            fragment_spirv: &fs,
+            fragment_entry: c"main",
+            vertex_count: 0,
+            topology: 0,
+            geometry: Some(Geometry {
+                vertex_data: &verts,
+                vertex_stride: 16,
+                attrs: &attrs,
+                index_data: &index_data,
+                index_u32: false,
+                draws: &draws,
+                depth: None,
+                push_constants: &[],
+                texture: Some(Texture {
+                    width: 2,
+                    height: 2,
+                    rgba: &tex_px,
+                    sampler: SamplerCfg { linear: false, repeat: false },
+                }),
+            }),
+        };
+        let (w, h) = (128u32, 128u32);
+        let bg = [0.0, 0.0, 0.0, 1.0];
+        let frame = gpu.render_forwarded(w, h, bg, &draw).expect("textured render");
+
+        // All four texel colours must appear (each texel maps to a screen quadrant under nearest).
+        let (mut red, mut green, mut blue, mut white) = (0u32, 0u32, 0u32, 0u32);
+        for p in frame.rgba.chunks_exact(4) {
+            let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+            red += (r > 180 && g < 60 && b < 60) as u32;
+            green += (g > 180 && r < 60 && b < 60) as u32;
+            blue += (b > 180 && r < 60 && g < 60) as u32;
+            white += (r > 180 && g > 180 && b > 180) as u32;
+        }
+        let quad_px = (w * h / 4) as u32;
+        for (name, n) in [("red", red), ("green", green), ("blue", blue), ("white", white)] {
+            assert!(
+                n > quad_px / 2,
+                "texel colour {name} must fill ~a quadrant ({n}/{quad_px}); texture not sampled?"
+            );
+        }
+        eprintln!("forwarded_texture_samples_onto_a_quad: OK (r={red} g={green} b={blue} w={white})");
     }
 }

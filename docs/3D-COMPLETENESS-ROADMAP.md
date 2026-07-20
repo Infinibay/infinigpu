@@ -19,10 +19,17 @@ fixes the correctness landmines (B1) they expose.
 - **Phase 2c transform (push constants) — DONE, A5000-verified.** A push-constant block (an MVP `mat4`) is
   forwarded via `ForwardedCmdListTail.push_const_len` (ABI 0.9, tail 48→52 B) + a trailing section, applied to
   VERTEX|FRAGMENT before the draws. Geometry can now leave raw NDC (camera/model transform). Host + ABI + device
-  + guest wire + tests. **Remaining 2c (the XL part):** full UBO/SSBO via descriptor sets (larger uniforms,
-  multiple bindings) and **textures** (sampled images + samplers + layout transitions) — most games need textures.
-- **Next up:** Phase 2c textures/UBO (descriptor sets — the biggest remaining chunk); Phase 2a (format A6 /
-  loadOp A8) for colour-space correctness; A5 static state (blend/cull/MSAA).
+  + guest wire + tests.
+- **Phase 2c textures — DONE, A5000-verified.** A sampled texture (RGBA8 pixels + dims + sampler cfg) is forwarded
+  via `ForwardedCmdListTail.tex_count` (ABI 0.10, tail 52→56 B) + a `TextureDescWire` in the fixed-array region +
+  a trailing RGBA8 pixel region. The host uploads the pixels to a device-local image (staging buffer + copy +
+  UNDEFINED→TRANSFER_DST→SHADER_READ_ONLY layout transitions), builds a descriptor set (set 0: binding 0 = sampled
+  image, binding 1 = sampler) and a sampler (linear/nearest × repeat/clamp), and binds it for the fragment shader
+  to `textureSample`. Host + ABI + device (fail-closed decode: `data_len == w*h*4`) + guest C encoder + cbindgen
+  header + conformance interop, all tests green (`forwarded_texture_samples_onto_a_quad` on the A5000; C↔Rust
+  round-trip). Single-texture; multi-texture + UBO/SSBO (larger uniforms, multiple bindings) are the follow-up.
+- **Next up:** Phase 2c UBO/SSBO via descriptor sets (uniform buffers — the remaining descriptor work); A5 static
+  state (blend/cull/MSAA); Phase 2a (format A6 / loadOp A8) for colour-space correctness.
 
 The rest of this doc is the original design; the per-phase wire/host/test shape it describes is what the landed
 phases implemented.
@@ -130,7 +137,7 @@ paths. Do this whenever the ABI is bumped for Phase 2b anyway.
 |-------|----------|--------|------|----------|--------|
 | 2a | A6, A8 | S | low | correct colors; overlay passes | todo |
 | 2b | A1, A3, A7, A5-dyn | **L** | med | **any real mesh renders** | **DONE** (host/device/wire; guest ICD recording pending owner) |
-| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) | **push-const transform DONE**; UBO-descriptors + textures todo (**next**) |
+| 2c | A2 | **XL** | high | transformed + textured apps (UBO/tex) | **push-const transform + textures DONE**; UBO/SSBO descriptors todo (**next**) |
 | 2d | A4, A5-static | M | med | depth-correct 3D, transparency, MSAA | **A4 depth DONE**; A5 static (blend/cull/MSAA) todo |
 | 2e | A9 | M | med | async frames (with Fix F) | todo |
 

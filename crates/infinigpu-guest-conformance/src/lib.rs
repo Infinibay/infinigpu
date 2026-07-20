@@ -81,6 +81,10 @@ unsafe extern "C" {
         push_const_len: u32,
         draws: *const u8,
         draw_count: u32,
+        texs: *const u8,
+        tex_count: u32,
+        texpix: *const u8,
+        texpix_len: u32,
     ) -> usize;
 }
 
@@ -107,15 +111,19 @@ pub fn encode_forwarded_cmdlist(
     depth_flags: u32,
     push_const: &[u8],
     draws: &[infinigpu_abi::wire::DrawCmdWire],
+    texs: &[infinigpu_abi::wire::TextureDescWire],
+    texpix: &[u8],
 ) -> Vec<u8> {
     let cap = 128
         + vspirv.len() * 4
         + fspirv.len() * 4
         + attrs.len() * 12
         + draws.len() * 32
+        + texs.len() * 16
         + vertex_data.len()
         + index_data.len()
         + push_const.len()
+        + texpix.len()
         + vertex_entry.to_bytes_with_nul().len()
         + fragment_entry.to_bytes_with_nul().len();
     let mut out = vec![0u8; cap];
@@ -147,6 +155,10 @@ pub fn encode_forwarded_cmdlist(
             push_const.len() as u32,
             draws.as_ptr() as *const u8,
             draws.len() as u32,
+            texs.as_ptr() as *const u8,
+            texs.len() as u32,
+            texpix.as_ptr(),
+            texpix.len() as u32,
         )
     };
     assert!(n > 0, "C cmdlist encoder returned 0 (degenerate geometry or did not fit)");

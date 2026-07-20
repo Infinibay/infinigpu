@@ -437,10 +437,15 @@ struct ForwardedDrawTail {
  *   6. index-buffer data — `index_data_len` bytes (0 ⇒ non-indexed draws),
  *   7. vertex entry-point name — `vertex_entry_len` bytes (incl. trailing NUL),
  *   8. fragment entry-point name — `fragment_entry_len` bytes (incl. trailing NUL).
- * Sections 1–4 are all 4-byte-multiples so each stays 4-aligned relative to the tail (the tail is
- * 13×u32 = 52 B); the arbitrary-length byte blobs (5–9) come last, read as raw bytes so their odd
- * lengths never misalign a fixed-layout array. Section 9 is `push_const_len` bytes of push-constant
- * data (a transform block, ABI 0.9), appended after the two entry names. Every length is
+ * The 4-byte-multiple sections (attrs, draws, `tex_count`×[`TextureDescWire`], both SPIR-V blobs)
+ * come first so each stays 4-aligned relative to the tail; the arbitrary-length byte blobs (vertex
+ * data, index data, both entry names, push-const bytes, then the concatenated texture pixels) come
+ * last, read as raw bytes so their odd lengths never misalign a fixed-layout array. Full order:
+ *   attrs[attr_count] · draws[draw_count] · texs[tex_count] ·
+ *   vSPIR-V · fSPIR-V · vertex data · index data · vertex entry · fragment entry ·
+ *   push-const bytes · texture pixels (RGBA8, concatenated in `texs` order).
+ * `push_const_len` is a transform block (ABI 0.9); `tex_count` textures (ABI 0.10) each bind a
+ * sampled image at descriptor set 0 binding `2i` and a sampler at binding `2i+1`. Every length is
  * guest-controlled and MUST be bounds-checked against the actual payload length before use
  * (fail-closed).
  *
@@ -508,6 +513,13 @@ struct ForwardedCmdListTail {
    * `maxPushConstantsSize` host-side.
    */
   uint32_t push_const_len;
+  /**
+   * Number of sampled textures (ABI 0.10). `0` ⇒ no descriptor set / no textures. Each is a
+   * [`TextureDescWire`] (in the fixed-array region after the draws) plus its RGBA8 pixels (in the
+   * trailing pixel region). Texture `i` binds at descriptor set 0 binding `2i` (sampled image) +
+   * `2i+1` (sampler), matching a WGSL `texture_2d`/`sampler` pair. Host-bounded (fail-closed).
+   */
+  uint32_t tex_count;
 };
 
 /**
@@ -568,4 +580,22 @@ struct DrawCmdWire {
    * Viewport height (pixels).
    */
   float vp_h;
+};
+
+/**
+ * One sampled texture in a [`ForwardedCmdListTail`] (in the fixed-array region after the draws).
+ * Its `data_len == width*height*4` RGBA8 pixels live in the trailing pixel region, concatenated in
+ * texture order. 16 bytes, 4-aligned.
+ */
+struct TextureDescWire {
+  uint32_t width;
+  uint32_t height;
+  /**
+   * RGBA8 byte length (`width*height*4`); the host validates the product.
+   */
+  uint32_t data_len;
+  /**
+   * [`sampler_flags`].
+   */
+  uint32_t sampler_flags;
 };

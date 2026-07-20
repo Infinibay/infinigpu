@@ -48,7 +48,9 @@ pub const ABI_MAJOR: u16 = 0;
 /// `push_const_len` (48→52 B) — a push-constant transform block (an MVP matrix) applied before the
 /// draws (Phase-2c). Since the tail size changed, a v9 guest must not send a command list to a pre-v9
 /// host (it would misparse the trailing sections); gate on `negotiated_minor >= 9` for push constants.
-pub const ABI_MINOR: u16 = 9;
+/// v10 grew the tail again by `tex_count` (52→56 B) + a `TextureDescWire` array + a trailing RGBA8
+/// pixel region — sampled textures via a descriptor set (Phase-2c). Gate on `negotiated_minor >= 10`.
+pub const ABI_MINOR: u16 = 10;
 
 /// Packed `ABI_VERSION` register value (`major << 16 | minor`).
 pub const fn abi_version() -> u32 {

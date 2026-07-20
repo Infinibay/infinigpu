@@ -48,10 +48,15 @@
 #define INFINIGPU_VFORMAT_R8G8B8A8_UNORM 4u
 #define INFINIGPU_VFORMAT_R32_UINT 5u
 
+/* Mirror of infinigpu_abi::wire::sampler_flags (Phase-2c — TextureDescWire.sampler_flags). */
+#define INFINIGPU_SAMPLER_LINEAR 0x1u
+#define INFINIGPU_SAMPLER_REPEAT 0x2u
+
 /* Wire structs whose bytes this encoder copies (defined in the generated infinigpu_abi.h). Only
  * pointers appear in the prototype, so a forward declaration keeps this header light. */
 struct VertexAttrWire;
 struct DrawCmdWire;
+struct TextureDescWire;
 
 /*
  * Serialize a forwarded draw into `out` (capacity `cap` bytes). Layout (matches ForwardedDrawTail):
@@ -74,14 +79,17 @@ size_t infinigpu_encode_forwarded(uint8_t *out, size_t cap,
  * (matches ForwardedCmdListTail + the host's decode_forwarded_cmdlist section order):
  *   VulkanWorkload{op=FORWARDED_CMDLIST, width, height, bg, scanout_addr}
  *   ForwardedCmdListTail{ spirv/entry lens, vertex_stride, attr_count, {vertex,index}_data_len,
- *                         index_type, draw_count, topology }
- *   attrs[attr_count] | draws[draw_count] | vertex SPIR-V | fragment SPIR-V |
- *   vertex data | index data | vertex_entry\0 | fragment_entry\0
- * SPIR-V lengths are 32-bit WORDS; data lengths are BYTES. `attrs`/`draws` are arrays of the wire
- * structs (the caller fills them from the recorded pipeline layout + vkCmdDraw* stream).
- * `index_data_len == 0` ⇒ non-indexed. Returns the total byte length, or 0 if it would not fit `cap`
- * (or the geometry is degenerate: no vertex buffer / no draws). The caller wraps the result in a
- * SUBMIT_CMD (encoding VULKAN_VENUSLIKE), the same as the bufferless encoder.
+ *                         index_type, draw_count, topology, depth_flags, push_const_len, tex_count }
+ *   attrs[attr_count] | draws[draw_count] | texdescs[tex_count] | vertex SPIR-V | fragment SPIR-V |
+ *   vertex data | index data | vertex_entry\0 | fragment_entry\0 | push constants | texture pixels
+ * SPIR-V lengths are 32-bit WORDS; data lengths are BYTES. `attrs`/`draws`/`texs` are arrays of the
+ * wire structs (the caller fills them from the recorded pipeline layout + vkCmdDraw* stream). The
+ * texdescs sit in the fixed-array region after the draws; their RGBA8 pixels are the trailing region
+ * after the push constants (`texpix`, the concatenation of every texdesc's `data_len` bytes — the
+ * host validates `data_len == width*height*4`). `index_data_len == 0` ⇒ non-indexed; `tex_count == 0`
+ * ⇒ untextured. Returns the total byte length, or 0 if it would not fit `cap` (or the geometry is
+ * degenerate: no vertex buffer / no draws). The caller wraps the result in a SUBMIT_CMD (encoding
+ * VULKAN_VENUSLIKE), the same as the bufferless encoder.
  */
 size_t infinigpu_encode_forwarded_cmdlist(
     uint8_t *out, size_t cap,
@@ -95,6 +103,8 @@ size_t infinigpu_encode_forwarded_cmdlist(
     const uint8_t *index_data, uint32_t index_data_len, uint32_t index_type,
     uint32_t topology, uint32_t depth_flags,
     const uint8_t *push_const, uint32_t push_const_len,
-    const struct DrawCmdWire *draws, uint32_t draw_count);
+    const struct DrawCmdWire *draws, uint32_t draw_count,
+    const struct TextureDescWire *texs, uint32_t tex_count,
+    const uint8_t *texpix, uint32_t texpix_len);
 
 #endif /* INFINIGPU_FORWARDED_H */

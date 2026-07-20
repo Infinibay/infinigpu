@@ -81,8 +81,18 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
     ];
 
     // Depth: TEST | WRITE | (LESS_OR_EQUAL << COMPARE_SHIFT) — exercises the Phase-2d bitfield too.
-    use infinigpu_abi::wire::{depth_compare, depth_flags};
+    use infinigpu_abi::wire::{depth_compare, depth_flags, sampler_flags, TextureDescWire};
     let df = depth_flags::pack(true, true, depth_compare::LESS_OR_EQUAL);
+    // A 2×2 RGBA8 texture with nearest+clamp sampling (exercises the Phase-2c texdesc + pixel region).
+    let texpix: Vec<u8> = vec![
+        10, 20, 30, 40, /**/ 50, 60, 70, 80, /**/ 90, 100, 110, 120, /**/ 130, 140, 150, 160,
+    ];
+    let texs = [TextureDescWire {
+        width: 2,
+        height: 2,
+        data_len: texpix.len() as u32,
+        sampler_flags: sampler_flags::LINEAR, // linear filtering, clamp addressing
+    }];
     let payload = guest::encode_forwarded_cmdlist(
         640,
         480,
@@ -101,6 +111,8 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
         df,
         &[9u8, 8, 7, 6, 5, 4, 3, 2], // push-constant bytes (a stand-in transform block)
         &draws,
+        &texs,
+        &texpix,
     );
 
     let o = decode_forwarded_cmdlist(&payload, CAP).expect("C-encoded cmdlist must decode");
@@ -126,4 +138,8 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
     assert!(d.test && d.write, "depth test+write survive the C→Rust round-trip");
     assert_eq!(d.compare, depth_compare::LESS_OR_EQUAL, "depth compare-op survives");
     assert_eq!(g.push_constants, [9, 8, 7, 6, 5, 4, 3, 2], "push-constant bytes survive C→Rust");
+    let t = g.texture.expect("texdesc + pixel region decode to a texture");
+    assert_eq!((t.width, t.height), (2, 2), "texture dims survive C→Rust");
+    assert_eq!(t.rgba, texpix, "texture pixels survive C→Rust (trailing region placement)");
+    assert!(t.linear && !t.repeat, "sampler flags survive (linear on, repeat off)");
 }

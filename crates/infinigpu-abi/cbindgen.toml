@@ -17,7 +17,7 @@ include = [
   "Negotiate", "CtxCreate", "ResourceCreateBlob", "AttachBacking", "MemEntry", "MapBlob",
   "SubmitCmd", "Fence", "SetScanoutBlob", "ResourceFlush", "ClearPresent",
   "ScanoutPresent", "ScanoutPresentDamaged", "CursorUpdate", "VulkanWorkload",
-  "ForwardedDrawTail", "ForwardedCmdListTail", "VertexAttrWire", "DrawCmdWire",
+  "ForwardedDrawTail", "ForwardedCmdListTail", "VertexAttrWire", "DrawCmdWire", "TextureDescWire",
 ]
 
 [parse]

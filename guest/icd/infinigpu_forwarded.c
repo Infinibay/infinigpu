@@ -17,10 +17,11 @@ _Static_assert(sizeof(struct VulkanWorkload) == 40, "VulkanWorkload is 40 bytes"
 _Static_assert(sizeof(struct ForwardedDrawTail) == 24, "ForwardedDrawTail is 24 bytes");
 _Static_assert(offsetof(struct VulkanWorkload, scanout_addr) == 32, "scanout_addr@32");
 /* Phase-2b command-list structs — the cmdlist encoder copies these; drift is a compile error.
- * The tail grew to 52 B in ABI 0.9 (push_const_len). */
-_Static_assert(sizeof(struct ForwardedCmdListTail) == 52, "ForwardedCmdListTail is 52 bytes");
+ * The tail grew to 52 B in ABI 0.9 (push_const_len) and to 56 B in ABI 0.10 (tex_count). */
+_Static_assert(sizeof(struct ForwardedCmdListTail) == 56, "ForwardedCmdListTail is 56 bytes");
 _Static_assert(sizeof(struct VertexAttrWire) == 12, "VertexAttrWire is 12 bytes");
 _Static_assert(sizeof(struct DrawCmdWire) == 32, "DrawCmdWire is 32 bytes");
+_Static_assert(sizeof(struct TextureDescWire) == 16, "TextureDescWire is 16 bytes");
 
 size_t infinigpu_encode_forwarded(uint8_t *out, size_t cap,
                                   uint32_t width, uint32_t height,
@@ -87,7 +88,9 @@ size_t infinigpu_encode_forwarded_cmdlist(
     const uint8_t *index_data, uint32_t index_data_len, uint32_t index_type,
     uint32_t topology, uint32_t depth_flags,
     const uint8_t *push_const, uint32_t push_const_len,
-    const struct DrawCmdWire *draws, uint32_t draw_count)
+    const struct DrawCmdWire *draws, uint32_t draw_count,
+    const struct TextureDescWire *texs, uint32_t tex_count,
+    const uint8_t *texpix, uint32_t texpix_len)
 {
 	const size_t vbytes = (size_t)vspirv_words * 4u;
 	const size_t fbytes = (size_t)fspirv_words * 4u;
@@ -95,6 +98,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	const size_t felen = strlen(fragment_entry) + 1u;
 	const size_t attrs_bytes = (size_t)attr_count * sizeof(struct VertexAttrWire);
 	const size_t draws_bytes = (size_t)draw_count * sizeof(struct DrawCmdWire);
+	const size_t texs_bytes = (size_t)tex_count * sizeof(struct TextureDescWire);
 
 	/* A command list is the geometry path: it must carry a vertex buffer and at least one draw
 	 * (the host's decode_forwarded_cmdlist rejects a degenerate list — fail here too, early). */
@@ -102,9 +106,9 @@ size_t infinigpu_encode_forwarded_cmdlist(
 		return 0;
 
 	const size_t total = sizeof(struct VulkanWorkload) + sizeof(struct ForwardedCmdListTail) +
-	                     attrs_bytes + draws_bytes + vbytes + fbytes +
+	                     attrs_bytes + draws_bytes + texs_bytes + vbytes + fbytes +
 	                     (size_t)vertex_data_len + (size_t)index_data_len + velen + felen +
-	                     (size_t)push_const_len;
+	                     (size_t)push_const_len + (size_t)texpix_len;
 	if (out == NULL || total > cap)
 		return 0;
 
@@ -135,12 +139,15 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	tail.topology = topology;
 	tail.depth_flags = depth_flags;
 	tail.push_const_len = push_const_len;
+	tail.tex_count = tex_count;
 	memcpy(out + o, &tail, sizeof tail);
 	o += sizeof tail;
 
-	/* Sections in the order the host decoder reads them: attrs, draws, vSPIR-V, fSPIR-V, vertex
-	 * data, index data, vertex entry, fragment entry. Each memcpy is guarded so a zero-length
-	 * section with a NULL pointer isn't passed to memcpy (undefined behaviour). */
+	/* Sections in the order the host decoder reads them: attrs, draws, texdescs, vSPIR-V, fSPIR-V,
+	 * vertex data, index data, vertex entry, fragment entry, push constants, texture pixels. Each
+	 * memcpy is guarded so a zero-length section with a NULL pointer isn't passed to memcpy
+	 * (undefined behaviour). The texdescs are in the fixed-array region (after draws); their pixels
+	 * are the trailing region (after push constants). */
 	if (attrs_bytes) {
 		memcpy(out + o, attrs, attrs_bytes);
 		o += attrs_bytes;
@@ -148,6 +155,10 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	if (draws_bytes) {
 		memcpy(out + o, draws, draws_bytes);
 		o += draws_bytes;
+	}
+	if (texs_bytes) {
+		memcpy(out + o, texs, texs_bytes);
+		o += texs_bytes;
 	}
 	memcpy(out + o, vspirv, vbytes);
 	o += vbytes;
@@ -166,6 +177,10 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	if (push_const_len) {
 		memcpy(out + o, push_const, push_const_len);
 		o += push_const_len;
+	}
+	if (texpix_len) {
+		memcpy(out + o, texpix, texpix_len);
+		o += texpix_len;
 	}
 
 	return o;

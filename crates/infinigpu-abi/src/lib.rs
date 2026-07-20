@@ -76,9 +76,12 @@ mod layout_asserts {
     // ForwardedCmdListTail (vk_op::FORWARDED_CMDLIST): 13×u32 = 52, 4-byte aligned (ABI 0.9 added
     // push_const_len). Its trailing VertexAttrWire[]/DrawCmdWire[] arrays are 4-multiples so they
     // stay 4-aligned after the tail.
-    const _: () = assert!(size_of::<ForwardedCmdListTail>() == 52);
+    const _: () = assert!(size_of::<ForwardedCmdListTail>() == 56);
     const _: () = assert!(align_of::<ForwardedCmdListTail>() == 4);
     const _: () = assert!(offset_of!(ForwardedCmdListTail, push_const_len) == 48);
+    const _: () = assert!(offset_of!(ForwardedCmdListTail, tex_count) == 52);
+    const _: () = assert!(size_of::<TextureDescWire>() == 16);
+    const _: () = assert!(align_of::<TextureDescWire>() == 4);
     const _: () = assert!(size_of::<VertexAttrWire>() == 12);
     const _: () = assert!(align_of::<VertexAttrWire>() == 4);
     const _: () = assert!(size_of::<DrawCmdWire>() == 32);
@@ -121,7 +124,7 @@ mod tests {
             abi_version(),
             (u32::from(ABI_MAJOR) << 16) | u32::from(ABI_MINOR)
         );
-        assert_eq!(abi_version(), 0x0000_0009);
+        assert_eq!(abi_version(), 0x0000_000A);
     }
 
     #[test]

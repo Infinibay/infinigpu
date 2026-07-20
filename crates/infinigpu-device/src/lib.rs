@@ -24,7 +24,8 @@ pub mod resource;
 use dma::DmaTable;
 use infinigpu_abi::regs;
 use infinigpu_replay::{
-    DepthState, DrawCmd, ForwardedDraw, Frame, Geometry, HostGpu, PresentStats, VertexAttr,
+    DepthState, DrawCmd, ForwardedDraw, Frame, Geometry, HostGpu, PresentStats, SamplerCfg, Texture,
+    VertexAttr,
 };
 use infinigpu_sched::{BrokerConfig, GpuBroker, VmConfig, VmTicket};
 use log::info;
@@ -316,6 +317,17 @@ pub struct OwnedGeometry {
     pub depth: Option<DepthState>,
     /// Phase-2c push-constant bytes (a transform block); empty ⇒ no push constants.
     pub push_constants: Vec<u8>,
+    /// Phase-2c sampled texture (RGBA8 pixels + dims + sampler cfg); `None` ⇒ untextured.
+    pub texture: Option<OwnedTexture>,
+}
+
+/// Owning form of a decoded Phase-2c texture (see [`decode_forwarded_cmdlist`]).
+pub struct OwnedTexture {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub linear: bool,
+    pub repeat: bool,
 }
 
 impl OwnedForwardedDraw {
@@ -336,6 +348,15 @@ impl OwnedForwardedDraw {
                 draws: &g.draws,
                 depth: g.depth,
                 push_constants: &g.push_constants,
+                texture: g.texture.as_ref().map(|t| Texture {
+                    width: t.width,
+                    height: t.height,
+                    rgba: &t.rgba,
+                    sampler: SamplerCfg {
+                        linear: t.linear,
+                        repeat: t.repeat,
+                    },
+                }),
             }),
         }
     }
@@ -434,7 +455,7 @@ const SPIRV_MAGIC: u32 = 0x0723_0203;
 /// off-VM conformance test can drive it with the guest encoder's bytes.
 pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<OwnedForwardedDraw> {
     use infinigpu_abi::wire::{
-        DrawCmdWire, ForwardedCmdListTail, VertexAttrWire, VulkanWorkload,
+        DrawCmdWire, ForwardedCmdListTail, TextureDescWire, VertexAttrWire, VulkanWorkload,
     };
     use zerocopy::FromBytes;
 
@@ -450,6 +471,7 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
     let vdata_len = tail.vertex_data_len as usize;
     let idata_len = tail.index_data_len as usize;
     let pc_len = tail.push_const_len as usize;
+    let tex_count = tail.tex_count as usize;
     let stride = tail.vertex_stride;
 
     // Scalar bounds (cheap rejects before any arithmetic on attacker lengths). Push constants are
@@ -470,6 +492,7 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         || vdata_len > max_bytes
         || idata_len > max_bytes
         || pc_len > 256
+        || tex_count > 1
     {
         return None;
     }
@@ -479,14 +502,18 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         return None;
     }
 
-    // Total of the nine trailing sections, in wire order. All checked_* so a hostile length can't
-    // wrap. Sections 1–2 (fixed-size arrays) and 3–4 (SPIR-V) are 4-multiples; the byte blobs 5–9
-    // (vertex/index data, two entry names, push constants) come last so their odd lengths never
-    // misalign a fixed array.
+    // Total of the fixed-array + variable-blob sections, in wire order. All checked_* so a hostile
+    // length can't wrap. The fixed-size arrays (attrs, draws, texdescs) and the SPIR-V blobs are
+    // 4-multiples and come first; the byte blobs (vertex/index data, two entry names, push constants)
+    // follow so their odd lengths never misalign a fixed array. The RGBA8 texture pixels form the
+    // trailing region — its length isn't in the tail, it's the sum of each texdesc's `data_len`, so
+    // we parse the texdescs (below) before we can bound-check it.
     let attrs_bytes = attr_count.checked_mul(size_of::<VertexAttrWire>())?;
     let draws_bytes = draw_count.checked_mul(size_of::<DrawCmdWire>())?;
+    let texs_bytes = tex_count.checked_mul(size_of::<TextureDescWire>())?;
     let total = attrs_bytes
         .checked_add(draws_bytes)?
+        .checked_add(texs_bytes)?
         .checked_add(vlen)?
         .checked_add(flen)?
         .checked_add(vdata_len)?
@@ -499,13 +526,14 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
     }
     let (attrs_b, r) = rest.split_at(attrs_bytes);
     let (draws_b, r) = r.split_at(draws_bytes);
+    let (texs_b, r) = r.split_at(texs_bytes);
     let (vspirv_b, r) = r.split_at(vlen);
     let (fspirv_b, r) = r.split_at(flen);
     let (vdata_b, r) = r.split_at(vdata_len);
     let (idata_b, r) = r.split_at(idata_len);
     let (ventry_b, r) = r.split_at(velen);
     let (fentry_b, r) = r.split_at(felen);
-    let (pc_b, _) = r.split_at(pc_len);
+    let (pc_b, r) = r.split_at(pc_len);
 
     // Parse the attribute + draw arrays element-by-element (read_from_prefix copies, so the
     // byte-aligned payload needs no 4-alignment).
@@ -573,6 +601,35 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         }
     };
 
+    // Phase-2c: unpack the (at most one) sampled texture. Parse the texdesc from the fixed-array
+    // region, validate `data_len == width*height*4` (checked so a hostile product can't wrap), then
+    // carve its RGBA8 pixels out of the trailing region `r` (after push constants). Fail-closed on any
+    // dimension/length mismatch.
+    let texture = if tex_count == 1 {
+        use infinigpu_abi::wire::sampler_flags as SF;
+        let (td, _) = TextureDescWire::read_from_prefix(texs_b).ok()?;
+        let w = td.width as usize;
+        let h = td.height as usize;
+        let data_len = td.data_len as usize;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let expect = w.checked_mul(h)?.checked_mul(4)?;
+        if data_len != expect || data_len > max_bytes || data_len > r.len() {
+            return None;
+        }
+        let (texpix_b, _) = r.split_at(data_len);
+        Some(OwnedTexture {
+            width: td.width,
+            height: td.height,
+            rgba: texpix_b.to_vec(),
+            linear: td.sampler_flags & SF::LINEAR != 0,
+            repeat: td.sampler_flags & SF::REPEAT != 0,
+        })
+    } else {
+        None
+    };
+
     Some(OwnedForwardedDraw {
         vertex_spirv,
         fragment_spirv,
@@ -589,6 +646,7 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
             draws,
             depth,
             push_constants: pc_b.to_vec(),
+            texture,
         }),
     })
 }
@@ -3295,8 +3353,9 @@ mod tests {
     // ---- Phase-2b: FORWARDED_CMDLIST (real mesh: vertex/index buffers + multi-draw) -------------
 
     /// Serialize a mesh into a `vk_op::FORWARDED_CMDLIST` payload exactly as the guest ICD will:
-    /// fixed VulkanWorkload → ForwardedCmdListTail → attrs → draws → vSPIR-V → fSPIR-V → vertex data
-    /// → index data → vertex entry → fragment entry (the order [`decode_forwarded_cmdlist`] expects).
+    /// fixed VulkanWorkload → ForwardedCmdListTail → attrs → draws → texdescs → vSPIR-V → fSPIR-V →
+    /// vertex data → index data → vertex entry → fragment entry → push constants → texture pixels
+    /// (the order [`decode_forwarded_cmdlist`] expects).
     #[allow(clippy::too_many_arguments)]
     fn encode_forwarded_cmdlist(
         width: u32,
@@ -3316,6 +3375,8 @@ mod tests {
         depth_flags: u32,
         push_const: &[u8],
         draws: &[infinigpu_abi::wire::DrawCmdWire],
+        texs: &[infinigpu_abi::wire::TextureDescWire],
+        texpix: &[u8],
     ) -> Vec<u8> {
         use infinigpu_abi::wire::{index_type, vk_op, ForwardedCmdListTail, VulkanWorkload};
         use zerocopy::IntoBytes;
@@ -3346,6 +3407,7 @@ mod tests {
             topology,
             depth_flags,
             push_const_len: push_const.len() as u32,
+            tex_count: texs.len() as u32,
         };
         let mut p = Vec::new();
         p.extend_from_slice(wl.as_bytes());
@@ -3356,6 +3418,9 @@ mod tests {
         for d in draws {
             p.extend_from_slice(d.as_bytes());
         }
+        for t in texs {
+            p.extend_from_slice(t.as_bytes());
+        }
         p.extend_from_slice(&vspv);
         p.extend_from_slice(&fspv);
         p.extend_from_slice(vdata);
@@ -3363,6 +3428,7 @@ mod tests {
         p.extend_from_slice(ve);
         p.extend_from_slice(fe);
         p.extend_from_slice(push_const);
+        p.extend_from_slice(texpix);
         p
     }
 
@@ -3388,11 +3454,21 @@ mod tests {
             DrawCmdWire { count: 3, instance_count: 1, first: 0, vertex_offset: 0, vp_x: 0.0, vp_y: 0.0, vp_w: 0.0, vp_h: 0.0 },
             DrawCmdWire { count: 3, instance_count: 2, first: 0, vertex_offset: 1, vp_x: 8.0, vp_y: 9.0, vp_w: 10.0, vp_h: 11.0 },
         ];
-        use infinigpu_abi::wire::{depth_compare, depth_flags};
+        use infinigpu_abi::wire::{depth_compare, depth_flags, sampler_flags, TextureDescWire};
         let df = depth_flags::pack(true, false, depth_compare::GREATER); // test on, write off
+        // A 2×2 RGBA8 texture (4 distinct texels) with linear+repeat sampling.
+        let texpix: Vec<u8> = vec![
+            255, 0, 0, 255, /**/ 0, 255, 0, 255, /**/ 0, 0, 255, 255, /**/ 255, 255, 0, 255,
+        ];
+        let texs = [TextureDescWire {
+            width: 2,
+            height: 2,
+            data_len: texpix.len() as u32,
+            sampler_flags: sampler_flags::LINEAR | sampler_flags::REPEAT,
+        }];
         let payload = encode_forwarded_cmdlist(
             32, 16, [0.1, 0.2, 0.3, 1.0], 0, &vspirv, &fspirv, c"vs", c"fs", 20, &attrs, &vdata,
-            &idata, false, 1, df, &[0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4], &draws,
+            &idata, false, 1, df, &[0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4], &draws, &texs, &texpix,
         );
 
         let o = decode_forwarded_cmdlist(&payload, CAP).expect("valid cmdlist decodes");
@@ -3416,6 +3492,10 @@ mod tests {
         assert!(d.test && !d.write, "depth test-on/write-off round-trips");
         assert_eq!(d.compare, depth_compare::GREATER, "depth compare-op round-trips");
         assert_eq!(g.push_constants, [0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4], "push-const bytes round-trip");
+        let t = g.texture.expect("texdesc + pixels decode to a texture");
+        assert_eq!((t.width, t.height), (2, 2), "texture dims round-trip");
+        assert_eq!(t.rgba, texpix, "texture pixels round-trip");
+        assert!(t.linear && t.repeat, "sampler flags round-trip");
 
         // Hostile → None (fail-closed):
         assert!(decode_forwarded_cmdlist(&payload[..44], CAP).is_none(), "truncated before tail rejected");
@@ -3428,9 +3508,15 @@ mod tests {
         let mut no_draws = payload.clone();
         no_draws[40 + 36..40 + 40].copy_from_slice(&0u32.to_le_bytes());
         assert!(decode_forwarded_cmdlist(&no_draws, CAP).is_none(), "zero draw_count rejected");
-        // bad vertex SPIR-V magic (first vSPIR-V word sits after the VulkanWorkload(40) + tail(52) +
-        // attrs + draws arrays).
-        let vspv_off = 40 + 52 + attrs.len() * 12 + draws.len() * 32;
+        // A texture whose data_len doesn't match width*height*4 is rejected. The single texdesc's
+        // data_len is its 3rd u32; the texdescs sit after VulkanWorkload(40) + tail(56) + attrs + draws.
+        let tex_off = 40 + 56 + attrs.len() * 12 + draws.len() * 32;
+        let mut bad_texlen = payload.clone();
+        bad_texlen[tex_off + 8..tex_off + 12].copy_from_slice(&99u32.to_le_bytes());
+        assert!(decode_forwarded_cmdlist(&bad_texlen, CAP).is_none(), "texture data_len mismatch rejected");
+        // bad vertex SPIR-V magic (first vSPIR-V word sits after the VulkanWorkload(40) + tail(56) +
+        // attrs + draws + texdesc arrays).
+        let vspv_off = 40 + 56 + attrs.len() * 12 + draws.len() * 32 + texs.len() * 16;
         let mut bad_magic = payload.clone();
         bad_magic[vspv_off] = bad_magic[vspv_off].wrapping_add(1);
         assert!(decode_forwarded_cmdlist(&bad_magic, CAP).is_none(), "non-SPIR-V vertex blob rejected");
@@ -3503,7 +3589,7 @@ mod tests {
         let scanout_addr = GUEST_BASE + SCAN_OFF as u64;
         let payload = encode_forwarded_cmdlist(
             w, h, bg, scanout_addr, &vs, &fs, c"main", c"main", 20, &attrs, &vdata, &[], false, 0, 0,
-            &[], &draws,
+            &[], &draws, &[], &[],
         );
         let sc = infinigpu_abi::wire::SubmitCmd {
             ctx_id: 0,
