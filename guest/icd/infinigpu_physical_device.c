@@ -31,13 +31,6 @@
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
-/* Set INFINIGPU_DEBUG=1 to trace ICD bring-up (useful both for the host smoke
- * and for the real guest VM boot). Off by default; never fires in production. */
-#define IGPU_TRACE(...) do { \
-   if (getenv("INFINIGPU_DEBUG")) { \
-      fprintf(stderr, "[infinigpu] " __VA_ARGS__); fputc('\n', stderr); \
-   } } while (0)
-
 #include <xf86drm.h>
 
 #include "vk_alloc.h"
@@ -62,19 +55,30 @@ const struct vk_device_extension_table infinigpu_device_extensions = {
    .EXT_physical_device_drm = true,
 
    /* --- OpenGL/Zink M1: the extension STRINGS zink hard-requires to stand up a real
-    * (hardware) GL screen. zink_get_physical_device_info() does `goto fail` — which
-    * makes zink_internal_create_screen() return NULL ("failed to create dri2 screen")
-    * — if any of these four is absent from vkEnumerateDeviceExtensionProperties. There
-    * is NO core-version fallback: zink matches the STRING, not the promoted core version.
-    * All four resolve to Mesa's generated vk_common_* device entrypoints (CreateRenderPass2,
+    * (hardware) GL screen. zink_get_physical_device_info() marks these `required=True`
+    * (zink_device_info.py) and does `goto fail` — which makes zink_internal_create_screen()
+    * return NULL ("failed to create dri2 screen") — if any is absent from
+    * vkEnumerateDeviceExtensionProperties. There is NO core-version fallback: zink matches
+    * the STRING, not the promoted core version, so advertising the core-1.3 FEATURE is not
+    * enough. All resolve to Mesa's generated vk_common_* device entrypoints (CreateRenderPass2,
     * CmdBeginRenderPass2, CreateFramebuffer[imageless], CreateDescriptorUpdateTemplate,
-    * UpdateDescriptorSetWithTemplate) — vk_device_init() auto-merges vk_common_device_
-    * entrypoints (overwrite=false), and those common impls delegate to the driver hooks
-    * we already implement (CmdBeginRendering, UpdateDescriptorSets). No wire/replay work. */
+    * UpdateDescriptorSetWithTemplate, CmdBeginRendering) — vk_device_init() auto-merges
+    * vk_common_device_entrypoints (overwrite=false), and those common impls delegate to the
+    * driver hooks we already implement. No wire/replay work.
+    *
+    * VERSION NOTE: the required set GREW after the Mesa 25.0.7 this ICD builds against.
+    * The guest's runtime zink is Mesa 26.0.3, which additionally marks VK_KHR_dynamic_rendering
+    * required=True (zink_device_info.py:206). Its absence made zink_get_physical_device_info()
+    * hit `debug_printf("ZINK: VK_KHR_dynamic_rendering required!")` — compiled OUT of a release
+    * Mesa — then `goto fail`, so the DRI loader fell back to kms_swrast/llvmpipe with NO visible
+    * error (the silent "creates screen? no → software" trap). Confirmed by extracting the exact
+    * 26.0.3 source (apt-get source mesa) in the live guest. We already advertise the
+    * dynamicRendering feature (infinigpu_get_features) and implement CmdBeginRendering. */
    .KHR_maintenance1              = true,
    .KHR_create_renderpass2        = true,
    .KHR_imageless_framebuffer     = true,
    .KHR_descriptor_update_template = true,
+   .KHR_dynamic_rendering         = true,
 
    /* zink hard-requires a timeline semaphore (else "zink: KHR_timeline_semaphore is
     * required"). We satisfy it BOTH ways: the core-1.2 feature (VkPhysicalDeviceVulkan12
@@ -91,6 +95,18 @@ const struct vk_device_extension_table infinigpu_device_extensions = {
     * present-time concern (WSI/M2), not a screen-creation blocker. */
    .KHR_external_memory           = true,
    .KHR_external_memory_fd        = true,
+
+   /* Mesa 26.0.3 zink adds a SECOND hard gate right after feature detection
+    * (zink_screen.c:3459): `if (!screen->info.rb2_feats.nullDescriptor) { mesa_loge("Zink
+    * requires the nullDescriptor feature of KHR/EXT robustness2."); goto fail; }`. So the
+    * device must advertise VK_EXT_robustness2 AND report its nullDescriptor feature true
+    * (set in infinigpu_get_features). robustness2 has no entrypoints — it is pure feature/
+    * property metadata; Mesa's vk_common GetPhysicalDeviceFeatures2 surfaces nullDescriptor
+    * from vk_features. nullDescriptor semantics (a VK_NULL_HANDLE descriptor reads 0 / writes
+    * are discarded) are what zink relies on to bind unused slots; the forwarded-draw path
+    * builds its descriptor set from the bound resources, so an unbound (null) slot is simply
+    * absent — consistent with the promise. This was not a zink requirement in 25.0.7. */
+   .EXT_robustness2               = true,
 };
 
 /* Fill VkPhysicalDeviceDrmPropertiesEXT (mapped by Mesa's generated
@@ -281,6 +297,12 @@ infinigpu_get_features(struct vk_features *f)
       .synchronization2    = true,
       .timelineSemaphore   = true,
       .imagelessFramebuffer = true,
+      /* VK_EXT_robustness2 nullDescriptor: hard-required by Mesa 26.0.3 zink screen
+       * creation (zink_screen.c:3459). Only nullDescriptor is demanded — leave
+       * robustBufferAccess2/robustImageAccess2 false (honest: the wire does not
+       * enforce the tightened robustness2 bounds). See the EXT_robustness2 note on
+       * the extension table. */
+      .nullDescriptor      = true,
    };
 }
 
@@ -505,6 +527,29 @@ infinigpu_format_supported(VkFormat format)
    }
 }
 
+/* Depth/stencil formats. zink probes have_X8_D24_UNORM_PACK32 / have_D24_UNORM_S8_UINT /
+ * have_D32_SFLOAT_S8_UINT at screen-create (zink_screen.c) to decide depth support, and the
+ * DRI/GL frontend enumerates depth-buffered GLX/EGL framebuffer configs from these — with ZERO
+ * depth support every 3D app that asks for a depth buffer is stuck (glGetString aside, no depth
+ * test). REQUIRED for real 3D even though it is not, on its own, the zink screen-selection gate.
+ * These land in the same dumb-buffer storage as color; the host replay already depth-tests
+ * forwarded meshes, so a depth attachment is backed. LINEAR is honest (row-major, no tiling). */
+static bool
+infinigpu_depth_format_supported(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_D16_UNORM:
+   case VK_FORMAT_X8_D24_UNORM_PACK32:
+   case VK_FORMAT_D32_SFLOAT:
+   case VK_FORMAT_D24_UNORM_S8_UINT:
+   case VK_FORMAT_D32_SFLOAT_S8_UINT:
+   case VK_FORMAT_S8_UINT:
+      return true;
+   default:
+      return false;
+   }
+}
+
 /* Formats usable as a vertex-buffer attribute (the wire's `vk_vformat` set). An app / validation
  * layer checks bufferFeatures & VERTEX_BUFFER_BIT before building a vertex-input state, so these
  * must be advertised or a real mesh pipeline is rejected. */
@@ -546,6 +591,18 @@ infinigpu_GetPhysicalDeviceFormatProperties2(
       p->linearTilingFeatures = feats;
       p->optimalTilingFeatures = feats;
    }
+   if (infinigpu_depth_format_supported(format)) {
+      /* A depth/stencil image is a render target (host depth-tests into it) and a
+       * sampled/blit/transfer source (shadow maps, readback). No BLEND on depth. */
+      const VkFormatFeatureFlags dfeats =
+         VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+         VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+         VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+         VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+         VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+      p->optimalTilingFeatures |= dfeats;
+      p->linearTilingFeatures |= dfeats;
+   }
    if (infinigpu_vertex_format_supported(format))
       p->bufferFeatures |= VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
 }
@@ -556,7 +613,8 @@ infinigpu_GetPhysicalDeviceImageFormatProperties2(
    const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
    VkImageFormatProperties2 *pImageFormatProperties)
 {
-   if (!infinigpu_format_supported(pImageFormatInfo->format) ||
+   if ((!infinigpu_format_supported(pImageFormatInfo->format) &&
+        !infinigpu_depth_format_supported(pImageFormatInfo->format)) ||
        pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 

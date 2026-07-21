@@ -16,6 +16,15 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Set INFINIGPU_DEBUG=1 to trace ICD bring-up (host smoke + real guest VM boot).
+ * Off by default; never fires in production. Shared by every TU. */
+#define IGPU_TRACE(...) do { \
+   if (getenv("INFINIGPU_DEBUG")) { \
+      fprintf(stderr, "[infinigpu] " __VA_ARGS__); fputc('\n', stderr); \
+   } } while (0)
 
 #include "c11/threads.h"
 #include "util/list.h"

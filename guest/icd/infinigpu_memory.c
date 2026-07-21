@@ -25,6 +25,10 @@ infinigpu_AllocateMemory(VkDevice _device,
    struct infinigpu_device_memory *mem;
    int drm_fd = dev->physical_device->drm_fd;
 
+   IGPU_TRACE("AllocateMemory: size=%llu typeIndex=%u",
+              (unsigned long long)pAllocateInfo->allocationSize,
+              pAllocateInfo->memoryTypeIndex);
+
    /* allocationSize==0 is legal — vk_device_memory_create would assert. */
    if (pAllocateInfo->allocationSize == 0) {
       *pMemory = VK_NULL_HANDLE;

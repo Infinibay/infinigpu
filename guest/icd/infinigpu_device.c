@@ -41,6 +41,8 @@ infinigpu_CreateDevice(VkPhysicalDevice physicalDevice,
    struct infinigpu_device *device;
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
+   IGPU_TRACE("CreateDevice: %u exts, %u queues", pCreateInfo->enabledExtensionCount,
+              pCreateInfo->queueCreateInfoCount);
 
    device = vk_zalloc2(&physical_device->vk.instance->alloc, pAllocator,
                        sizeof(*device), 8,
@@ -68,6 +70,7 @@ infinigpu_CreateDevice(VkPhysicalDevice physicalDevice,
    }
 
    device->physical_device = physical_device;
+   IGPU_TRACE("CreateDevice: vk_device_init OK");
 
    /* Direct-record command buffers (infinigpu_cmd_buffer.c). */
    device->vk.command_buffer_ops = &infinigpu_cmd_buffer_ops;

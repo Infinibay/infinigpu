@@ -30,6 +30,8 @@ infinigpu_CreateDescriptorSetLayout(VkDevice _device,
                                     VkDescriptorSetLayout *pSetLayout)
 {
    VK_FROM_HANDLE(infinigpu_device, dev, _device);
+   IGPU_TRACE("CreateDescriptorSetLayout: bindings=%u flags=0x%x",
+              pCreateInfo->bindingCount, pCreateInfo->flags);
    /* Ref-counted runtime object; no driver state to fill (types come from the writes). */
    struct infinigpu_descriptor_set_layout *l =
       vk_descriptor_set_layout_zalloc(&dev->vk, sizeof(*l));
@@ -98,6 +100,8 @@ infinigpu_CreateDescriptorPool(VkDevice _device,
                                VkDescriptorPool *pDescriptorPool)
 {
    VK_FROM_HANDLE(infinigpu_device, dev, _device);
+   IGPU_TRACE("CreateDescriptorPool: maxSets=%u flags=0x%x", pCreateInfo->maxSets,
+              pCreateInfo->flags);
    struct infinigpu_descriptor_pool *pool =
       vk_object_zalloc(&dev->vk, pAllocator, sizeof(*pool), VK_OBJECT_TYPE_DESCRIPTOR_POOL);
    if (!pool)

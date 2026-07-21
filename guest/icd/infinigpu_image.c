@@ -38,6 +38,9 @@ infinigpu_image_create(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
                             pCreateInfo->arrayLayers,
                          INFINIGPU_MEM_ALIGN);
 
+   IGPU_TRACE("CreateImage: format=%d %ux%u usage=0x%x tiling=%d -> size=%llu",
+              pCreateInfo->format, pCreateInfo->extent.width, pCreateInfo->extent.height,
+              pCreateInfo->usage, pCreateInfo->tiling, (unsigned long long)image->size);
    *pImage = infinigpu_image_to_handle(image);
    return VK_SUCCESS;
 }
