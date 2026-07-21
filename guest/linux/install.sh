@@ -84,6 +84,35 @@ mkdir -p /etc/modprobe.d
 printf 'options infinigpu ring_drainer=1\n' > /etc/modprobe.d/infinigpu.conf
 log "[OK] /etc/modprobe.d/infinigpu.conf written (ring_drainer=1 → 3D submit enabled)"
 
+# 4b'. Reserve a CMA pool so the KMD can allocate LARGE contiguous scanout framebuffers.
+# The infinigpu KMD backs dumb/scanout buffers with GEM-DMA (physically-contiguous
+# dma_alloc_coherent). With no CMA reservation the kernel caps a single contiguous
+# allocation at MAX_ORDER (~4 MiB), so any framebuffer past ~1024x768 (1920x1080 = 8 MiB,
+# 4K = 33 MiB) fails DRM_IOCTL_MODE_CREATE_DUMB with -ENOMEM. gnome-shell then can't lock
+# a front buffer ("gbm_surface_lock_front_buffer failed") and the GPU console is BLACK at
+# any real resolution. cma=512M comfortably covers multi-buffered 4K. CMA is reserved at
+# boot, so this takes effect on the next boot (the GPU cold-boot after setup).
+if [ -f /etc/default/grub ] && command -v update-grub >/dev/null 2>&1; then
+  if grep -q 'cma=' /etc/default/grub; then
+    log "[OK] cma= already present in GRUB cmdline"
+  else
+    if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
+      sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 cma=512M"/' /etc/default/grub
+    else
+      echo 'GRUB_CMDLINE_LINUX_DEFAULT="cma=512M"' >> /etc/default/grub
+    fi
+    # normalise a leading space left when the prior value was empty ("" → " cma=512M")
+    sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=" cma=/GRUB_CMDLINE_LINUX_DEFAULT="cma=/' /etc/default/grub
+    if update-grub 2>&1 | tee -a "$LOG"; then
+      log "[OK] reserved cma=512M for large scanout framebuffers (effective next boot)"
+    else
+      log "[WARN] update-grub failed — large framebuffers may -ENOMEM; set cma=512M manually"
+    fi
+  fi
+else
+  log "[INFO] no GRUB/update-grub — ensure the kernel gets cma=512M for large framebuffers"
+fi
+
 # 4c. Load the module AFTER DKMS has built it — closes a first-boot race.
 # On the FIRST boot into the DKMS-target kernel (the guest apt/dnf-upgrades the kernel
 # during install, so the GPU cold-boot lands on a kernel DKMS hasn't built for yet),
