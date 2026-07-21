@@ -103,9 +103,11 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	const size_t draws_bytes = (size_t)draw_count * sizeof(struct DrawCmdWire);
 	const size_t texs_bytes = (size_t)tex_count * sizeof(struct TextureDescWire);
 
-	/* A command list is the geometry path: it must carry a vertex buffer and at least one draw
-	 * (the host's decode_forwarded_cmdlist rejects a degenerate list — fail here too, early). */
-	if (vertex_stride == 0u || vertex_data_len == 0u || draw_count == 0u)
+	/* A command list carries at least one draw. It is either a MESH (a vertex buffer: stride>0 with
+	 * vertex bytes) or a BUFFERLESS draw (gl_VertexIndex pulling from a UBO, like vkcube: stride==0 AND
+	 * vertex_data_len==0). Reject a degenerate list (no draw) or the mixed case (exactly one of
+	 * stride/data is zero) — mirrors the host's decode_forwarded_cmdlist guard. */
+	if (draw_count == 0u || (vertex_stride == 0u) != (vertex_data_len == 0u))
 		return 0;
 
 	const size_t total = sizeof(struct VulkanWorkload) + sizeof(struct ForwardedCmdListTail) +

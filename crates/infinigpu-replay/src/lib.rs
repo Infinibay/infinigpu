@@ -3140,19 +3140,27 @@ impl HostGpu {
                 max_depth: 1.0,
             };
             match (geom, draw.geometry.as_ref()) {
-                // Phase-2b: real mesh — bind the vertex (and optional index) buffer, then replay each
-                // forwarded draw with its own viewport.
-                (Some(gg), Some(g)) => {
-                    dev.cmd_bind_vertex_buffers(ss.cmd, 0, &[gg.vbo], &[0]);
-                    if let Some((ibo, _)) = gg.ibo {
-                        let it = if g.index_u32 {
-                            vk::IndexType::UINT32
-                        } else {
-                            vk::IndexType::UINT16
-                        };
-                        dev.cmd_bind_index_buffer(ss.cmd, ibo, 0, it);
-                    }
-                    let indexed = gg.ibo.is_some();
+                // A command list with explicit draws: either a real MESH (a vertex/index buffer was
+                // uploaded — `geom` is Some) or a BUFFERLESS draw that pulls its vertices from a UBO by
+                // gl_VertexIndex (vkcube — `geom` is None, but the draw list + UBO are present). Bind
+                // the vertex/index buffer only for a mesh; either way replay each forwarded draw with
+                // its own count + viewport (NOT the top-level `vertex_count`, which is 0 for a cmdlist).
+                (_, Some(g)) if !g.draws.is_empty() => {
+                    let indexed = match geom {
+                        Some(gg) => {
+                            dev.cmd_bind_vertex_buffers(ss.cmd, 0, &[gg.vbo], &[0]);
+                            if let Some((ibo, _)) = gg.ibo {
+                                let it = if g.index_u32 {
+                                    vk::IndexType::UINT32
+                                } else {
+                                    vk::IndexType::UINT16
+                                };
+                                dev.cmd_bind_index_buffer(ss.cmd, ibo, 0, it);
+                            }
+                            gg.ibo.is_some()
+                        }
+                        None => false,
+                    };
                     for d in g.draws {
                         let vp = if d.viewport[2] > 0.0 {
                             vk::Viewport {

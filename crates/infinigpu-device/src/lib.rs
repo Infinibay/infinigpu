@@ -570,9 +570,15 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
     {
         return None;
     }
-    // A command list is the geometry path: it must carry a vertex buffer with a real stride, and the
-    // stride must span every attribute. A bufferless draw belongs on the `vk_op::FORWARDED` path.
-    if stride == 0 || vdata_len == 0 || !vdata_len.is_multiple_of(stride as usize) {
+    // A mesh carries a vertex buffer: a real stride, and vertex bytes that are a whole number of
+    // vertices. A BUFFERLESS draw (gl_VertexIndex — e.g. a shader that pulls its vertices from a UBO,
+    // as vkcube does) carries neither: stride==0 AND vdata_len==0, with the geometry riding in the
+    // uniform block. Both are valid command lists; reject only the mixed case (exactly one of the two
+    // is zero — a stride without data or data without a stride) or a stride that doesn't divide the data.
+    if (stride == 0) != (vdata_len == 0) {
+        return None;
+    }
+    if stride != 0 && !vdata_len.is_multiple_of(stride as usize) {
         return None;
     }
 

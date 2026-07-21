@@ -276,20 +276,27 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
          ? INFINIGPU_VK_TOPOLOGY_TRIANGLE_STRIP
          : INFINIGPU_VK_TOPOLOGY_TRIANGLE_LIST;
 
-   /* Vertex buffer: whole vertices from the CmdBindVertexBuffers offset to the buffer end. */
+   /* Vertex source: a MESH binds a vertex buffer (stride>0 → whole vertices from the
+    * CmdBindVertexBuffers offset to the buffer end); a BUFFERLESS draw (stride==0, e.g. vkcube pulling
+    * vertices from a UBO by gl_VertexIndex) binds none — vdata=NULL, vlen=0, and the shader reads the
+    * forwarded UBO/SSBO captured below. The host's replay builds an empty vertex-input for stride==0. */
    struct infinigpu_buffer *vb = cmd->vbuf;
    IGPU_TRACE("cmdlist: stride=%u vbuf=%p map=%p total=%llu voff=%llu attrs=%u vs=%uB fs=%uB draws=%u",
               p->vertex_stride, (void *)vb, vb ? vb->map : NULL,
               vb ? (unsigned long long)vb->total_size : 0ull,
               (unsigned long long)cmd->vbuf_offset, p->attr_count,
               vs->spirv_size, fs->spirv_size, cmd->draw_count);
-   if (!vb || !vb->map || cmd->vbuf_offset >= vb->total_size)
-      return vk_errorf(dev, VK_ERROR_UNKNOWN, "cmdlist draw without a valid vertex buffer");
-   const uint8_t *vdata = (const uint8_t *)vb->map + cmd->vbuf_offset;
-   uint64_t vavail = vb->total_size - cmd->vbuf_offset;
-   uint32_t vlen = (uint32_t)((vavail / p->vertex_stride) * p->vertex_stride);
-   if (vlen == 0)
-      return vk_errorf(dev, VK_ERROR_UNKNOWN, "vertex buffer smaller than one vertex");
+   const uint8_t *vdata = NULL;
+   uint32_t vlen = 0;
+   if (p->vertex_stride > 0) {
+      if (!vb || !vb->map || cmd->vbuf_offset >= vb->total_size)
+         return vk_errorf(dev, VK_ERROR_UNKNOWN, "cmdlist draw without a valid vertex buffer");
+      vdata = (const uint8_t *)vb->map + cmd->vbuf_offset;
+      uint64_t vavail = vb->total_size - cmd->vbuf_offset;
+      vlen = (uint32_t)((vavail / p->vertex_stride) * p->vertex_stride);
+      if (vlen == 0)
+         return vk_errorf(dev, VK_ERROR_UNKNOWN, "vertex buffer smaller than one vertex");
+   }
 
    /* Index buffer: forwarded only if a draw is indexed (the host treats index presence as global,
     * so a command buffer must not mix indexed and non-indexed draws — content rarely does). */
@@ -570,9 +577,14 @@ infinigpu_replay_cmd_buffer(struct infinigpu_device *dev,
          return vk_errorf(dev, VK_ERROR_UNKNOWN,
                           "color attachment has no bound memory");
 
-      /* Phase-2b: a pipeline that reads a vertex buffer (non-zero stride) takes the command-list
-       * path (real mesh); otherwise the Phase-1 bufferless path (SM-generated vertices). */
-      if (p->vertex_stride > 0 && cmd->vbuf) {
+      /* The command-list path carries the full draw state (vertex buffer, UBO/SSBO, textures, dynamic
+       * state). Take it for a real MESH (non-zero stride + a bound vertex buffer) OR for a BUFFERLESS
+       * draw that still needs a UBO — a shader that pulls its vertices from a uniform block by
+       * gl_VertexIndex (vkcube), which the Phase-1 bufferless path can't carry (it forwards no UBO).
+       * Only a pipeline with neither a vertex buffer nor a UBO falls to the Phase-1 SM-generated path. */
+      const bool has_vbuf = (p->vertex_stride > 0 && cmd->vbuf);
+      const bool has_ubo = cmd->bound_desc_set && cmd->bound_desc_set->ubo_buffer;
+      if (has_vbuf || has_ubo) {
          VkResult r = infinigpu_replay_cmdlist(dev, cmd, p, vs, fs, img);
          if (r != VK_SUCCESS)
             return r;
