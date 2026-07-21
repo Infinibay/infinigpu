@@ -414,6 +414,19 @@ pub struct HostGpu {
     /// Built lazily per unique signature and reused (content-independent). Bounded to avoid an
     /// adversarial guest growing it unboundedly; all entries destroyed on drop.
     desc_set_layouts: Mutex<HashMap<DescriptorSig, vk::DescriptorSetLayout>>,
+    /// Fix F: content-address the per-frame texture + mesh uploads so identical read-only content
+    /// uploads ONCE (env `INFINIGPU_RESOURCE_CACHE`, default **on**; `=0` restores the per-frame-upload
+    /// path for an A/B). Gated behind `cache_enabled` (shares its lifetime discipline).
+    resource_cache_enabled: bool,
+    /// Fix F: resident meshes keyed by content hash; hands out a binding-only `GeometryGpu` copy on a
+    /// hit. Bulk-evicted at [`MAX_CACHED_GEOM`] / [`MAX_CACHED_GEOM_BYTES`]; all destroyed on drop.
+    geom_cache: Mutex<GeomCache>,
+    /// Fix F: resident textures keyed by content hash; hands out `(view, sampler)` on a hit. Evicted
+    /// only at frame start (never mid-frame — a multi-texture set already references cache entries),
+    /// bulk at [`MAX_CACHED_TEX`] / [`MAX_CACHED_TEX_BYTES`]; all destroyed on drop.
+    tex_cache: Mutex<TexCache>,
+    /// Fix F: lazily-built reusable command buffer + fence for the dedicated cache-miss texture upload.
+    upload_ctx: Mutex<Option<UploadCtx>>,
 }
 
 /// Fix D: a guest-RAM region imported as a `TRANSFER_DST` buffer the GPU can copy a frame into.
@@ -866,6 +879,11 @@ struct SizedScratch {
 /// a by-id resource cache that skips re-uploading a static mesh every frame is a perf follow-up, see
 /// `docs/3D-COMPLETENESS-ROADMAP.md`). Created per submit and destroyed only after that submit's
 /// fence completes — the recorded draws reference these buffers until then.
+///
+/// `Copy` (just Vulkan handles): the Fix-F geometry cache hands out a binding-only copy of a
+/// cache-owned mesh without transferring ownership — the copy is bound into the frame's command
+/// buffer while the cache retains the sole `destroy` right.
+#[derive(Clone, Copy)]
 struct GeometryGpu {
     vbo: vk::Buffer,
     vbo_mem: vk::DeviceMemory,
@@ -915,6 +933,159 @@ impl TextureGpu {
         dev.free_memory(self.image_mem, None);
         dev.destroy_buffer(self.staging, None);
         dev.free_memory(self.staging_mem, None);
+    }
+}
+
+// ─── Fix F: host resource cache (content-addressed textures + meshes) ───────────────────────────
+//
+// The forwarded ICD re-sends a draw's FULL textures + vertex/index bytes every frame (findings #4/#8):
+// a static-art game therefore re-uploaded megabytes to the GPU per frame — a fresh VkImage/staging
+// buffer + VkDeviceMemory alloc + CPU memcpy + GPU copy for every texture, every mesh, 60×/s — all of
+// it redundant. Fix F content-addresses those read-only resources so identical content uploads ONCE
+// and is reused: the per-frame CPU marshaling + alloc churn (the "still rendering via CPU" cost) and
+// the GPU upload collapse to a descriptor write on a hit. Read-only + the single-submit-thread +
+// fence-per-frame invariant make sharing across submits sound (no in-flight reference at eviction).
+
+/// Fast content hash for cache-addressing read-only GPU resources. The forwarding ICD re-sends a
+/// resource's FULL bytes every frame, so this runs on the single submit thread on **every** frame
+/// (including 100%-hit steady state) — a byte-at-a-time FNV (~1 GB/s, a serial multiply chain) would
+/// add ~16 ms/frame for a 16 MB texture, blowing the frame budget on a HIT. So it hashes four
+/// independent lanes of 8-byte words (ILP + 8× width ⇒ ~10-16 GB/s) and folds in the length. Not
+/// cryptographic — dedup only; the callers additionally fold in dims/type so a shared prefix can't
+/// collide. (A truly O(1) key needs a guest resource id / buffer generation from the wire — a Tier-4
+/// follow-up; this keeps the per-frame scan cheap until then.)
+fn content_hash(data: &[u8]) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    // Four distinct non-zero seeds so the lanes decorrelate.
+    let mut h = [
+        0xcbf2_9ce4_8422_2325u64,
+        0x8422_2325_cbf2_9ce4,
+        0x0100_0000_01b3_beef,
+        0xdead_beef_cafe_f00d,
+    ];
+    let mut chunks = data.chunks_exact(32);
+    for c in &mut chunks {
+        for (lane, hl) in h.iter_mut().enumerate() {
+            let w = u64::from_le_bytes(c[lane * 8..lane * 8 + 8].try_into().unwrap());
+            *hl = (*hl ^ w).wrapping_mul(PRIME);
+        }
+    }
+    let mut acc =
+        h[0] ^ h[1].rotate_left(16) ^ h[2].rotate_left(32) ^ h[3].rotate_left(48);
+    // Tail (< 32 bytes): fold remaining whole words, then leftover bytes.
+    let rem = chunks.remainder();
+    let mut words = rem.chunks_exact(8);
+    for c in &mut words {
+        acc = (acc ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(PRIME);
+    }
+    for &b in words.remainder() {
+        acc = (acc ^ b as u64).wrapping_mul(PRIME);
+    }
+    acc ^ (data.len() as u64).wrapping_mul(PRIME)
+}
+
+/// Fix F cache bounds. A guest flooding unique meshes/textures can't grow the caches without limit:
+/// at either the entry-count or the byte cap the whole cache is bulk-evicted and repopulated on
+/// demand (fail-closed, matching the pipeline/scratch caches). The byte caps bound host VRAM.
+const MAX_CACHED_GEOM: usize = 256;
+const MAX_CACHED_GEOM_BYTES: usize = 128 * 1024 * 1024;
+const MAX_CACHED_TEX: usize = 512;
+const MAX_CACHED_TEX_BYTES: usize = 512 * 1024 * 1024;
+
+/// Content key for a cached mesh: the vertex bytes, the index bytes, both lengths, and the index
+/// width — anything that changes the uploaded buffers changes the key.
+fn geom_key(g: &Geometry) -> u64 {
+    let mut h = content_hash(g.vertex_data) ^ content_hash(g.index_data).rotate_left(32);
+    h ^= (g.vertex_data.len() as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    h ^= (g.index_data.len() as u64).rotate_left(17);
+    h ^= (g.index_u32 as u64) << 1;
+    h
+}
+
+/// Content key for a cached texture: the RGBA bytes, the dimensions, and the sampler mode (a linear
+/// vs. nearest / repeat vs. clamp change produces a different sampler, so it is part of the key).
+fn tex_key(t: &Texture) -> u64 {
+    let mut h = content_hash(t.rgba);
+    h ^= ((t.width as u64) << 40) ^ ((t.height as u64) << 8);
+    h ^= (t.sampler.linear as u64) << 2;
+    h ^= (t.sampler.repeat as u64) << 3;
+    h
+}
+
+/// Fix F: a mesh uploaded ONCE and reused across frames, keyed by [`geom_key`]. Cache-owned
+/// (persistent for the VM/process lifetime; bulk-evicted at the cap or on drop) — never destroyed
+/// per frame, unlike a per-submit [`GeometryGpu`].
+struct ResidentGeometry {
+    gpu: GeometryGpu,
+    /// Uploaded size; folded into the cache's running byte total for the VRAM cap (the total is what
+    /// bounds the cache — this per-entry copy documents intent / a future per-entry LRU).
+    #[allow(dead_code)]
+    bytes: usize,
+}
+
+/// Fix F: a sampled texture uploaded ONCE and reused across frames, keyed by [`tex_key`]. Holds no
+/// staging buffer — the staging→image copy runs on a dedicated one-off submit at upload time
+/// ([`HostGpu::upload_resident_texture`]), leaving the image `SHADER_READ_ONLY_OPTIMAL` before any
+/// frame samples it. Cache-owned; never destroyed per frame.
+struct ResidentTexture {
+    image: vk::Image,
+    image_mem: vk::DeviceMemory,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+    #[allow(dead_code)]
+    width: u32,
+    #[allow(dead_code)]
+    height: u32,
+    bytes: usize,
+}
+
+impl ResidentTexture {
+    /// # Safety
+    /// `dev` must be the owning device and no submit referencing these objects may still be in flight
+    /// (the caller waits device-idle / the per-frame fence before evicting).
+    unsafe fn destroy(&self, dev: &ash::Device) {
+        dev.destroy_sampler(self.sampler, None);
+        dev.destroy_image_view(self.view, None);
+        dev.destroy_image(self.image, None);
+        dev.free_memory(self.image_mem, None);
+    }
+}
+
+/// Fix F: content-addressed cache of resident geometry, with a running byte total (for the VRAM cap)
+/// and hit/miss counters (the hit rate quantifies the win — steady state approaches 100%).
+#[derive(Default)]
+struct GeomCache {
+    map: HashMap<u64, ResidentGeometry>,
+    bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+/// Fix F: content-addressed cache of resident textures (see [`GeomCache`]).
+#[derive(Default)]
+struct TexCache {
+    map: HashMap<u64, ResidentTexture>,
+    bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+/// Fix F: a reusable one-off command buffer + fence for the dedicated staging→image upload of a
+/// cache-miss texture. Built lazily on the first miss, reused across misses (one submit thread per
+/// device process ⇒ no contention). Distinct from the per-frame [`SizedScratch`] so a texture upload
+/// never perturbs the frame command buffer.
+struct UploadCtx {
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+}
+
+impl UploadCtx {
+    /// # Safety
+    /// `dev` must be the owning device and no upload using these objects may still be in flight.
+    unsafe fn destroy(&self, dev: &ash::Device) {
+        dev.destroy_fence(self.fence, None);
+        dev.destroy_command_pool(self.pool, None); // frees self.cmd too
     }
 }
 
@@ -1198,6 +1369,15 @@ impl HostGpu {
             host_ptr_align,
             guest_imports: Mutex::new(HashMap::new()),
             desc_set_layouts: Mutex::new(HashMap::new()),
+            // Fix F: default ON, gated behind the pipeline cache (same lifetime discipline).
+            // `INFINIGPU_RESOURCE_CACHE=0` restores the per-frame texture/mesh upload for an A/B.
+            resource_cache_enabled: cache_enabled
+                && std::env::var("INFINIGPU_RESOURCE_CACHE")
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true),
+            geom_cache: Mutex::new(GeomCache::default()),
+            tex_cache: Mutex::new(TexCache::default()),
+            upload_ctx: Mutex::new(None),
         })
     }
 
@@ -2380,13 +2560,25 @@ impl HostGpu {
         let ss = cache.get(&sk).expect("just inserted above");
         let t_setup = bd.map(|_| Instant::now());
 
-        // Phase-2b/2c: upload the mesh + texture (if any) for this submit. Freed after the fence
-        // completes below — the recorded draws reference them until then. A failure here is a clean
-        // early return (the scratch is untouched; each upload frees its own partials).
+        // Fix F: evict the texture cache HERE (frame start) if it hit a cap — sound only before this
+        // frame references any texture (the previous frame's fence is already waited, and this frame's
+        // descriptor set is not yet built). Never evict mid-fetch (a multi-texture set would dangle).
+        if self.resource_cache_enabled {
+            self.trim_tex_cache();
+        }
+        // Phase-2b/2c: upload the mesh + texture (if any) for this submit. Fix F: a cache-resident mesh
+        // (and its textures) is uploaded once and reused — the cache owns it, so it is NOT freed after
+        // the fence; only a legacy (cache-off) per-frame mesh is. A failure here is a clean early
+        // return (the scratch is untouched; each upload frees its own partials).
+        let geom_owned = !self.resource_cache_enabled;
         let geom_gpu = match draw.geometry.as_ref() {
-            Some(g) if g.vertex_stride != 0 && !g.vertex_data.is_empty() => {
-                Some(self.upload_geometry(g)?)
-            }
+            Some(g) if g.vertex_stride != 0 && !g.vertex_data.is_empty() => Some(
+                if self.resource_cache_enabled {
+                    self.get_or_upload_geometry(g)?
+                } else {
+                    self.upload_geometry(g)?
+                },
+            ),
             _ => None,
         };
         // Phase-2c: build descriptor set 0 (a UBO and/or a texture, composed into one set) for this
@@ -2400,7 +2592,7 @@ impl HostGpu {
                 match built {
                     Ok(d) => Some(d),
                     Err(e) => {
-                        if let Some(gg) = geom_gpu {
+                        if let (Some(gg), true) = (geom_gpu, geom_owned) {
                             unsafe { gg.destroy(dev) };
                         }
                         return Err(e);
@@ -2444,8 +2636,9 @@ impl HostGpu {
         })();
         // Whether the submit succeeded or failed, the fence is no longer pending on our objects (on
         // success it is signaled; on failure the submit never referenced them or the wait returned) ⇒
-        // free the per-submit mesh + descriptors exactly once, then propagate any error.
-        if let Some(gg) = geom_gpu {
+        // free the per-submit mesh + descriptors exactly once, then propagate any error. Fix F: a
+        // cache-resident mesh is NOT freed here — the cache owns it and reuses it next frame.
+        if let (Some(gg), true) = (geom_gpu, geom_owned) {
             unsafe { gg.destroy(dev) };
         }
         if let Some(d) = descs {
@@ -2588,6 +2781,336 @@ impl HostGpu {
             }
         };
         Ok(GeometryGpu { vbo, vbo_mem, ibo })
+    }
+
+    /// Fix F: return a resident mesh for `g`, uploading it once on a miss and reusing it on every
+    /// later frame. The returned [`GeometryGpu`] is a **binding-only copy** of cache-owned handles —
+    /// the caller binds it but must NOT destroy it (the cache owns the lifetime). Bulk-evicts at the
+    /// cap before inserting; safe because eviction runs under the lock while the previous frame's fence
+    /// is already waited and this frame has not yet referenced any other mesh (a frame binds one mesh).
+    fn get_or_upload_geometry(&self, g: &Geometry) -> R<GeometryGpu> {
+        let key = geom_key(g);
+        let mut c = self.geom_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = c.map.get(&key) {
+            let gpu = r.gpu;
+            c.hits += 1;
+            return Ok(gpu);
+        }
+        // Miss — upload, then insert (evicting in bulk first if this would exceed a cap).
+        let gpu = self.upload_geometry(g)?;
+        let bytes = g.vertex_data.len() + g.index_data.len();
+        c.misses += 1;
+        if c.map.len() >= MAX_CACHED_GEOM || c.bytes.saturating_add(bytes) > MAX_CACHED_GEOM_BYTES {
+            // No in-flight submit references these (previous frame fence-waited; this frame binds only
+            // the mesh we are about to insert), so a bulk free is sound.
+            for (_, r) in c.map.drain() {
+                unsafe { r.gpu.destroy(&self.device) };
+            }
+            c.bytes = 0;
+        }
+        c.map.insert(key, ResidentGeometry { gpu, bytes });
+        c.bytes += bytes;
+        Ok(gpu)
+    }
+
+    /// Fix F: evict the whole texture cache iff it has reached a cap. Called at frame start — BEFORE
+    /// the frame references any texture — so no in-flight or current-frame descriptor set points at an
+    /// evicted image (the previous frame's fence is already waited). This is why texture eviction is
+    /// never done inline per-insert: a multi-texture set fetches several entries into ONE descriptor
+    /// set, and evicting mid-fetch could destroy an image already bound this frame.
+    fn trim_tex_cache(&self) {
+        let mut c = self.tex_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if c.map.len() >= MAX_CACHED_TEX || c.bytes >= MAX_CACHED_TEX_BYTES {
+            unsafe {
+                let _ = self.device.device_wait_idle();
+                for (_, t) in c.map.drain() {
+                    t.destroy(&self.device);
+                }
+            }
+            c.bytes = 0;
+        }
+    }
+
+    /// Fix F: return `(view, sampler)` for a resident texture matching `tex`, uploading it once on a
+    /// miss. Never evicts (that happens only in [`Self::trim_tex_cache`] at frame start) so a
+    /// mid-frame miss can't destroy a sibling texture already bound into this frame's descriptor set.
+    /// The returned handles are cache-owned and outlive the frame; the caller only writes them into
+    /// the descriptor set.
+    fn get_or_upload_texture(&self, tex: &Texture) -> R<(vk::ImageView, vk::Sampler)> {
+        let (w, h) = (tex.width, tex.height);
+        let expected = (w as usize).checked_mul(h as usize).and_then(|p| p.checked_mul(4));
+        if w == 0 || h == 0 || w > 16384 || h > 16384 || expected != Some(tex.rgba.len()) {
+            return Err(format!("bad texture {w}x{h} ({} bytes)", tex.rgba.len()).into());
+        }
+        let key = tex_key(tex);
+        let mut c = self.tex_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = c.map.get(&key) {
+            let vs = (r.view, r.sampler);
+            c.hits += 1;
+            return Ok(vs);
+        }
+        // Miss — upload on a dedicated one-off submit so the image is SHADER_READ_ONLY_OPTIMAL before
+        // this frame's render samples it. Insert past the soft cap (bounded to +MAX_TEXTURES until the
+        // next frame-start trim); we deliberately do NOT evict here (see the doc comment).
+        let r = self.upload_resident_texture(tex)?;
+        let ret = (r.view, r.sampler);
+        c.misses += 1;
+        c.bytes += r.bytes;
+        c.map.insert(key, r);
+        Ok(ret)
+    }
+
+    /// Fix F: build the reusable upload command buffer + fence on first use.
+    fn ensure_upload_ctx(&self) -> R<()> {
+        let mut slot = self.upload_ctx.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return Ok(());
+        }
+        unsafe {
+            let pool = self.device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default().queue_family_index(self.queue_family),
+                None,
+            )?;
+            let cmd = match self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            ) {
+                Ok(v) => v[0],
+                Err(e) => {
+                    self.device.destroy_command_pool(pool, None);
+                    return Err(e.into());
+                }
+            };
+            let fence = match self.device.create_fence(&vk::FenceCreateInfo::default(), None) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.device.destroy_command_pool(pool, None);
+                    return Err(e.into());
+                }
+            };
+            *slot = Some(UploadCtx { pool, cmd, fence });
+        }
+        Ok(())
+    }
+
+    /// Fix F: upload one texture's pixels into a fresh device-local sampled image on a dedicated
+    /// one-off submit (staging→image copy + layout transitions on [`Self::upload_ctx`]), leaving it
+    /// `SHADER_READ_ONLY_OPTIMAL`. The transient staging buffer is freed here; only the image + view +
+    /// sampler survive in the returned [`ResidentTexture`] (which the cache owns). Frees all partials
+    /// on any error (no leak on the long-lived shared device).
+    fn upload_resident_texture(&self, tex: &Texture) -> R<ResidentTexture> {
+        let dev = &self.device;
+        let (w, h) = (tex.width, tex.height);
+        self.ensure_upload_ctx()?;
+        let mut staging = vk::Buffer::null();
+        let mut staging_mem = vk::DeviceMemory::null();
+        let mut image = vk::Image::null();
+        let mut image_mem = vk::DeviceMemory::null();
+        let mut view = vk::ImageView::null();
+        let mut sampler = vk::Sampler::null();
+        let mut build = || -> R<ResidentTexture> {
+            unsafe {
+                // Staging buffer (host-visible|coherent), filled with the pixels.
+                staging = dev.create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(tex.rgba.len() as u64)
+                        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )?;
+                let sreq = dev.get_buffer_memory_requirements(staging);
+                staging_mem = dev.allocate_memory(
+                    &vk::MemoryAllocateInfo::default().allocation_size(sreq.size).memory_type_index(
+                        self.find_mem(
+                            sreq.memory_type_bits,
+                            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )?,
+                    ),
+                    None,
+                )?;
+                dev.bind_buffer_memory(staging, staging_mem, 0)?;
+                let ptr = dev.map_memory(staging_mem, 0, tex.rgba.len() as u64, vk::MemoryMapFlags::empty())?;
+                std::ptr::copy_nonoverlapping(tex.rgba.as_ptr(), ptr as *mut u8, tex.rgba.len());
+                dev.unmap_memory(staging_mem);
+
+                // Device-local sampled image.
+                image = dev.create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )?;
+                let ireq = dev.get_image_memory_requirements(image);
+                image_mem = dev.allocate_memory(
+                    &vk::MemoryAllocateInfo::default().allocation_size(ireq.size).memory_type_index(
+                        self.find_mem(ireq.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?,
+                    ),
+                    None,
+                )?;
+                dev.bind_image_memory(image, image_mem, 0)?;
+                view = dev.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .subresource_range(color_range()),
+                    None,
+                )?;
+                let filter = if tex.sampler.linear { vk::Filter::LINEAR } else { vk::Filter::NEAREST };
+                let addr = if tex.sampler.repeat {
+                    vk::SamplerAddressMode::REPEAT
+                } else {
+                    vk::SamplerAddressMode::CLAMP_TO_EDGE
+                };
+                sampler = dev.create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(filter)
+                        .min_filter(filter)
+                        .address_mode_u(addr)
+                        .address_mode_v(addr)
+                        .address_mode_w(addr),
+                    None,
+                )?;
+
+                // Record the staging→image copy + layout transitions on the dedicated upload buffer,
+                // submit, and wait — the image is populated + SHADER_READ_ONLY_OPTIMAL on return.
+                let ctx = self.upload_ctx.lock().unwrap_or_else(|e| e.into_inner());
+                let ctx = ctx.as_ref().expect("ensure_upload_ctx built it");
+                dev.reset_command_pool(ctx.pool, vk::CommandPoolResetFlags::empty())?;
+                dev.begin_command_buffer(
+                    ctx.cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )?;
+                let to_dst = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .image(image)
+                    .subresource_range(color_range());
+                dev.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_dst],
+                );
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(0)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+                dev.cmd_copy_buffer_to_image(
+                    ctx.cmd,
+                    staging,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+                let to_read = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .image(image)
+                    .subresource_range(color_range());
+                dev.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_read],
+                );
+                dev.end_command_buffer(ctx.cmd)?;
+                dev.reset_fences(&[ctx.fence])?;
+                let cmds = [ctx.cmd];
+                let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+                dev.queue_submit(self.queue, &submit, ctx.fence)?;
+                self.wait_fence(ctx.fence)?;
+
+                // The image is populated; the staging buffer is no longer needed — free it now so the
+                // resident texture carries only image + view + sampler.
+                dev.destroy_buffer(staging, None);
+                dev.free_memory(staging_mem, None);
+                staging = vk::Buffer::null();
+                staging_mem = vk::DeviceMemory::null();
+
+                let bytes = (ireq.size as usize).max(tex.rgba.len());
+                Ok(ResidentTexture { image, image_mem, view, sampler, width: w, height: h, bytes })
+            }
+        };
+        build().map_err(|e| {
+            unsafe {
+                if sampler != vk::Sampler::null() {
+                    dev.destroy_sampler(sampler, None);
+                }
+                if view != vk::ImageView::null() {
+                    dev.destroy_image_view(view, None);
+                }
+                if image != vk::Image::null() {
+                    dev.destroy_image(image, None);
+                }
+                if image_mem != vk::DeviceMemory::null() {
+                    dev.free_memory(image_mem, None);
+                }
+                if staging != vk::Buffer::null() {
+                    dev.destroy_buffer(staging, None);
+                }
+                if staging_mem != vk::DeviceMemory::null() {
+                    dev.free_memory(staging_mem, None);
+                }
+            }
+            e
+        })
+    }
+
+    /// Fix F: write a resident texture's `(view, sampler)` into the shared descriptor set — image at
+    /// `image_binding` (already `SHADER_READ_ONLY_OPTIMAL`), sampler at `image_binding + 1`. Mirrors
+    /// the write in [`Self::upload_texture_into`] but for a pre-uploaded cache-resident image.
+    fn write_texture_descriptor(
+        &self,
+        set: vk::DescriptorSet,
+        image_binding: u32,
+        view: vk::ImageView,
+        sampler: vk::Sampler,
+    ) {
+        unsafe {
+            let img_info = [vk::DescriptorImageInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let smp_info = [vk::DescriptorImageInfo::default().sampler(sampler)];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(image_binding)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&img_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(image_binding + 1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&smp_info),
+            ];
+            self.device.update_descriptor_sets(&writes, &[]);
+        }
     }
 
     /// Phase-2c: the descriptor-set-0 layout for a [`DescriptorSig`], built dynamically from the present
@@ -2950,20 +3473,36 @@ impl HostGpu {
                     None
                 };
 
-                // Textures last — upload_texture_into writes each into the shared set at its binding and
-                // self-cleans on error. Already-built TextureGpus are collected so an error mid-way frees
-                // them (via the outer map_err path, which destroys the pool; the built textures are freed
-                // here explicitly since they live only in this Vec until the FrameDescriptors is returned).
-                let mut tgpu: Vec<TextureGpu> = Vec::with_capacity(textures.len());
-                for (i, t) in textures.iter().enumerate() {
-                    let binding = tex_base + 2 * i as u32;
-                    match self.upload_texture_into(t, set, binding) {
-                        Ok(g) => tgpu.push(g),
-                        Err(e) => {
-                            for g in &tgpu {
-                                g.destroy(dev);
+                // Textures last. Fix F (default): each texture is fetched from the resident cache
+                // (uploaded once, then reused) and only its `(view, sampler)` written into this set —
+                // the image is already `SHADER_READ_ONLY_OPTIMAL`, so `FrameDescriptors.tex` stays
+                // empty and `record_forwarded_frame` records no per-frame copy/transition. A resident
+                // upload that fails self-cleans; ones that already succeeded stay cache-owned (not
+                // leaked), and the outer `map_err` frees the pool/UBO/SSBO built above.
+                //
+                // Cache OFF (`INFINIGPU_RESOURCE_CACHE=0`): the legacy per-frame path —
+                // `upload_texture_into` builds a `TextureGpu` (staging + image + view + sampler) whose
+                // staging→image copy is recorded into the frame command buffer and which is destroyed
+                // after the submit fence. Already-built ones are freed on a mid-loop error.
+                let mut tgpu: Vec<TextureGpu> = Vec::new();
+                if self.resource_cache_enabled {
+                    for (i, t) in textures.iter().enumerate() {
+                        let binding = tex_base + 2 * i as u32;
+                        let (view, sampler) = self.get_or_upload_texture(t)?;
+                        self.write_texture_descriptor(set, binding, view, sampler);
+                    }
+                } else {
+                    tgpu.reserve(textures.len());
+                    for (i, t) in textures.iter().enumerate() {
+                        let binding = tex_base + 2 * i as u32;
+                        match self.upload_texture_into(t, set, binding) {
+                            Ok(g) => tgpu.push(g),
+                            Err(e) => {
+                                for g in &tgpu {
+                                    g.destroy(dev);
+                                }
+                                return Err(e);
                             }
-                            return Err(e);
                         }
                     }
                 }
@@ -3906,6 +4445,30 @@ impl Drop for HostGpu {
             for (_, sl) in layouts.drain() {
                 self.device.destroy_descriptor_set_layout(sl, None);
             }
+            // Fix F: free the resident texture + mesh caches and the one-off upload context (device is
+            // idle after the wait above). Log the hit rate — steady state approaches 100% (each hit is
+            // a per-frame image/mesh upload + alloc avoided).
+            {
+                let mut tc = self.tex_cache.lock().unwrap_or_else(|e| e.into_inner());
+                if tc.hits + tc.misses > 0 {
+                    eprintln!("resource cache: textures {} hit / {} miss", tc.hits, tc.misses);
+                }
+                for (_, t) in tc.map.drain() {
+                    t.destroy(&self.device);
+                }
+            }
+            {
+                let mut gc = self.geom_cache.lock().unwrap_or_else(|e| e.into_inner());
+                if gc.hits + gc.misses > 0 {
+                    eprintln!("resource cache: meshes {} hit / {} miss", gc.hits, gc.misses);
+                }
+                for (_, r) in gc.map.drain() {
+                    r.gpu.destroy(&self.device);
+                }
+            }
+            if let Some(ctx) = self.upload_ctx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                ctx.destroy(&self.device);
+            }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -4841,6 +5404,148 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
             );
         }
         eprintln!("forwarded_texture_samples_onto_a_quad: OK (r={red} g={green} b={blue} w={white})");
+    }
+
+    /// Fix F: the fast content hash is deterministic, length-sensitive, one-bit sensitive, and
+    /// handles every tail length (0..32) without panicking on `chunks_exact` remainders. A stable hash
+    /// is what makes a cache HIT happen; sensitivity is what stops two distinct resources aliasing.
+    #[test]
+    fn content_hash_is_deterministic_and_sensitive() {
+        // Deterministic across calls, for every length spanning the 32-byte block + word + byte tails.
+        for len in [0usize, 1, 7, 8, 31, 32, 33, 63, 64, 100, 1000] {
+            let v: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            assert_eq!(content_hash(&v), content_hash(&v), "hash must be deterministic (len {len})");
+        }
+        // A one-bit flip anywhere must change the hash (spot-check a few positions per length).
+        for len in [1usize, 8, 9, 32, 33, 65] {
+            let base: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let h0 = content_hash(&base);
+            for pos in [0, len / 2, len - 1] {
+                let mut m = base.clone();
+                m[pos] ^= 1;
+                assert_ne!(content_hash(&m), h0, "one-bit flip at {pos}/{len} must change the hash");
+            }
+        }
+        // Length is folded in: a prefix must not collide with the longer buffer.
+        assert_ne!(content_hash(b"abc"), content_hash(b"abcd"));
+        assert_ne!(content_hash(b""), content_hash(b"\0"));
+    }
+
+    /// Fix F: the resource cache reuses a texture + mesh across frames WITHOUT changing the pixels.
+    /// Renders the same textured, indexed quad twice on ONE `HostGpu` and asserts (a) the two frames
+    /// are byte-identical — the cache-hit path samples the same resident image and binds the same
+    /// resident vertex/index buffers, so the output must match the miss frame exactly — and (b) the
+    /// second frame was a genuine HIT for BOTH the texture and the mesh (one upload, then reuse). A
+    /// third frame with different texel bytes must MISS the texture (proving the content key
+    /// discriminates) while the identical mesh still hits. This is the perf win's correctness gate: on
+    /// a real game the per-frame image/staging/mesh alloc + CPU upload collapses to a descriptor write.
+    #[test]
+    #[ignore = "needs a Vulkan GPU"]
+    fn resource_cache_reuses_texture_and_mesh_identically() {
+        let gpu = match HostGpu::open() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        assert!(gpu.resource_cache_enabled, "cache must default on for this test");
+        let vs = compile_wgsl(
+            "struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };\n\
+             @vertex fn main(@location(0) p: vec2<f32>, @location(1) uv: vec2<f32>) -> VOut {\n\
+               return VOut(vec4<f32>(p, 0.0, 1.0), uv);\n}",
+            naga::ShaderStage::Vertex,
+        );
+        let fs = compile_wgsl(
+            "@group(0) @binding(0) var tex: texture_2d<f32>;\n\
+             @group(0) @binding(1) var samp: sampler;\n\
+             @fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {\n\
+               return textureSample(tex, samp, uv);\n}",
+            naga::ShaderStage::Fragment,
+        );
+        use infinigpu_abi::wire::vk_vformat as V;
+        let attrs = [
+            VertexAttr { location: 0, format: V::R32G32_SFLOAT, offset: 0 },
+            VertexAttr { location: 1, format: V::R32G32_SFLOAT, offset: 8 },
+        ];
+        let quad: [[f32; 4]; 4] = [
+            [-1.0, -1.0, 0.0, 0.0],
+            [1.0, -1.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [-1.0, 1.0, 0.0, 1.0],
+        ];
+        let verts: Vec<u8> = quad.iter().flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes())).collect();
+        let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+        let index_data: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let draws = [DrawCmd { count: 6, instance_count: 1, first: 0, vertex_offset: 0, viewport: [0.0; 4] }];
+        let (w, h) = (128u32, 128u32);
+        let bg = [0.0, 0.0, 0.0, 1.0];
+        // Render a textured, indexed-quad frame over `px` (all other geometry identical across calls).
+        // Renders inline so the transient `textures`/`draw` outlive the call and the returned `Frame`
+        // owns its pixels.
+        let render = |px: &[u8]| -> Frame {
+            let textures = [Texture {
+                width: 2,
+                height: 2,
+                rgba: px,
+                sampler: SamplerCfg { linear: false, repeat: false },
+            }];
+            let draw = ForwardedDraw {
+                vertex_spirv: &vs,
+                vertex_entry: c"main",
+                fragment_spirv: &fs,
+                fragment_entry: c"main",
+                vertex_count: 0,
+                topology: 0,
+                geometry: Some(Geometry {
+                    vertex_data: &verts,
+                    vertex_stride: 16,
+                    attrs: &attrs,
+                    index_data: &index_data,
+                    index_u32: false,
+                    draws: &draws,
+                    depth: None,
+                    push_constants: &[],
+                    textures: &textures,
+                    tex_binding: 0,
+                    uniform: None,
+                    storage: None,
+                    raster_flags: 0,
+                }),
+            };
+            gpu.render_forwarded(w, h, bg, &draw).expect("textured render")
+        };
+        let tex_px: [u8; 16] = [
+            255, 0, 0, 255, 0, 255, 0, 255, // red, green
+            0, 0, 255, 255, 255, 255, 255, 255, // blue, white
+        ];
+        let f1 = render(&tex_px);
+        let f2 = render(&tex_px);
+        assert_eq!(f1.rgba, f2.rgba, "a cache-hit frame must be byte-identical to the miss frame");
+        {
+            let t = gpu.tex_cache.lock().unwrap();
+            assert_eq!((t.hits, t.misses), (1, 1), "2nd identical texture render must HIT once");
+        }
+        {
+            let g = gpu.geom_cache.lock().unwrap();
+            assert_eq!((g.hits, g.misses), (1, 1), "2nd identical mesh render must HIT once");
+        }
+        // Different texel bytes ⇒ a texture MISS (the mesh is unchanged ⇒ still a HIT).
+        let other_px: [u8; 16] = [
+            0, 255, 0, 255, 255, 0, 0, 255, // green, red
+            255, 255, 255, 255, 0, 0, 255, 255, // white, blue
+        ];
+        let f3 = render(&other_px);
+        assert_ne!(f1.rgba, f3.rgba, "different texels must produce a different frame (key discriminates)");
+        {
+            let t = gpu.tex_cache.lock().unwrap();
+            assert_eq!((t.hits, t.misses), (1, 2), "a different texture must MISS");
+        }
+        {
+            let g = gpu.geom_cache.lock().unwrap();
+            assert_eq!((g.hits, g.misses), (2, 1), "the identical mesh must HIT again");
+        }
+        eprintln!("resource_cache_reuses_texture_and_mesh_identically: OK");
     }
 
     /// Phase-2c UBO: a `var<uniform>` block reaches the VERTEX stage — the shader offsets each vertex
