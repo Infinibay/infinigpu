@@ -403,3 +403,33 @@ infinigpu_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
       pu->image_extent = r->imageExtent;
    }
 }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
+                         const VkCopyBufferInfo2 *pInfo)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   struct infinigpu_buffer *src = infinigpu_buffer_from_handle(pInfo->srcBuffer);
+   struct infinigpu_buffer *dst = infinigpu_buffer_from_handle(pInfo->dstBuffer);
+
+   /* Buffer→buffer copy. Both operands are host-visible, host-coherent DRM dumb buffers
+    * (buffer->map is the persistent mapping recorded at BindBufferMemory2), so the copy is
+    * a plain CPU memcpy — no host GPU round-trip. It is done EAGERLY at record time rather
+    * than deferred: zink's staging pattern (map+write staging → CmdCopyBuffer2 → submit)
+    * has the source fully populated before the copy is recorded, and this driver's submit is
+    * synchronous, so eager and submit-time execution are equivalent for it. This was a hard
+    * NULL-dispatch crash before: zink hits it at zink_context_create() (a 4-byte init write
+    * routed through a staging buffer), and vk_common_CmdCopyBuffer delegates to this
+    * CmdCopyBuffer2 hook — an unimplemented slot is a call through NULL. Guard on both maps. */
+   if (!src || !dst || !src->map || !dst->map)
+      return;
+   for (uint32_t i = 0; i < pInfo->regionCount; i++) {
+      const VkBufferCopy2 *r = &pInfo->pRegions[i];
+      /* Skip an out-of-bounds region rather than corrupt host memory. */
+      if (r->srcOffset + r->size > src->total_size ||
+          r->dstOffset + r->size > dst->total_size)
+         continue;
+      memcpy((char *)dst->map + r->dstOffset,
+             (const char *)src->map + r->srcOffset, r->size);
+   }
+}
