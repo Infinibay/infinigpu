@@ -676,16 +676,18 @@ out:
 	return ret;
 }
 
-/* Register `fb`'s backing as a host blob (CREATE_BLOB + ATTACH_BACKING) once, caching addr->res_id
- * so a re-flip of the same FB skips it. The scanout bind (SET_SCANOUT_BLOB) is NOT done here — it is
- * per-flip in igpu_flush_resource, because the head must follow whichever buffer is being flipped,
- * not stick to the last one registered. Round-robin evicts (with DESTROY) when the cache is full.
- * Returns the res_id, or 0 on a full ring. Caller holds ring_lock. */
+/* Register `fb`'s backing as a host blob (CREATE_BLOB + ATTACH_BACKING + SET_SCANOUT_BLOB) once,
+ * caching addr->res_id so a re-flip of the same FB skips it. The initial scanout bind is done HERE
+ * (it must be — the per-flip rebind alone never establishes the FIRST binding, which black-screens
+ * the single-buffer case); igpu_flush_resource additionally re-binds per-flip so a compositor that
+ * cycles several buffers keeps the head on whichever one it flips. Round-robin evicts (with DESTROY)
+ * when the cache is full. Returns the res_id, or 0 on a full ring. Caller holds ring_lock. */
 static u32 igpu_resource_register(struct igpu_device *idev, dma_addr_t addr,
 				  u32 w, u32 h, u32 pitch)
 {
 	struct igpu_resource_create_blob cb;
 	struct { struct igpu_attach_backing h; struct igpu_mem_entry e; } __packed ab;
+	struct igpu_set_scanout_blob sb;
 	u64 size = (u64)pitch * h;
 	u32 res_id, i;
 
@@ -704,6 +706,16 @@ static u32 igpu_resource_register(struct igpu_device *idev, dma_addr_t addr,
 	ab.e.addr = addr; ab.e.length = size;
 	if (!igpu_ring2_push(idev, MSG_RESOURCE_ATTACH_BACKING, &ab, sizeof(ab)))
 		return 0;
+	/* Bind the freshly-created blob to scanout head 0 right here, the moment the host knows
+	 * the res exists (CREATE_BLOB + ATTACH_BACKING). This is the PROVEN-working initial bind
+	 * (removing it black-screened the single-buffer/greeter case — the per-flip rebind alone
+	 * did not establish the first binding). Track it in scanout_res_id so igpu_flush_resource's
+	 * per-flip rebind fires only when the compositor actually flips to a DIFFERENT buffer. */
+	sb.scanout_id = 0; sb.res_id = res_id; sb.width = w; sb.height = h;
+	sb.format = WIRE_FMT_XRGB8888; sb.stride = pitch;
+	if (!igpu_ring2_push(idev, MSG_SET_SCANOUT_BLOB, &sb, sizeof(sb)))
+		return 0;
+	idev->scanout_res_id = res_id;
 
 	i = idev->fbcache_next;
 	if (idev->fbcache[i].valid) {
