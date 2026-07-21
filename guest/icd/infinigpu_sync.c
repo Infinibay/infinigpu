@@ -278,6 +278,11 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
 
    /* Vertex buffer: whole vertices from the CmdBindVertexBuffers offset to the buffer end. */
    struct infinigpu_buffer *vb = cmd->vbuf;
+   IGPU_TRACE("cmdlist: stride=%u vbuf=%p map=%p total=%llu voff=%llu attrs=%u vs=%uB fs=%uB draws=%u",
+              p->vertex_stride, (void *)vb, vb ? vb->map : NULL,
+              vb ? (unsigned long long)vb->total_size : 0ull,
+              (unsigned long long)cmd->vbuf_offset, p->attr_count,
+              vs->spirv_size, fs->spirv_size, cmd->draw_count);
    if (!vb || !vb->map || cmd->vbuf_offset >= vb->total_size)
       return vk_errorf(dev, VK_ERROR_UNKNOWN, "cmdlist draw without a valid vertex buffer");
    const uint8_t *vdata = (const uint8_t *)vb->map + cmd->vbuf_offset;
@@ -516,9 +521,12 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       return vk_errorf(dev, VK_ERROR_UNKNOWN, "cmdlist payload did not fit");
    }
 
+   IGPU_TRACE("cmdlist: encoded payload=%zuB vlen=%u ilen=%u -> SUBMIT_FORWARDED gem=%u %ux%u",
+              n, vlen, ilen, img->mem->gem_handle, width, height);
    const int ret = infinigpu_submit_forwarded(drm_fd, img->mem->gem_handle,
                                                width, height, payload, (uint32_t)n);
    free(payload);
+   IGPU_TRACE("cmdlist: SUBMIT_FORWARDED ret=%d", ret);
    if (ret != 0)
       return vk_errorf(dev, VK_ERROR_DEVICE_LOST, "SUBMIT_FORWARDED failed (%d)", ret);
    return VK_SUCCESS;
@@ -550,6 +558,9 @@ infinigpu_replay_cmd_buffer(struct infinigpu_device *dev,
          else if (p->stages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
             fs = &p->stages[s];
       }
+      IGPU_TRACE("draw branch: vs=%p fs=%p stages=%u vertex_stride=%u vbuf=%p -> %s path",
+                 (void *)vs, (void *)fs, p->stage_count, p->vertex_stride, (void *)cmd->vbuf,
+                 (p->vertex_stride > 0 && cmd->vbuf) ? "cmdlist" : "bufferless");
       if (!vs || !fs)
          return vk_errorf(dev, VK_ERROR_UNKNOWN,
                           "forwarded draw needs a vertex + fragment stage");
