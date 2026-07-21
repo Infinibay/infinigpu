@@ -116,6 +116,12 @@ const struct vk_sync_type infinigpu_sync_type = {
    .size = sizeof(struct infinigpu_sync),
    .features = VK_SYNC_FEATURE_BINARY |
                VK_SYNC_FEATURE_GPU_WAIT |
+               /* GPU_MULTI_WAIT is required of the point type by vk_sync_timeline
+                * (vk_sync_timeline_type_validate) — the emulated timeline the ICD
+                * registers for OpenGL/Zink is built on this binary type. Honest here:
+                * queue submit honours all waits via vk_sync_wait_many (any count), and
+                * IMMEDIATE synchronous submit means they are already signalled. */
+               VK_SYNC_FEATURE_GPU_MULTI_WAIT |
                VK_SYNC_FEATURE_CPU_WAIT |
                VK_SYNC_FEATURE_CPU_RESET |
                VK_SYNC_FEATURE_CPU_SIGNAL |
