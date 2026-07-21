@@ -318,3 +318,43 @@ infinigpu_DestroyPipelineCache(VkDevice _device, VkPipelineCache _cache,
       return;
    vk_object_free(&dev->vk, pAllocator, cache);
 }
+
+/* zink serialises its pipeline cache (vkGetPipelineCacheData) right after building a graphics
+ * pipeline, to persist it to disk. We forward SPIR-V and keep no compiled pipeline blobs, so our
+ * cache carries no payload — return a minimal valid VkPipelineCacheHeaderVersionOne (32 B) and
+ * nothing else. A subsequent CreatePipelineCache ignores incoming data anyway, so the header IDs
+ * are cosmetic; fill them from our advertised vendor/device ID for conformance. Without this,
+ * zink's screen->vk.GetPipelineCacheData is a NULL dispatch slot and it SIGSEGVs on its async
+ * command-queue thread the moment it caches the pipeline it built for a real draw. */
+VKAPI_ATTR VkResult VKAPI_CALL
+infinigpu_GetPipelineCacheData(VkDevice _device, VkPipelineCache _cache,
+                               size_t *pDataSize, void *pData)
+{
+   /* VkPipelineCacheHeaderVersionOne = headerSize(4)+headerVersion(4)+vendorID(4)+deviceID(4)+UUID(16). */
+   const size_t header_size = 16 + VK_UUID_SIZE;
+   if (pData == NULL) {
+      *pDataSize = header_size;
+      return VK_SUCCESS;
+   }
+   if (*pDataSize < header_size) {
+      *pDataSize = 0;
+      return VK_INCOMPLETE;
+   }
+   const uint32_t hdr[4] = {
+      (uint32_t)header_size, VK_PIPELINE_CACHE_HEADER_VERSION_ONE,
+      0x0000F00Fu /* vendorID — matches infinigpu_get_properties */,
+      0x000A5000u /* deviceID — matches infinigpu_get_properties */,
+   };
+   memcpy(pData, hdr, sizeof(hdr));
+   memset((uint8_t *)pData + sizeof(hdr), 0, VK_UUID_SIZE);  /* pipelineCacheUUID: all-zero, as advertised */
+   *pDataSize = header_size;
+   return VK_SUCCESS;
+}
+
+/* No-op: our caches hold no compiled data, so there is nothing to merge. */
+VKAPI_ATTR VkResult VKAPI_CALL
+infinigpu_MergePipelineCaches(VkDevice _device, VkPipelineCache dstCache,
+                              uint32_t srcCacheCount, const VkPipelineCache *pSrcCaches)
+{
+   return VK_SUCCESS;
+}
