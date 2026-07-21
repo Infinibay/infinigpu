@@ -237,6 +237,12 @@ struct igpu_device {
 	void *ring2;                           /* [descriptors][payloads] (CMD_RING_BASE) */
 	dma_addr_t ring2_dma;
 	u32 next_res_id;
+	/* res_id currently bound to scanout head 0. The compositor triple-buffers (a distinct
+	 * blob res per FB), so the head must follow the flipped buffer: SET_SCANOUT_BLOB is
+	 * re-issued whenever the flushed res differs from this, else the host head keeps pointing
+	 * at the last-registered buffer and every OTHER buffer's RESOURCE_FLUSH is dropped
+	 * ("res N not bound to a scanout") — ~2/3 of frames lost => stale/torn glitches. */
+	u32 scanout_res_id;
 	/* Framebuffer -> res_id registrations, so a re-flip of the same FB skips re-registration. */
 	struct {
 		dma_addr_t addr;
@@ -670,15 +676,16 @@ out:
 	return ret;
 }
 
-/* Register `fb`'s backing as a host blob (CREATE_BLOB + ATTACH_BACKING + SET_SCANOUT_BLOB) once,
- * caching addr->res_id so a re-flip of the same FB skips it. Round-robin evicts (with DESTROY) when
- * the cache is full. Returns the res_id, or 0 on a full ring. Caller holds ring_lock. */
+/* Register `fb`'s backing as a host blob (CREATE_BLOB + ATTACH_BACKING) once, caching addr->res_id
+ * so a re-flip of the same FB skips it. The scanout bind (SET_SCANOUT_BLOB) is NOT done here — it is
+ * per-flip in igpu_flush_resource, because the head must follow whichever buffer is being flipped,
+ * not stick to the last one registered. Round-robin evicts (with DESTROY) when the cache is full.
+ * Returns the res_id, or 0 on a full ring. Caller holds ring_lock. */
 static u32 igpu_resource_register(struct igpu_device *idev, dma_addr_t addr,
 				  u32 w, u32 h, u32 pitch)
 {
 	struct igpu_resource_create_blob cb;
 	struct { struct igpu_attach_backing h; struct igpu_mem_entry e; } __packed ab;
-	struct igpu_set_scanout_blob sb;
 	u64 size = (u64)pitch * h;
 	u32 res_id, i;
 
@@ -697,15 +704,16 @@ static u32 igpu_resource_register(struct igpu_device *idev, dma_addr_t addr,
 	ab.e.addr = addr; ab.e.length = size;
 	if (!igpu_ring2_push(idev, MSG_RESOURCE_ATTACH_BACKING, &ab, sizeof(ab)))
 		return 0;
-	sb.scanout_id = 0; sb.res_id = res_id; sb.width = w; sb.height = h;
-	sb.format = WIRE_FMT_XRGB8888; sb.stride = pitch;
-	if (!igpu_ring2_push(idev, MSG_SET_SCANOUT_BLOB, &sb, sizeof(sb)))
-		return 0;
 
 	i = idev->fbcache_next;
 	if (idev->fbcache[i].valid) {
 		u32 old = idev->fbcache[i].res_id;
 
+		/* If the buffer we're evicting is the one currently bound to the head, forget the
+		 * binding so the next flip re-issues SET_SCANOUT_BLOB (the res is about to be
+		 * DESTROYed host-side). */
+		if (old == idev->scanout_res_id)
+			idev->scanout_res_id = 0;
 		igpu_ring2_push(idev, MSG_RESOURCE_DESTROY, &old, sizeof(old));
 	}
 	idev->fbcache[i].addr = addr;
@@ -724,12 +732,23 @@ static bool igpu_flush_resource(struct igpu_device *idev, dma_addr_t addr,
 				struct drm_framebuffer *fb, u32 dx, u32 dy, u32 dw, u32 dh)
 {
 	struct igpu_resource_flush rf;
+	struct igpu_set_scanout_blob sb;
 	u32 res_id;
 	bool ok = false;
 
 	mutex_lock(&idev->ring_lock);
 	res_id = igpu_resource_register(idev, addr, fb->width, fb->height, fb->pitches[0]);
 	if (res_id) {
+		/* Point scanout head 0 at the buffer actually being flipped, so its RESOURCE_FLUSH
+		 * resolves to a bound scanout host-side. Only when it changed (the compositor cycles
+		 * a few buffers), so a static screen re-flushing one buffer costs no extra descriptor. */
+		if (res_id != idev->scanout_res_id) {
+			sb.scanout_id = 0; sb.res_id = res_id;
+			sb.width = fb->width; sb.height = fb->height;
+			sb.format = WIRE_FMT_XRGB8888; sb.stride = fb->pitches[0];
+			igpu_ring2_push(idev, MSG_SET_SCANOUT_BLOB, &sb, sizeof(sb));
+			idev->scanout_res_id = res_id;
+		}
 		rf.res_id = res_id; rf.x = dx; rf.y = dy; rf.w = dw; rf.h = dh; rf.reserved = 0;
 		igpu_ring2_push(idev, MSG_RESOURCE_FLUSH, &rf, sizeof(rf));
 		ok = true;
@@ -1231,6 +1250,7 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			return -ENOMEM;
 		memset(idev->ring2_idx, 0, sizeof(*idev->ring2_idx));
 		idev->next_res_id = 0;
+		idev->scanout_res_id = 0;
 		idev->fbcache_next = 0;
 
 		iowrite32(lower_32_bits(idev->ring2_dma), bar0 + REG_CMD_RING_BASE_LO);
