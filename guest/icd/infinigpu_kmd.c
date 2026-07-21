@@ -9,6 +9,7 @@
 #include "infinigpu_kmd.h"
 
 #include <errno.h>
+#include <fcntl.h>   /* O_CLOEXEC/O_RDWR behind DRM_CLOEXEC/DRM_RDWR */
 #include <string.h>
 #include <sys/mman.h>
 
@@ -68,6 +69,21 @@ infinigpu_gem_close(int fd, uint32_t handle)
 {
    struct drm_gem_close close = { .handle = handle };
    drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &close);
+}
+
+int
+infinigpu_prime_handle_to_fd(int fd, uint32_t handle, int *out_fd)
+{
+   /* PRIME-export a GEM handle to a dma-buf fd. The infinigpu KMD is drm_gem_dma
+    * (CMA), so DRM_CAP_PRIME advertises EXPORT and drmPrimeHandleToFD works out of
+    * the box — this is what WSI's DRM/display present path re-imports (drmModeAddFB2)
+    * onto the infinigpu scanout. DRM_RDWR so the host can also map it read-write. */
+   int dfd = -1;
+   int ret = drmPrimeHandleToFD(fd, handle, DRM_CLOEXEC | DRM_RDWR, &dfd);
+   if (ret != 0)
+      return ret < 0 ? ret : -errno;
+   *out_fd = dfd;
+   return 0;
 }
 
 int

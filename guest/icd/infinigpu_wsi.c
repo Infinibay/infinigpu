@@ -44,18 +44,31 @@ infinigpu_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
 VkResult
 infinigpu_init_wsi(struct infinigpu_physical_device *pdev)
 {
+   /* NOT sw_device: VK_KHR_display's swapchain HARD-CODES WSI_IMAGE_TYPE_DRM
+    * (wsi_common_display.c: wsi_display_surface_create_swapchain), so its images
+    * MUST be dma-buf-exported (drmPrimeFDToHandle + drmModeAddFB2 onto the infinigpu
+    * scanout). Under .sw_device=true, wsi_common never even fetches GetMemoryFdKHR
+    * (`if (!wsi->sw)` in wsi_common.c) → the DRM image path derefs a NULL callback →
+    * vkCreateSwapchainKHR SIGSEGVs (this was THE blocker for a real fullscreen app
+    * presenting on the GPU). As a real (non-sw) device wsi_common fetches our
+    * GetMemoryFdKHR (PRIME-export of the drm_gem_dma BO) and takes the legacy
+    * no-modifier "scanout" path (num_modifier_lists==0 → no VK_EXT_image_drm_format_
+    * modifier needed). The proven zink RENDER path is offscreen (FBO, no swapchain),
+    * so it is unaffected by this WSI-present change. */
    VkResult result =
       wsi_device_init(&pdev->wsi_device,
                       infinigpu_physical_device_to_handle(pdev),
                       infinigpu_wsi_proc_addr,
                       &pdev->vk.instance->alloc,
-                      pdev->drm_fd, /* display_fd: KMS present in-guest, empty on host */
+                      pdev->drm_fd, /* display_fd: card* PRIMARY node (KMS) in-guest */
                       NULL,
-                      &(struct wsi_device_options){ .sw_device = true });
+                      &(struct wsi_device_options){ .sw_device = false });
    if (result != VK_SUCCESS)
       return result;
 
-   /* Force the linear no-blit CPU image path (no dma-buf, no GetMemoryFdKHR). */
+   /* Our images are always LINEAR packed-pitch dumb buffers (drm_gem_dma); the WSI
+    * "scanout" no-blit path scans them out directly (GetImageSubresourceLayout
+    * reports the linear pitch drmModeAddFB2 uses). */
    pdev->wsi_device.wants_linear = true;
    pdev->vk.wsi_device = &pdev->wsi_device;
 

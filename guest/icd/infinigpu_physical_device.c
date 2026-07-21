@@ -96,6 +96,16 @@ const struct vk_device_extension_table infinigpu_device_extensions = {
    .KHR_external_memory           = true,
    .KHR_external_memory_fd        = true,
 
+   /* M3 present path: the WSI DRM/display swapchain creates its images with the
+    * dma-buf external handle type (wsi_configure_native_image passes
+    * VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT), then exports each via
+    * vkGetMemoryFdKHR and re-imports it (drmModeAddFB2) onto the infinigpu scanout.
+    * The KMD is drm_gem_dma (DRM_CAP_PRIME EXPORT), so the export is a plain
+    * drmPrimeHandleToFD (infinigpu_GetMemoryFdKHR). Advertising this makes the
+    * DMA_BUF handle type valid; no modifier support is needed because the display
+    * swapchain uses the legacy no-modifier "scanout" path (num_modifier_lists==0). */
+   .EXT_external_memory_dma_buf   = true,
+
    /* Mesa 26.0.3 zink adds a SECOND hard gate right after feature detection
     * (zink_screen.c:3459): `if (!screen->info.rb2_feats.nullDescriptor) { mesa_loge("Zink
     * requires the nullDescriptor feature of KHR/EXT robustness2."); goto fail; }`. So the

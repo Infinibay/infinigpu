@@ -38,6 +38,12 @@ void infinigpu_dumb_unmap(void *ptr, uint64_t size);
 /* Close a GEM handle (frees the dumb buffer). */
 void infinigpu_gem_close(int fd, uint32_t handle);
 
+/* PRIME-export a GEM handle to a dma-buf fd (DRM_CLOEXEC|DRM_RDWR). The KMD is
+ * drm_gem_dma, so PRIME export is supported. Returns 0 and fills *out_fd (caller
+ * owns it — close()) or a negative errno. Backs vkGetMemoryFdKHR, which WSI's
+ * DRM/display present path uses to page-flip a swapchain image onto the scanout. */
+int infinigpu_prime_handle_to_fd(int fd, uint32_t handle, int *out_fd);
+
 /* Issue DRM_IOCTL_INFINIGPU_SUBMIT_FORWARDED: replay `payload` (a forwarded-draw
  * body from infinigpu_encode_forwarded — VulkanWorkload + ForwardedDrawTail +
  * SPIR-V) on the host GPU, DMA-writing the width*height R8G8B8A8 result into

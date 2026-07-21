@@ -144,3 +144,47 @@ infinigpu_GetDeviceMemoryCommitment(VkDevice _device, VkDeviceMemory _mem,
    /* No lazily-allocated memory. */
    *pCommittedMemoryInBytes = 0;
 }
+
+VKAPI_ATTR VkResult VKAPI_CALL
+infinigpu_GetMemoryFdKHR(VkDevice _device,
+                         const VkMemoryGetFdInfoKHR *pGetFdInfo,
+                         int *pFd)
+{
+   VK_FROM_HANDLE(infinigpu_device, dev, _device);
+   VK_FROM_HANDLE(infinigpu_device_memory, mem, pGetFdInfo->memory);
+
+   /* We only export dma-buf (the WSI DRM/display present path asks for exactly this
+    * to page-flip a swapchain image onto the infinigpu scanout). The backing is a
+    * drm_gem_dma dumb buffer; PRIME-export its GEM handle. */
+   if (pGetFdInfo->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT &&
+       pGetFdInfo->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
+      return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
+
+   if (mem == NULL || mem->gem_handle == 0 || dev->physical_device->drm_fd < 0)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   int fd = -1;
+   int ret = infinigpu_prime_handle_to_fd(dev->physical_device->drm_fd,
+                                          mem->gem_handle, &fd);
+   if (ret != 0)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   *pFd = fd;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+infinigpu_GetMemoryFdPropertiesKHR(VkDevice _device,
+                                   VkExternalMemoryHandleTypeFlagBits handleType,
+                                   int fd,
+                                   VkMemoryFdPropertiesKHR *pMemoryFdProperties)
+{
+   VK_FROM_HANDLE(infinigpu_device, dev, _device);
+
+   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   /* Single memory type (index 0) backs every allocation on this driver. */
+   pMemoryFdProperties->memoryTypeBits = 1u;
+   return VK_SUCCESS;
+}
