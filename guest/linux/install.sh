@@ -112,6 +112,20 @@ WantedBy=multi-user.target
 UNIT
   systemctl enable infinigpu-load.service 2>/dev/null || true
   log "[OK] infinigpu-load.service enabled (modprobe After=dkms.service — first-boot race fix)"
+
+  # Order the display manager AFTER the module is loaded, else gdm/Wayland comes up
+  # before /dev/dri/card0 exists and the whole GPU console is BLACK until a manual
+  # modprobe + DM restart (there is no `dkms.service` on Ubuntu — DKMS builds via kernel
+  # hooks — so infinigpu-load's `After=dkms.service` is a dangling no-op and the module
+  # can otherwise land after gdm has already picked its renderer). A *weak* Wants means a
+  # non-GPU boot where the module can't bind never blocks the display manager.
+  mkdir -p /etc/systemd/system/display-manager.service.d
+  cat > /etc/systemd/system/display-manager.service.d/10-infinigpu.conf <<'DROPIN'
+[Unit]
+After=infinigpu-load.service
+Wants=infinigpu-load.service
+DROPIN
+  log "[OK] display-manager ordered after infinigpu-load (no black GPU console on boot)"
 fi
 
 # 5. Vulkan ICD (userspace driver): unlike the DKMS kernel module, the ICD is a
