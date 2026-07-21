@@ -1069,9 +1069,16 @@ static int igpu_init_cursor_pipeline(struct igpu_device *idev)
 
 static int igpu_conn_get_modes(struct drm_connector *connector)
 {
-	int count = drm_add_modes_noedid(connector, 2048, 2048);
+	/* Advertise the full standard (VESA-DMT/CVT) mode list up to 4K so the desktop's
+	 * display settings expose a real resolution picker, and prefer 1920x1080 as a usable
+	 * default instead of 1024x768. The whole datapath downstream (host present, encoder
+	 * respawn, viewer) already re-adapts to any runtime resolution, so switching just
+	 * works once the modes are offered. NOTE: a compositor that still pins to the preferred
+	 * mode needs a synthesized EDID (physical size/DPI) here — do the 5-min in-guest
+	 * `modetest -c` / GNOME-Displays diagnostic first to confirm before adding one. */
+	int count = drm_add_modes_noedid(connector, 3840, 2160);
 
-	drm_set_preferred_mode(connector, 1024, 768);
+	drm_set_preferred_mode(connector, 1920, 1080);
 	return count;
 }
 
@@ -1270,8 +1277,10 @@ static int igpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	drm->mode_config.funcs = &igpu_mode_config_funcs;
 	drm->mode_config.min_width = 0;
 	drm->mode_config.min_height = 0;
-	drm->mode_config.max_width = 2048;
-	drm->mode_config.max_height = 2048;
+	/* 4K ceiling. Bounded by the host's 64 MiB per-present cap (3840x2160x4 = 33 MiB,
+	 * well under); raise both together if going beyond ~4K. */
+	drm->mode_config.max_width = 3840;
+	drm->mode_config.max_height = 2160;
 	drm->mode_config.preferred_depth = 24;
 
 	ret = drm_connector_init(drm, &idev->connector, &igpu_connector_funcs,
