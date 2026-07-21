@@ -605,6 +605,27 @@ infinigpu_GetPhysicalDeviceFormatProperties2(
    }
    if (infinigpu_vertex_format_supported(format))
       p->bufferFeatures |= VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+
+   /* VkFormatProperties3 (core 1.3 / VK_KHR_format_feature_flags2) carries the SAME
+    * features as the 64-bit VkFormatFeatureFlags2. This is NOT optional metadata for us:
+    * a consumer that sees apiVersion >= 1.3 reads its format features from THIS struct,
+    * not the legacy 32-bit VkFormatProperties above. zink is exactly such a consumer —
+    * zink_init_format_props() takes the `have_vulkan13` branch and caches
+    * props3.optimalTilingFeatures. If we leave props3 zero, zink believes NO color format
+    * can be a RENDER_TARGET, so dri_fill_in_modes builds ZERO GLX/EGL configs,
+    * driCreateConfigs fails, the DRI screen is NULL, and GL silently falls back to
+    * llvmpipe (the exact failure this fixes — found via a debug Mesa 26.0.3 build in the
+    * guest). Because we override GetPhysicalDeviceFormatProperties2 (rather than deferring
+    * to vk_common) WE own the pNext walk. The FeatureFlags2 bit values equal the legacy
+    * FeatureFlags for every bit we set, so mirror the 32-bit masks widened to 64-bit. */
+   vk_foreach_struct(ext, pFormatProperties->pNext) {
+      if (ext->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) {
+         VkFormatProperties3 *p3 = (VkFormatProperties3 *)ext;
+         p3->linearTilingFeatures  = p->linearTilingFeatures;
+         p3->optimalTilingFeatures = p->optimalTilingFeatures;
+         p3->bufferFeatures        = p->bufferFeatures;
+      }
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
