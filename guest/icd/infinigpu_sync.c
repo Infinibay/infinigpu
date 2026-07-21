@@ -20,6 +20,7 @@
 
 #include "util/os_time.h"
 #include "util/timespec.h"
+#include "util/format_srgb.h"
 #include "vk_format.h"
 #include "vk_log.h"
 
@@ -185,6 +186,70 @@ infinigpu_run_upload(const struct infinigpu_pending_upload *pu)
    for (uint32_t y = 0; y < rows; y++)
       memcpy(dst + (uint64_t)y * img->row_pitch,
              src + (uint64_t)y * src_row_texels * bpp, (size_t)w * bpp);
+}
+
+/* Pack a float clear colour to a 4-byte RGBA/BGRA UNORM/SRGB texel (the formats zink uses for FBO
+ * and swapchain colour). Vulkan specifies a clear value in linear space, so apply the sRGB transfer
+ * for _SRGB formats (alpha stays linear). Returns false for any format we don't pack. */
+static bool
+infinigpu_pack_clear_rgba8(VkFormat fmt, const float f[4], uint8_t out[4])
+{
+   bool bgra, srgb;
+   switch (fmt) {
+   case VK_FORMAT_R8G8B8A8_UNORM: bgra = false; srgb = false; break;
+   case VK_FORMAT_R8G8B8A8_SRGB:  bgra = false; srgb = true;  break;
+   case VK_FORMAT_B8G8R8A8_UNORM: bgra = true;  srgb = false; break;
+   case VK_FORMAT_B8G8R8A8_SRGB:  bgra = true;  srgb = true;  break;
+   default: return false;
+   }
+   uint8_t c[4];
+   for (int i = 0; i < 4; i++) {
+      float v = f[i] < 0.0f ? 0.0f : (f[i] > 1.0f ? 1.0f : f[i]);
+      if (srgb && i < 3)
+         c[i] = util_format_linear_float_to_srgb_8unorm(v);
+      else
+         c[i] = (uint8_t)(v * 255.0f + 0.5f);
+   }
+   if (bgra) { out[0] = c[2]; out[1] = c[1]; out[2] = c[0]; out[3] = c[3]; }
+   else      { out[0] = c[0]; out[1] = c[1]; out[2] = c[2]; out[3] = c[3]; }
+   return true;
+}
+
+/* Apply a render-pass LOAD_OP_CLEAR to the colour attachment when a command buffer clears but records
+ * NO draw (e.g. glClear followed by glReadPixels). The forwarded-draw path folds the clear into the
+ * host render (bg[]), but a draw-less command buffer skips the ioctl entirely (see the comment in
+ * infinigpu_replay_cmd_buffer) — so without this the image keeps its stale/zero contents and the
+ * deferred image->buffer readback returns zeros. The attachment is a host-mapped, host-coherent dumb
+ * buffer, so realise the clear as a CPU fill of the packed clear colour over the render area — no GPU
+ * round-trip, and equivalent to a hardware clear for a synchronous single-submit driver. */
+static void
+infinigpu_run_clear(struct infinigpu_image *img, const VkClearColorValue *col,
+                    const VkRect2D *area)
+{
+   if (!img || !img->mem || !img->mem->map)
+      return;
+   if (vk_format_get_blocksize(img->vk.format) != 4)
+      return;   /* colour clear only — depth/stencil + non-32bpp are out of the readback path's scope */
+   uint8_t px[4];
+   if (!infinigpu_pack_clear_rgba8(img->vk.format, col->float32, px))
+      return;
+
+   /* Clamp the render area to the image. A zero-sized area (never set) means the whole image. */
+   uint32_t x0 = area ? (uint32_t)area->offset.x : 0;
+   uint32_t y0 = area ? (uint32_t)area->offset.y : 0;
+   uint32_t w = (area && area->extent.width)  ? area->extent.width  : img->vk.extent.width;
+   uint32_t h = (area && area->extent.height) ? area->extent.height : img->vk.extent.height;
+   if (x0 >= img->vk.extent.width || y0 >= img->vk.extent.height)
+      return;
+   if (x0 + w > img->vk.extent.width)  w = img->vk.extent.width - x0;
+   if (y0 + h > img->vk.extent.height) h = img->vk.extent.height - y0;
+
+   char *base = (char *)img->mem->map + img->mem_offset;
+   for (uint32_t y = 0; y < h; y++) {
+      char *row = base + (uint64_t)(y0 + y) * img->row_pitch + (uint64_t)x0 * 4;
+      for (uint32_t x = 0; x < w; x++)
+         memcpy(row + (uint64_t)x * 4, px, 4);
+   }
 }
 
 /* Phase-2b/2c: forward a real mesh (bound vertex/index buffers + multi-draw) via the command-list
@@ -467,6 +532,10 @@ infinigpu_replay_cmd_buffer(struct infinigpu_device *dev,
 {
    int drm_fd = dev->physical_device->drm_fd;
 
+   IGPU_TRACE("submit cmdbuf: draws=%u clear=%d color_att=%p pipeline=%p uploads=%u copies=%u",
+              cmd->draw_count, cmd->has_clear, (void *)cmd->color_att,
+              (void *)cmd->bound_pipeline, cmd->upload_count, cmd->copy_count);
+
    /* Texture uploads first, so a staged sampled texture is in the image's memory before any draw
     * (in this or a later command buffer) reads it. */
    for (uint32_t u = 0; u < cmd->upload_count; u++)
@@ -532,6 +601,11 @@ infinigpu_replay_cmd_buffer(struct infinigpu_device *dev,
             return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
                              "SUBMIT_FORWARDED failed (%d)", ret);
       }
+   } else if (cmd->has_clear && cmd->color_att && cmd->color_att->image) {
+      /* Draw-less clear (glClear + readback): no forwarded submit runs, so realise the
+       * LOAD_OP_CLEAR on the CPU into the host-mapped attachment before the readback copy. */
+      IGPU_TRACE("submit cmdbuf: draw-less clear -> CPU fill of color attachment");
+      infinigpu_run_clear(cmd->color_att->image, &cmd->clear_value, &cmd->render_area);
    }
 
    for (uint32_t c = 0; c < cmd->copy_count; c++)
