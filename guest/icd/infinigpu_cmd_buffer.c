@@ -305,6 +305,71 @@ infinigpu_CmdSetPrimitiveTopology(VkCommandBuffer commandBuffer, VkPrimitiveTopo
    cmd->dyn_set_mask |= INFINIGPU_DYN_TOPOLOGY;
 }
 
+/* Remaining core-1.3 dynamic-state setters (EDS1/EDS2 + base). A general GL/zink pipeline reports the
+ * device as 1.3 and drives these dynamically, so an unimplemented slot is a call through a NULL
+ * dispatch pointer (SIGSEGV) the moment zink records a draw. We already CAPTURE the states our
+ * forwarded-draw path remotes (cull/front-face/depth test·write·compare/topology/viewport). The rest
+ * are states this driver does not yet remote — scissor, stencil, depth-bias, depth-bounds, blend
+ * constants, line width, rasterizer-discard/primitive-restart enables. Accept them as no-ops: the
+ * host renders opaque geometry to the full target, so for content that doesn't depend on these they
+ * are benign, and they keep zink's dynamic-state stream from hitting a NULL entrypoint. Forwarding
+ * any of them faithfully (e.g. scissor clipping, stencil) is follow-up work in the wire + replay. */
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetScissor(VkCommandBuffer commandBuffer, uint32_t firstScissor,
+                        uint32_t scissorCount, const VkRect2D *pScissors) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetScissorWithCount(VkCommandBuffer commandBuffer, uint32_t scissorCount,
+                                 const VkRect2D *pScissors) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetDepthBoundsTestEnable(VkCommandBuffer commandBuffer, VkBool32 depthBoundsTestEnable) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetStencilTestEnable(VkCommandBuffer commandBuffer, VkBool32 stencilTestEnable) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetStencilOp(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask,
+                          VkStencilOp failOp, VkStencilOp passOp, VkStencilOp depthFailOp,
+                          VkCompareOp compareOp) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetStencilCompareMask(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask,
+                                   uint32_t compareMask) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetStencilWriteMask(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask,
+                                 uint32_t writeMask) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetStencilReference(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask,
+                                 uint32_t reference) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetDepthBias(VkCommandBuffer commandBuffer, float depthBiasConstantFactor,
+                          float depthBiasClamp, float depthBiasSlopeFactor) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetDepthBounds(VkCommandBuffer commandBuffer, float minDepthBounds,
+                            float maxDepthBounds) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetBlendConstants(VkCommandBuffer commandBuffer, const float blendConstants[4]) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetLineWidth(VkCommandBuffer commandBuffer, float lineWidth) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetRasterizerDiscardEnable(VkCommandBuffer commandBuffer,
+                                        VkBool32 rasterizerDiscardEnable) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetDepthBiasEnable(VkCommandBuffer commandBuffer, VkBool32 depthBiasEnable) { }
+
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdSetPrimitiveRestartEnable(VkCommandBuffer commandBuffer,
+                                       VkBool32 primitiveRestartEnable) { }
+
 VKAPI_ATTR void VKAPI_CALL
 infinigpu_CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
                                VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout,
