@@ -1025,7 +1025,7 @@ struct ResidentGeometry {
 
 /// Fix F: a sampled texture uploaded ONCE and reused across frames, keyed by [`tex_key`]. Holds no
 /// staging buffer — the staging→image copy runs on a dedicated one-off submit at upload time
-/// ([`HostGpu::upload_resident_texture`]), leaving the image `SHADER_READ_ONLY_OPTIMAL` before any
+/// ([`HostGpu::record_and_submit_uploads`]), leaving the image `SHADER_READ_ONLY_OPTIMAL` before any
 /// frame samples it. Cache-owned; never destroyed per frame.
 struct ResidentTexture {
     image: vk::Image,
@@ -1036,6 +1036,9 @@ struct ResidentTexture {
     width: u32,
     #[allow(dead_code)]
     height: u32,
+    /// Uploaded size; the running cache total is what bounds VRAM (this per-entry copy documents
+    /// intent / a future per-entry LRU).
+    #[allow(dead_code)]
     bytes: usize,
 }
 
@@ -1048,6 +1051,61 @@ impl ResidentTexture {
         dev.destroy_image_view(self.view, None);
         dev.destroy_image(self.image, None);
         dev.free_memory(self.image_mem, None);
+    }
+}
+
+/// Fix F: a cache-miss texture that has been allocated + staged but whose staging→image copy has not
+/// yet been submitted. A frame's misses are collected as `PendingTexUpload`s and their copies recorded
+/// into ONE shared upload command buffer with a single submit (so K new textures cost one GPU
+/// round-trip, not K) — the burst-miss latency the per-texture blocking upload would otherwise spike.
+struct PendingTexUpload {
+    binding: u32,
+    key: u64,
+    image: vk::Image,
+    image_mem: vk::DeviceMemory,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+    staging: vk::Buffer,
+    staging_mem: vk::DeviceMemory,
+    width: u32,
+    height: u32,
+    bytes: usize,
+}
+
+impl PendingTexUpload {
+    /// Free everything (image + view + sampler + staging) — used when a frame's texture resolution
+    /// fails before the resident texture is committed to the cache, so nothing leaks and no
+    /// half-populated image enters the cache.
+    ///
+    /// # Safety
+    /// `dev` must be the owning device and no submit referencing these objects may still be in flight.
+    unsafe fn destroy(&self, dev: &ash::Device) {
+        dev.destroy_sampler(self.sampler, None);
+        dev.destroy_image_view(self.view, None);
+        dev.destroy_image(self.image, None);
+        dev.free_memory(self.image_mem, None);
+        dev.destroy_buffer(self.staging, None);
+        dev.free_memory(self.staging_mem, None);
+    }
+
+    /// After the shared upload submit completes: free the now-consumed staging buffer and return the
+    /// resident texture (image + view + sampler) the cache will own.
+    ///
+    /// # Safety
+    /// `dev` must be the owning device and the upload submit that copied into `image` must have
+    /// completed (the caller waits the shared upload fence first).
+    unsafe fn into_resident(self, dev: &ash::Device) -> ResidentTexture {
+        dev.destroy_buffer(self.staging, None);
+        dev.free_memory(self.staging_mem, None);
+        ResidentTexture {
+            image: self.image,
+            image_mem: self.image_mem,
+            view: self.view,
+            sampler: self.sampler,
+            width: self.width,
+            height: self.height,
+            bytes: self.bytes,
+        }
     }
 }
 
@@ -2831,33 +2889,73 @@ impl HostGpu {
         }
     }
 
-    /// Fix F: return `(view, sampler)` for a resident texture matching `tex`, uploading it once on a
-    /// miss. Never evicts (that happens only in [`Self::trim_tex_cache`] at frame start) so a
-    /// mid-frame miss can't destroy a sibling texture already bound into this frame's descriptor set.
-    /// The returned handles are cache-owned and outlive the frame; the caller only writes them into
-    /// the descriptor set.
-    fn get_or_upload_texture(&self, tex: &Texture) -> R<(vk::ImageView, vk::Sampler)> {
-        let (w, h) = (tex.width, tex.height);
-        let expected = (w as usize).checked_mul(h as usize).and_then(|p| p.checked_mul(4));
-        if w == 0 || h == 0 || w > 16384 || h > 16384 || expected != Some(tex.rgba.len()) {
-            return Err(format!("bad texture {w}x{h} ({} bytes)", tex.rgba.len()).into());
-        }
-        let key = tex_key(tex);
+    /// Fix F: resolve every texture a frame's descriptor set needs and write each `(view, sampler)`
+    /// into `set` at its binding. Hits come straight from the resident cache; ALL misses are allocated
+    /// + staged and then uploaded on ONE shared submit (not one blocking round-trip per texture), so a
+    /// scene load that introduces K new textures costs a single GPU round-trip instead of K. Never
+    /// evicts mid-frame (that happens only in [`Self::trim_tex_cache`] at frame start) so a miss can't
+    /// destroy a sibling texture already bound into this frame's set. On any error every partially
+    /// built miss is freed and no half-populated texture enters the cache.
+    fn resolve_frame_textures(
+        &self,
+        textures: &[Texture],
+        set: vk::DescriptorSet,
+        tex_base: u32,
+    ) -> R<()> {
+        let dev = &self.device;
         let mut c = self.tex_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(r) = c.map.get(&key) {
-            let vs = (r.view, r.sampler);
-            c.hits += 1;
-            return Ok(vs);
+        let mut pending: Vec<PendingTexUpload> = Vec::new();
+        let free_pending = |p: &[PendingTexUpload]| unsafe {
+            for x in p {
+                x.destroy(dev);
+            }
+        };
+        for (i, tex) in textures.iter().enumerate() {
+            let (w, h) = (tex.width, tex.height);
+            let expected = (w as usize).checked_mul(h as usize).and_then(|p| p.checked_mul(4));
+            if w == 0 || h == 0 || w > 16384 || h > 16384 || expected != Some(tex.rgba.len()) {
+                free_pending(&pending);
+                return Err(format!("bad texture {w}x{h} ({} bytes)", tex.rgba.len()).into());
+            }
+            let binding = tex_base + 2 * i as u32;
+            let key = tex_key(tex);
+            if let Some(r) = c.map.get(&key) {
+                let (view, sampler) = (r.view, r.sampler);
+                c.hits += 1;
+                self.write_texture_descriptor(set, binding, view, sampler);
+                continue;
+            }
+            // Miss — allocate + stage now, defer the copy to the single shared submit below. Inserts
+            // past the soft cap (bounded to +MAX_TEXTURES until the next frame-start trim).
+            match self.alloc_resident_texture(tex, binding, key) {
+                Ok(p) => pending.push(p),
+                Err(e) => {
+                    free_pending(&pending);
+                    return Err(e);
+                }
+            }
         }
-        // Miss — upload on a dedicated one-off submit so the image is SHADER_READ_ONLY_OPTIMAL before
-        // this frame's render samples it. Insert past the soft cap (bounded to +MAX_TEXTURES until the
-        // next frame-start trim); we deliberately do NOT evict here (see the doc comment).
-        let r = self.upload_resident_texture(tex)?;
-        let ret = (r.view, r.sampler);
-        c.misses += 1;
-        c.bytes += r.bytes;
-        c.map.insert(key, r);
-        Ok(ret)
+        if pending.is_empty() {
+            return Ok(());
+        }
+        // One GPU round-trip for EVERY miss this frame (not one per texture).
+        if let Err(e) = self.record_and_submit_uploads(&pending) {
+            free_pending(&pending);
+            return Err(e);
+        }
+        // Commit: free each staging buffer, insert the resident texture, write its descriptor. The
+        // upload submit has completed, so every image is SHADER_READ_ONLY_OPTIMAL and sampleable by
+        // the frame submit the caller issues next.
+        for p in pending {
+            let (binding, key, bytes) = (p.binding, p.key, p.bytes);
+            let (view, sampler) = (p.view, p.sampler);
+            let r = unsafe { p.into_resident(dev) };
+            c.bytes += bytes;
+            c.misses += 1;
+            c.map.insert(key, r);
+            self.write_texture_descriptor(set, binding, view, sampler);
+        }
+        Ok(())
     }
 
     /// Fix F: build the reusable upload command buffer + fence on first use.
@@ -2895,22 +2993,22 @@ impl HostGpu {
         Ok(())
     }
 
-    /// Fix F: upload one texture's pixels into a fresh device-local sampled image on a dedicated
-    /// one-off submit (staging→image copy + layout transitions on [`Self::upload_ctx`]), leaving it
-    /// `SHADER_READ_ONLY_OPTIMAL`. The transient staging buffer is freed here; only the image + view +
-    /// sampler survive in the returned [`ResidentTexture`] (which the cache owns). Frees all partials
-    /// on any error (no leak on the long-lived shared device).
-    fn upload_resident_texture(&self, tex: &Texture) -> R<ResidentTexture> {
+    /// Fix F: allocate + stage one cache-miss texture WITHOUT submitting — creates the device-local
+    /// sampled image + view + sampler and a host-visible staging buffer filled with the pixels, but
+    /// records no copy. [`Self::record_and_submit_uploads`] later records every pending copy + layout
+    /// transition into one command buffer and submits ONCE (so K new textures cost one round-trip, not
+    /// K). Returns a [`PendingTexUpload`] carrying the staging buffer (freed after the shared submit).
+    /// Frees all partials on any error (no leak on the long-lived shared device).
+    fn alloc_resident_texture(&self, tex: &Texture, binding: u32, key: u64) -> R<PendingTexUpload> {
         let dev = &self.device;
         let (w, h) = (tex.width, tex.height);
-        self.ensure_upload_ctx()?;
         let mut staging = vk::Buffer::null();
         let mut staging_mem = vk::DeviceMemory::null();
         let mut image = vk::Image::null();
         let mut image_mem = vk::DeviceMemory::null();
         let mut view = vk::ImageView::null();
         let mut sampler = vk::Sampler::null();
-        let mut build = || -> R<ResidentTexture> {
+        let mut build = || -> R<PendingTexUpload> {
             unsafe {
                 // Staging buffer (host-visible|coherent), filled with the pixels.
                 staging = dev.create_buffer(
@@ -2935,7 +3033,7 @@ impl HostGpu {
                 std::ptr::copy_nonoverlapping(tex.rgba.as_ptr(), ptr as *mut u8, tex.rgba.len());
                 dev.unmap_memory(staging_mem);
 
-                // Device-local sampled image.
+                // Device-local sampled image (populated later by the shared upload submit).
                 image = dev.create_image(
                     &vk::ImageCreateInfo::default()
                         .image_type(vk::ImageType::TYPE_2D)
@@ -2981,80 +3079,20 @@ impl HostGpu {
                     None,
                 )?;
 
-                // Record the staging→image copy + layout transitions on the dedicated upload buffer,
-                // submit, and wait — the image is populated + SHADER_READ_ONLY_OPTIMAL on return.
-                let ctx = self.upload_ctx.lock().unwrap_or_else(|e| e.into_inner());
-                let ctx = ctx.as_ref().expect("ensure_upload_ctx built it");
-                dev.reset_command_pool(ctx.pool, vk::CommandPoolResetFlags::empty())?;
-                dev.begin_command_buffer(
-                    ctx.cmd,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )?;
-                let to_dst = vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .image(image)
-                    .subresource_range(color_range());
-                dev.cmd_pipeline_barrier(
-                    ctx.cmd,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_dst],
-                );
-                let region = vk::BufferImageCopy::default()
-                    .image_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .mip_level(0)
-                            .base_array_layer(0)
-                            .layer_count(1),
-                    )
-                    .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
-                dev.cmd_copy_buffer_to_image(
-                    ctx.cmd,
-                    staging,
-                    image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[region],
-                );
-                let to_read = vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .image(image)
-                    .subresource_range(color_range());
-                dev.cmd_pipeline_barrier(
-                    ctx.cmd,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_read],
-                );
-                dev.end_command_buffer(ctx.cmd)?;
-                dev.reset_fences(&[ctx.fence])?;
-                let cmds = [ctx.cmd];
-                let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
-                dev.queue_submit(self.queue, &submit, ctx.fence)?;
-                self.wait_fence(ctx.fence)?;
-
-                // The image is populated; the staging buffer is no longer needed — free it now so the
-                // resident texture carries only image + view + sampler.
-                dev.destroy_buffer(staging, None);
-                dev.free_memory(staging_mem, None);
-                staging = vk::Buffer::null();
-                staging_mem = vk::DeviceMemory::null();
-
                 let bytes = (ireq.size as usize).max(tex.rgba.len());
-                Ok(ResidentTexture { image, image_mem, view, sampler, width: w, height: h, bytes })
+                Ok(PendingTexUpload {
+                    binding,
+                    key,
+                    image,
+                    image_mem,
+                    view,
+                    sampler,
+                    staging,
+                    staging_mem,
+                    width: w,
+                    height: h,
+                    bytes,
+                })
             }
         };
         build().map_err(|e| {
@@ -3080,6 +3118,83 @@ impl HostGpu {
             }
             e
         })
+    }
+
+    /// Fix F: record every pending miss's staging→image copy + layout transitions into the single
+    /// reusable upload command buffer and submit it ONCE (leaving each image `SHADER_READ_ONLY_OPTIMAL`
+    /// and sampleable by the frame submit that follows), so a frame that introduces K new textures
+    /// pays one GPU round-trip instead of K blocking ones. The caller frees the staging buffers and
+    /// commits the resident images after this returns.
+    fn record_and_submit_uploads(&self, pending: &[PendingTexUpload]) -> R<()> {
+        self.ensure_upload_ctx()?;
+        let dev = &self.device;
+        let ctx = self.upload_ctx.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = ctx.as_ref().expect("ensure_upload_ctx built it");
+        unsafe {
+            dev.reset_command_pool(ctx.pool, vk::CommandPoolResetFlags::empty())?;
+            dev.begin_command_buffer(
+                ctx.cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            for p in pending {
+                let to_dst = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .image(p.image)
+                    .subresource_range(color_range());
+                dev.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_dst],
+                );
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(0)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D { width: p.width, height: p.height, depth: 1 });
+                dev.cmd_copy_buffer_to_image(
+                    ctx.cmd,
+                    p.staging,
+                    p.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+                let to_read = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .image(p.image)
+                    .subresource_range(color_range());
+                dev.cmd_pipeline_barrier(
+                    ctx.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_read],
+                );
+            }
+            dev.end_command_buffer(ctx.cmd)?;
+            dev.reset_fences(&[ctx.fence])?;
+            let cmds = [ctx.cmd];
+            let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+            dev.queue_submit(self.queue, &submit, ctx.fence)?;
+            self.wait_fence(ctx.fence)?;
+        }
+        Ok(())
     }
 
     /// Fix F: write a resident texture's `(view, sampler)` into the shared descriptor set — image at
@@ -3486,11 +3601,9 @@ impl HostGpu {
                 // after the submit fence. Already-built ones are freed on a mid-loop error.
                 let mut tgpu: Vec<TextureGpu> = Vec::new();
                 if self.resource_cache_enabled {
-                    for (i, t) in textures.iter().enumerate() {
-                        let binding = tex_base + 2 * i as u32;
-                        let (view, sampler) = self.get_or_upload_texture(t)?;
-                        self.write_texture_descriptor(set, binding, view, sampler);
-                    }
+                    // Resolve all of the frame's textures at once — hits are written straight from the
+                    // cache; every miss rides ONE shared upload submit (no per-texture round-trip).
+                    self.resolve_frame_textures(textures, set, tex_base)?;
                 } else {
                     tgpu.reserve(textures.len());
                     for (i, t) in textures.iter().enumerate() {
