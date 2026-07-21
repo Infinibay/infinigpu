@@ -27,6 +27,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 /* Set INFINIGPU_DEBUG=1 to trace ICD bring-up (useful both for the host smoke
@@ -52,11 +54,63 @@
  * merged into the device dispatch table in infinigpu_CreateDevice. */
 const struct vk_device_extension_table infinigpu_device_extensions = {
    .KHR_swapchain = true,
+   /* Zink selects a physical device by matching the DRM node major/minor it opened
+    * against VkPhysicalDeviceDrmPropertiesEXT; without this extension (and the DRM
+    * properties filled in infinigpu_get_properties) zink_get_display_device() matches
+    * nothing and bails with "ZINK: failed to choose pdev". Pure pdev metadata reported
+    * guest-side — the A5000/replay is not involved in device selection. */
+   .EXT_physical_device_drm = true,
 };
+
+/* Fill VkPhysicalDeviceDrmPropertiesEXT (mapped by Mesa's generated
+ * GetPhysicalDeviceProperties2 into these flat vk_properties fields). Derived
+ * DYNAMICALLY from the opened node — never hardcode renderD128; the render minor
+ * must equal the node the guest GL loader actually stat()s, or zink still rejects
+ * the pdev. The ICD opens the PRIMARY node (card*); its render sibling is found via
+ * libdrm. Both are reported so zink can match on either. */
+static void
+infinigpu_fill_drm_properties(struct vk_properties *p, int drm_fd)
+{
+   struct stat st;
+
+   if (drm_fd < 0)
+      return;
+
+   /* The opened fd is the primary (card*) node. */
+   if (fstat(drm_fd, &st) == 0 && S_ISCHR(st.st_mode)) {
+      p->drmHasPrimary = true;
+      p->drmPrimaryMajor = major(st.st_rdev);
+      p->drmPrimaryMinor = minor(st.st_rdev);
+   }
+
+   drmDevicePtr dev = NULL;
+   if (drmGetDevice2(drm_fd, 0, &dev) == 0 && dev) {
+      if ((dev->available_nodes & (1 << DRM_NODE_RENDER)) &&
+          dev->nodes[DRM_NODE_RENDER]) {
+         struct stat rst;
+         if (stat(dev->nodes[DRM_NODE_RENDER], &rst) == 0 && S_ISCHR(rst.st_mode)) {
+            p->drmHasRender = true;
+            p->drmRenderMajor = major(rst.st_rdev);
+            p->drmRenderMinor = minor(rst.st_rdev);
+         }
+      }
+      if (!p->drmHasPrimary &&
+          (dev->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
+          dev->nodes[DRM_NODE_PRIMARY]) {
+         struct stat pst;
+         if (stat(dev->nodes[DRM_NODE_PRIMARY], &pst) == 0 && S_ISCHR(pst.st_mode)) {
+            p->drmHasPrimary = true;
+            p->drmPrimaryMajor = major(pst.st_rdev);
+            p->drmPrimaryMinor = minor(pst.st_rdev);
+         }
+      }
+      drmFreeDevice(&dev);
+   }
+}
 
 static void
 infinigpu_get_properties(const struct infinigpu_physical_device *pdev,
-                         struct vk_properties *p)
+                         struct vk_properties *p, int drm_fd)
 {
    /* struct vk_properties is the flat Mesa properties struct (generated
     * src/vulkan/util/vk_physical_device_properties.h); designated init zeroes
@@ -106,6 +160,9 @@ infinigpu_get_properties(const struct infinigpu_physical_device *pdev,
    snprintf(p->driverName, VK_MAX_DRIVER_NAME_SIZE, "infinigpu");
    snprintf(p->driverInfo, VK_MAX_DRIVER_INFO_SIZE, "infinigpu phase-0");
    /* pipelineCacheUUID / deviceUUID / driverUUID left all-zero. */
+
+   /* VkPhysicalDeviceDrmPropertiesEXT — required for Zink to select this pdev. */
+   infinigpu_fill_drm_properties(p, drm_fd);
 }
 
 /* Phase 1 advertises exactly the features the forwarded-triangle path uses: a
@@ -135,7 +192,7 @@ infinigpu_physical_device_init(struct infinigpu_physical_device *pdev,
       &dispatch_table, &wsi_physical_device_entrypoints, false);
 
    struct vk_properties properties;
-   infinigpu_get_properties(pdev, &properties);
+   infinigpu_get_properties(pdev, &properties, drm_fd);
    struct vk_features features;
    infinigpu_get_features(&features);
 
