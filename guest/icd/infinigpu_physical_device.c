@@ -60,6 +60,37 @@ const struct vk_device_extension_table infinigpu_device_extensions = {
     * nothing and bails with "ZINK: failed to choose pdev". Pure pdev metadata reported
     * guest-side — the A5000/replay is not involved in device selection. */
    .EXT_physical_device_drm = true,
+
+   /* --- OpenGL/Zink M1: the extension STRINGS zink hard-requires to stand up a real
+    * (hardware) GL screen. zink_get_physical_device_info() does `goto fail` — which
+    * makes zink_internal_create_screen() return NULL ("failed to create dri2 screen")
+    * — if any of these four is absent from vkEnumerateDeviceExtensionProperties. There
+    * is NO core-version fallback: zink matches the STRING, not the promoted core version.
+    * All four resolve to Mesa's generated vk_common_* device entrypoints (CreateRenderPass2,
+    * CmdBeginRenderPass2, CreateFramebuffer[imageless], CreateDescriptorUpdateTemplate,
+    * UpdateDescriptorSetWithTemplate) — vk_device_init() auto-merges vk_common_device_
+    * entrypoints (overwrite=false), and those common impls delegate to the driver hooks
+    * we already implement (CmdBeginRendering, UpdateDescriptorSets). No wire/replay work. */
+   .KHR_maintenance1              = true,
+   .KHR_create_renderpass2        = true,
+   .KHR_imageless_framebuffer     = true,
+   .KHR_descriptor_update_template = true,
+
+   /* zink hard-requires a timeline semaphore (else "zink: KHR_timeline_semaphore is
+    * required"). We satisfy it BOTH ways: the core-1.2 feature (VkPhysicalDeviceVulkan12
+    * Features.timelineSemaphore, see infinigpu_get_features) AND this extension string.
+    * The timeline is EMULATED guest-side on the binary sync (vk_sync_timeline over
+    * infinigpu_sync_type); IMMEDIATE synchronous submit means every point is already
+    * signalled when a submit returns, so the wire/replay never sees a timeline. */
+   .KHR_timeline_semaphore        = true,
+
+   /* zink_drm_create_screen() checks have_KHR_external_memory_fd AFTER a successful
+    * internal create and, if false, destroys the screen and returns NULL — the DRM-path
+    * gate the DRI2/DRI3/kopper loader always hits. The screen-creation gate only checks
+    * the STRING is present (satisfied here). Real dmabuf export (vkGetMemoryFdKHR) is a
+    * present-time concern (WSI/M2), not a screen-creation blocker. */
+   .KHR_external_memory           = true,
+   .KHR_external_memory_fd        = true,
 };
 
 /* Fill VkPhysicalDeviceDrmPropertiesEXT (mapped by Mesa's generated
@@ -143,6 +174,74 @@ infinigpu_get_properties(const struct infinigpu_physical_device *pdev,
       .maxViewportDimensions            = { 16384, 16384 },
       .viewportBoundsRange              = { -32768.0f, 32768.0f },
 
+      /* Descriptor / attachment / vertex-input / framebuffer / sample limits that
+       * zink reads to SIZE its resource usage. Leaving them zero (the old default)
+       * makes zink clamp-to-zero, divide-by-zero, or hard-abort at context/pipeline
+       * build — AFTER a non-NULL screen (the "screen succeeds, first context crashes"
+       * trap). Values are generous, spec-compliant ceilings: the A5000 backs them and
+       * SPIR-V is forwarded verbatim. Where the WIRE is structurally narrower we report
+       * the honest cap (maxVertexInputAttributes == INFINIGPU_MAX_ATTRS; single-sample
+       * framebuffers because the replay hardcodes VK_SAMPLE_COUNT_1_BIT). Deeper wire
+       * limits (one descriptor set, one UBO/SSBO, <=8 textures, one color target) are
+       * an M2 correctness matter, not a device-selection or sizing limit. */
+      .maxTexelBufferElements               = 1u << 16,
+      .maxUniformBufferRange                = 1u << 16,   /* zink asserts >= 16384 */
+      .maxStorageBufferRange                = 1u << 30,   /* zink asserts >= 1<<27 */
+      .maxPerStageDescriptorSamplers        = 1024,
+      .maxPerStageDescriptorUniformBuffers  = 1024,
+      .maxPerStageDescriptorStorageBuffers  = 1024,
+      .maxPerStageDescriptorSampledImages   = 1024,
+      .maxPerStageDescriptorStorageImages   = 1024,
+      .maxPerStageDescriptorInputAttachments = 1024,
+      .maxPerStageResources                 = 1024,
+      .maxDescriptorSetSamplers             = 1024,
+      .maxDescriptorSetUniformBuffers       = 1024,
+      .maxDescriptorSetUniformBuffersDynamic = 8,
+      .maxDescriptorSetStorageBuffers       = 1024,
+      .maxDescriptorSetStorageBuffersDynamic = 8,
+      .maxDescriptorSetSampledImages        = 1024,
+      .maxDescriptorSetStorageImages        = 1024,
+      .maxDescriptorSetInputAttachments     = 1024,
+      .maxVertexInputAttributes             = INFINIGPU_MAX_ATTRS,   /* 16 — wire cap */
+      .maxVertexInputBindings               = INFINIGPU_MAX_ATTRS,
+      .maxVertexInputAttributeOffset        = 2047,
+      .maxVertexInputBindingStride          = 2048,
+      .maxVertexOutputComponents            = 128,
+      .maxFragmentInputComponents           = 128,
+      .maxFragmentOutputAttachments         = 8,
+      .maxFragmentDualSrcAttachments        = 1,
+      .maxFragmentCombinedOutputResources   = 16,
+      .maxColorAttachments                  = 8,
+      .maxDrawIndexedIndexValue             = UINT32_MAX,
+      .maxDrawIndirectCount                 = 1,
+      .maxSamplerLodBias                    = 16.0f,
+      .maxSamplerAnisotropy                 = 16.0f,
+      .maxFramebufferWidth                  = 16384,
+      .maxFramebufferHeight                 = 16384,
+      .maxFramebufferLayers                 = 2048,
+      .framebufferColorSampleCounts         = VK_SAMPLE_COUNT_1_BIT,
+      .framebufferDepthSampleCounts         = VK_SAMPLE_COUNT_1_BIT,
+      .framebufferStencilSampleCounts       = VK_SAMPLE_COUNT_1_BIT,
+      .framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .sampledImageColorSampleCounts        = VK_SAMPLE_COUNT_1_BIT,
+      .sampledImageIntegerSampleCounts      = VK_SAMPLE_COUNT_1_BIT,
+      .sampledImageDepthSampleCounts        = VK_SAMPLE_COUNT_1_BIT,
+      .sampledImageStencilSampleCounts      = VK_SAMPLE_COUNT_1_BIT,
+      .storageImageSampleCounts             = VK_SAMPLE_COUNT_1_BIT,
+      .maxSampleMaskWords                   = 1,
+      .maxClipDistances                     = 8,
+      .maxCullDistances                     = 8,
+      .maxCombinedClipAndCullDistances      = 8,
+      .pointSizeRange                       = { 1.0f, 64.0f },
+      .lineWidthRange                       = { 1.0f, 1.0f },
+      .pointSizeGranularity                 = (1.0f / 8.0f),
+      .lineWidthGranularity                 = 0.0f,
+      .maxTexelOffset                       = 7,
+      .minTexelOffset                       = -8,
+      .subPixelPrecisionBits                = 8,
+      .subTexelPrecisionBits                = 8,
+      .mipmapPrecisionBits                  = 8,
+
       /* Vulkan 1.1 */
       .deviceLUIDValid = false,
       .deviceNodeMask  = 0,
@@ -165,16 +264,23 @@ infinigpu_get_properties(const struct infinigpu_physical_device *pdev,
    infinigpu_fill_drm_properties(p, drm_fd);
 }
 
-/* Phase 1 advertises exactly the features the forwarded-triangle path uses: a
- * 1.3 device with dynamic rendering (CmdBeginRendering) and synchronization2
- * (CmdPipelineBarrier2). We do NOT advertise timelineSemaphore — the driver runs
- * a binary CPU sync in IMMEDIATE submit mode (see infinigpu_sync.c). */
+/* Feature set. The forwarded-draw path uses dynamicRendering (CmdBeginRendering) +
+ * synchronization2 (CmdPipelineBarrier2). The rest are the OpenGL/Zink M1 features:
+ *   - timelineSemaphore: the ONE feature whose absence hard-fails zink screen creation
+ *     (zink_screen.c:3451). Emulated on the binary sync (see the sync registration in
+ *     infinigpu_physical_device_init) — IMMEDIATE synchronous submit resolves every
+ *     point on return, so the wire/replay never sees a timeline.
+ *   - imagelessFramebuffer: the feature behind VK_KHR_imageless_framebuffer; Mesa's
+ *     common CreateFramebuffer honours the IMAGELESS flag only when this is enabled.
+ * Both are backed entirely guest-side (metadata + Mesa common runtime); no replay work. */
 static void
 infinigpu_get_features(struct vk_features *f)
 {
    *f = (struct vk_features){
-      .dynamicRendering = true,
-      .synchronization2 = true,
+      .dynamicRendering    = true,
+      .synchronization2    = true,
+      .timelineSemaphore   = true,
+      .imagelessFramebuffer = true,
    };
 }
 
@@ -209,11 +315,18 @@ infinigpu_physical_device_init(struct infinigpu_physical_device *pdev,
    if (result != VK_SUCCESS)
       return result;
 
-   /* Register the driver's binary CPU sync. Binary-only (no timeline) keeps the
-    * device in IMMEDIATE submit mode, where driver_submit runs synchronously on
-    * the caller's thread and blocks on the forwarded-draw ioctl. */
+   /* Register the driver's binary CPU sync PLUS an emulated timeline built on top of
+    * it (vk_sync_timeline over the binary type — the same construction lavapipe uses).
+    * OpenGL/Zink hard-requires a working timeline VkSemaphore; emulating it guest-side
+    * is free here because submit is IMMEDIATE and synchronous — driver_submit blocks on
+    * the forwarded-draw ioctl, so every timeline point is already signalled when a
+    * submit returns and the wire/replay never sees a timeline. The binary type exposes
+    * exactly the features vk_sync_timeline needs (CPU_WAIT/SIGNAL/RESET + WAIT_PENDING,
+    * see infinigpu_sync.c). */
+   pdev->sync_timeline_type = vk_sync_timeline_get_type(&infinigpu_sync_type);
    pdev->sync_types[0] = &infinigpu_sync_type;
-   pdev->sync_types[1] = NULL;
+   pdev->sync_types[1] = &pdev->sync_timeline_type.sync;
+   pdev->sync_types[2] = NULL;
    pdev->vk.supported_sync_types = pdev->sync_types;
 
    pdev->drm_fd = drm_fd;
