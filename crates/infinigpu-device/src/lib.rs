@@ -844,6 +844,34 @@ fn cursor_shape_ok(width: u16, height: u16, pitch: u32, format: u32) -> bool {
         && pitch.checked_mul(h).map_or(false, |t| t <= CURSOR_MAX_BYTES)
 }
 
+/// Repack one source scanout row (32-bpp) into a tightly-packed BGRA encoder row.
+///
+/// For fbcon/BGRA sources the encoder row is BYTE-IDENTICAL to the source except the X
+/// byte must become an opaque alpha — so it's a whole-row `copy_from_slice` + a stride-4
+/// alpha fill (near memcpy speed, auto-vectorized), NOT a per-pixel scalar swizzle. Only
+/// R8G8B8A8 needs a real R↔B swap. `dst` and `src` must both be `w*4` bytes. This runs on
+/// the guest-blocking present path (the ring retire happens after it), so keeping it at
+/// memcpy speed directly cuts input→photon latency.
+#[inline]
+fn swizzle_row_to_bgra(dst: &mut [u8], src: &[u8], is_copy: bool) {
+    debug_assert_eq!(dst.len(), src.len());
+    if is_copy {
+        dst.copy_from_slice(src);
+        let mut a = 3;
+        while a < dst.len() {
+            dst[a] = 255; // X → opaque alpha
+            a += 4;
+        }
+    } else {
+        for (o, p) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            o[0] = p[2]; // B ← R
+            o[1] = p[1];
+            o[2] = p[0]; // R ← B
+            o[3] = 255;
+        }
+    }
+}
+
 /// Clamp a guest-supplied damage rect into the `[0,w]×[0,h]` frame. Saturating `min`
 /// math guarantees the result satisfies `dx+dw <= w` and `dy+dh <= h` for **any** `u32`
 /// input (including `u32::MAX`), so a hostile guest can never drive an out-of-bounds
@@ -1044,7 +1072,22 @@ impl InfinigpuBackend {
         // Bind the infiniPixel WebSocket server eagerly (encoder stays lazy, sized to
         // the first frame) so a viewer can connect *before* the first present and catch
         // the whole stream from frame 0.
-        let pixel = pixel_port.and_then(|port| match infinigpu_pixel::PixelStreamer::new(30, 8000, port) {
+        //
+        // fps/bitrate are env-configurable and default to 60 fps: the pixel Hub is a
+        // latest-wins mailbox, so a 30 fps cap here silently coalesces a 60 fps game down
+        // to 30 (every other rendered frame is dropped before it reaches NVENC). 60 fps +
+        // a fatter default bitrate is the cheapest motion-smoothness win for a game VM.
+        let stream_fps: u32 = std::env::var("INFINIGPU_STREAM_FPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&f| f >= 1 && f <= 240)
+            .unwrap_or(60);
+        let stream_kbps: u32 = std::env::var("INFINIGPU_STREAM_KBPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&b| b >= 500 && b <= 200_000)
+            .unwrap_or(12000);
+        let pixel = pixel_port.and_then(|port| match infinigpu_pixel::PixelStreamer::new(stream_fps, stream_kbps, port) {
             Ok(s) => {
                 info!("infiniPixel: serving on ws://0.0.0.0:{port} (open client/infinipixel.html?port={port})");
                 Some(s)
@@ -1993,44 +2036,74 @@ impl InfinigpuBackend {
         self.bytes_read_last = total;
 
         // Byte order of one 32-bpp pixel. fbcon's XRGB8888 is little-endian
-        // [B,G,R,X]; R8G8B8A8 is [R,G,B,A].
+        // [B,G,R,X]; R8G8B8A8 is [R,G,B,A]. The encoder wants BGRA. For the fbcon/BGRA
+        // formats the encoder's BGRA row is BYTE-IDENTICAL to the source (only X→255), so
+        // it's a whole-row copy_from_slice + alpha fill — no per-pixel swizzle. Only the
+        // R8G8B8A8 case needs a real R↔B swap. (The old code did a per-byte scalar loop
+        // writing BOTH an RGB and a BGRA buffer for every pixel = ~3-8 ms/frame on the
+        // guest-blocking path, since the ring retire below happens AFTER this.)
         let (ri, gi, bi) = match sp.format {
             format::R8G8B8A8 => (0, 1, 2),
             _ => (2, 1, 0), // B8G8R8A8 / B8G8R8X8 (fbcon default)
         };
-        let mut rgb = vec![0u8; w * h * 3];
-        // When streaming, also produce a tightly-packed BGRA frame for the encoder.
+        let bgra_is_copy = !matches!(sp.format, format::R8G8B8A8);
+        // The packed RGB frame is ONLY consumed by the dev-only PPM dumper — don't build it
+        // (a full per-pixel pass) in production.
+        let want_rgb = self.present_dir.is_some();
         let streaming = self.pixel.is_some();
+        let mut rgb = if want_rgb { vec![0u8; w * h * 3] } else { Vec::new() };
         let mut bgra = if streaming { vec![0u8; w * h * 4] } else { Vec::new() };
         let mut nonblank = 0usize;
         for y in 0..h {
             let row = &buf[y * pitch..y * pitch + w * 4];
-            for x in 0..w {
-                let px = &row[x * 4..x * 4 + 4];
-                let (r, g, b) = (px[ri], px[gi], px[bi]);
-                if r | g | b != 0 {
-                    nonblank += 1;
+            if streaming {
+                let out = &mut bgra[y * w * 4..(y * w + w) * 4];
+                if bgra_is_copy {
+                    out.copy_from_slice(row);
+                    let mut a = 3;
+                    while a < out.len() {
+                        out[a] = 255; // X → opaque alpha
+                        a += 4;
+                    }
+                } else {
+                    for (o, p) in out.chunks_exact_mut(4).zip(row.chunks_exact(4)) {
+                        o[0] = p[2]; // B ← R
+                        o[1] = p[1];
+                        o[2] = p[0]; // R ← B
+                        o[3] = 255;
+                    }
                 }
-                let o = (y * w + x) * 3;
-                rgb[o] = r;
-                rgb[o + 1] = g;
-                rgb[o + 2] = b;
-                if streaming {
-                    let o4 = (y * w + x) * 4;
-                    bgra[o4] = b;
-                    bgra[o4 + 1] = g;
-                    bgra[o4 + 2] = r;
-                    bgra[o4 + 3] = 255;
+            }
+            if want_rgb {
+                for x in 0..w {
+                    let px = &row[x * 4..x * 4 + 4];
+                    let (r, g, b) = (px[ri], px[gi], px[bi]);
+                    if r | g | b != 0 {
+                        nonblank += 1;
+                    }
+                    let o = (y * w + x) * 3;
+                    rgb[o] = r;
+                    rgb[o + 1] = g;
+                    rgb[o + 2] = b;
                 }
             }
         }
 
         self.present_count += 1;
-        let pct = 100.0 * nonblank as f64 / (w * h).max(1) as f64;
-        info!(
-            "present: frame {} {w}x{h} pitch {pitch} @ {:#x} — {nonblank} non-blank px ({pct:.1}%)",
-            self.present_count, sp.scanout_addr
-        );
+        if want_rgb {
+            let pct = 100.0 * nonblank as f64 / (w * h).max(1) as f64;
+            info!(
+                "present: frame {} {w}x{h} pitch {pitch} @ {:#x} — {nonblank} non-blank px ({pct:.1}%)",
+                self.present_count, sp.scanout_addr
+            );
+        } else {
+            info!(
+                "present: frame {} {w}x{h} pitch {pitch} @ {:#x} — {} KiB",
+                self.present_count,
+                sp.scanout_addr,
+                total / 1024
+            );
+        }
         if let Some(dir) = self.present_dir.clone() {
             // Keep the first few numbered frames plus an always-current one.
             if self.present_count <= 12 {
@@ -2108,13 +2181,18 @@ impl InfinigpuBackend {
         let (dx, dy, dw, dh) = clamp_damage(w, h, sp.dx, sp.dy, sp.dw, sp.dh);
 
         // One pixel's source byte order → BGRA. fbcon XRGB8888 is [B,G,R,X]; R8G8B8A8 is [R,G,B,A].
-        let (ri, gi, bi) = match sp.format {
-            format::R8G8B8A8 => (0usize, 1usize, 2usize),
-            _ => (2usize, 1usize, 0usize),
-        };
+        // For fbcon/BGRA the encoder row is byte-identical to the source (only X→255), so the swizzle
+        // is a whole-row copy + alpha fill; only R8G8B8A8 needs a per-pixel R↔B swap (see
+        // `swizzle_row_to_bgra`). This is the same ~3-8 ms/frame guest-blocking cost `present_scanout` had.
+        let bgra_is_copy = !matches!(sp.format, format::R8G8B8A8);
 
-        // Full rebuild when there is no matching surface (first frame / resize / post-reset).
-        let need_full = !matches!(&self.last_scanout, Some(b) if b.w == w && b.h == h);
+        // Full rebuild when there is no matching surface (first frame / resize / post-reset) OR when the
+        // guest damage covers the whole frame — the guest KMD currently reports full-rect damage every
+        // frame, and the "incremental" branch would then DMA the whole frame into an extra scratch AND
+        // copy it again (strictly more work than the full path). Detect that and take the full path,
+        // reading straight into the persistent surface.
+        let full_damage = dx == 0 && dy == 0 && dw == w && dh == h;
+        let need_full = full_damage || !matches!(&self.last_scanout, Some(b) if b.w == w && b.h == h);
 
         if need_full {
             let mut buf = vec![0u8; fb_bytes];
@@ -2122,17 +2200,16 @@ impl InfinigpuBackend {
                 log::error!("present(dmg): framebuffer {:#x} not mapped", sp.scanout_addr);
                 return;
             }
-            let mut bgra = vec![0u8; w * h * 4];
+            // Reuse the persistent BGRA surface's allocation when the dims match (the full-damage
+            // per-frame case); only allocate on a real resize/first-frame.
+            let mut bgra = match self.last_scanout.take() {
+                Some(b) if b.w == w && b.h == h => b.bgra,
+                _ => vec![0u8; w * h * 4],
+            };
             for y in 0..h {
-                let row = &buf[y * pitch..y * pitch + w * 4];
-                for x in 0..w {
-                    let px = &row[x * 4..x * 4 + 4];
-                    let o4 = (y * w + x) * 4;
-                    bgra[o4] = px[bi];
-                    bgra[o4 + 1] = px[gi];
-                    bgra[o4 + 2] = px[ri];
-                    bgra[o4 + 3] = 255;
-                }
+                let src = &buf[y * pitch..y * pitch + w * 4];
+                let dst = &mut bgra[y * w * 4..(y * w + w) * 4];
+                swizzle_row_to_bgra(dst, src, bgra_is_copy);
             }
             self.last_scanout = Some(ScanoutBuffer { w, h, bgra });
             self.bytes_read_last = fb_bytes;
@@ -2156,15 +2233,9 @@ impl InfinigpuBackend {
             for r in 0..dh {
                 let y = dy + r;
                 let dst_row = (y * w + dx) * 4;
-                let row_buf = &rows[r * dw * 4..(r + 1) * dw * 4];
-                for x in 0..dw {
-                    let px = &row_buf[x * 4..x * 4 + 4];
-                    let o4 = dst_row + x * 4;
-                    b.bgra[o4] = px[bi];
-                    b.bgra[o4 + 1] = px[gi];
-                    b.bgra[o4 + 2] = px[ri];
-                    b.bgra[o4 + 3] = 255;
-                }
+                let src = &rows[r * dw * 4..(r + 1) * dw * 4];
+                let dst = &mut b.bgra[dst_row..dst_row + dw * 4];
+                swizzle_row_to_bgra(dst, src, bgra_is_copy);
             }
             self.bytes_read_last = dw * dh * 4;
         } else {
