@@ -156,7 +156,8 @@ fn c_cmdlist_encoder_decodes_through_the_host_decoder() {
     assert_eq!(t.rgba, texpix, "texture pixels survive C→Rust (trailing region placement)");
     assert!(t.linear && !t.repeat, "sampler flags survive (linear on, repeat off)");
     assert_eq!(g.tex_binding, 1, "tex_binding survives C→Rust (image@1 / sampler@2)");
-    let u = g.uniform.expect("ubo bytes decode to a uniform");
+    assert_eq!(g.uniforms.len(), 1, "one UBO decodes from the C→Rust round-trip");
+    let u = &g.uniforms[0];
     assert_eq!(u.binding, 0, "ubo binding survives C→Rust");
     assert_eq!(u.bytes, ubo, "ubo bytes survive C→Rust (blob after push-const, before texpix)");
     let s = g.storage.expect("ssbo bytes decode to a storage buffer");

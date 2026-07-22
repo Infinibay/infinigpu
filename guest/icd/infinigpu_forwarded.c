@@ -89,7 +89,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
     const uint8_t *index_data, uint32_t index_data_len, uint32_t index_type,
     uint32_t topology, uint32_t depth_flags,
     const uint8_t *push_const, uint32_t push_const_len,
-    const uint8_t *ubo, uint32_t ubo_len, uint32_t ubo_binding,
+    const struct ForwardedUbo *ubos, uint32_t ubo_count,
     const uint8_t *ssbo, uint32_t ssbo_len, uint32_t ssbo_binding,
     const struct DrawCmdWire *draws, uint32_t draw_count,
     const struct TextureDescWire *texs, uint32_t tex_count, uint32_t tex_binding,
@@ -103,6 +103,12 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	const size_t draws_bytes = (size_t)draw_count * sizeof(struct DrawCmdWire);
 	const size_t texs_bytes = (size_t)tex_count * sizeof(struct TextureDescWire);
 
+	/* Self-describing UBO block (ABI 0.14): ubo_count records, each an 8-byte header (binding, len)
+	 * followed by `len` bytes. `ubo_bytes` is the total on-wire size (headers + data). */
+	size_t ubo_bytes = 0;
+	for (uint32_t i = 0; i < ubo_count; i++)
+		ubo_bytes += 8u + (size_t)ubos[i].len;
+
 	/* A command list carries at least one draw. It is either a MESH (a vertex buffer: stride>0 with
 	 * vertex bytes) or a BUFFERLESS draw (gl_VertexIndex pulling from a UBO, like vkcube: stride==0 AND
 	 * vertex_data_len==0). Reject a degenerate list (no draw) or the mixed case (exactly one of
@@ -113,7 +119,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	const size_t total = sizeof(struct VulkanWorkload) + sizeof(struct ForwardedCmdListTail) +
 	                     attrs_bytes + draws_bytes + texs_bytes + vbytes + fbytes +
 	                     (size_t)vertex_data_len + (size_t)index_data_len + velen + felen +
-	                     (size_t)push_const_len + (size_t)ubo_len + (size_t)ssbo_len + (size_t)texpix_len;
+	                     (size_t)push_const_len + ubo_bytes + (size_t)ssbo_len + (size_t)texpix_len;
 	if (out == NULL || total > cap)
 		return 0;
 
@@ -145,8 +151,8 @@ size_t infinigpu_encode_forwarded_cmdlist(
 	tail.depth_flags = depth_flags;
 	tail.push_const_len = push_const_len;
 	tail.tex_count = tex_count;
-	tail.ubo_len = ubo_len;
-	tail.ubo_binding = ubo_binding;
+	tail.ubo_len = (uint32_t)ubo_bytes;
+	tail.ubo_count = ubo_count;
 	tail.tex_binding = tex_binding;
 	tail.raster_flags = raster_flags;
 	tail.ssbo_len = ssbo_len;
@@ -190,9 +196,17 @@ size_t infinigpu_encode_forwarded_cmdlist(
 		memcpy(out + o, push_const, push_const_len);
 		o += push_const_len;
 	}
-	if (ubo_len) {
-		memcpy(out + o, ubo, ubo_len);
-		o += ubo_len;
+	/* UBO block: ubo_count self-describing records — [binding u32][len u32][len bytes] each — at the
+	 * same wire position the single UBO occupied pre-0.14. Written little-endian by field so it matches
+	 * the host's zerocopy read of two u32 headers per record. */
+	for (uint32_t i = 0; i < ubo_count; i++) {
+		uint32_t hdr[2] = { ubos[i].binding, ubos[i].len };
+		memcpy(out + o, hdr, sizeof hdr);
+		o += sizeof hdr;
+		if (ubos[i].len) {
+			memcpy(out + o, ubos[i].data, ubos[i].len);
+			o += ubos[i].len;
+		}
 	}
 	if (ssbo_len) {
 		/* SSBO blob: after the UBO bytes, before the trailing texture pixels — matches the host

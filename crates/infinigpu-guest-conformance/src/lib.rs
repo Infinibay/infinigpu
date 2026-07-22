@@ -9,6 +9,16 @@
 //! guest RAM) and are `unsafe` for the same reason the device's `host_ptr` path is: the caller must
 //! guarantee the offsets stay in bounds of the backing allocation.
 
+/// Mirror of the C `struct ForwardedUbo` (guest/icd/infinigpu_forwarded.h) — one uniform buffer to
+/// forward: its bytes, length, and descriptor-set-0 binding. Passed as an array to the cmdlist encoder
+/// (ABI 0.14 multi-UBO). `#[repr(C)]` so the field layout matches the C struct byte-for-byte.
+#[repr(C)]
+struct ForwardedUbo {
+    data: *const u8,
+    len: u32,
+    binding: u32,
+}
+
 unsafe extern "C" {
     fn igpu_gref_push(
         idx_base: *mut u8,
@@ -79,9 +89,8 @@ unsafe extern "C" {
         depth_flags: u32,
         push_const: *const u8,
         push_const_len: u32,
-        ubo: *const u8,
-        ubo_len: u32,
-        ubo_binding: u32,
+        ubos: *const ForwardedUbo,
+        ubo_count: u32,
         ssbo: *const u8,
         ssbo_len: u32,
         ssbo_binding: u32,
@@ -203,6 +212,13 @@ pub fn encode_forwarded_cmdlist(
         + vertex_entry.to_bytes_with_nul().len()
         + fragment_entry.to_bytes_with_nul().len();
     let mut out = vec![0u8; cap];
+    // ABI 0.14: the encoder takes an array of UBOs. This wrapper forwards a single UBO (the C ICD's
+    // common case for these interop tests), so build a one-element array (empty ⇒ zero UBOs).
+    let ubos: Vec<ForwardedUbo> = if ubo.is_empty() {
+        Vec::new()
+    } else {
+        vec![ForwardedUbo { data: ubo.as_ptr(), len: ubo.len() as u32, binding: ubo_binding }]
+    };
     let n = unsafe {
         infinigpu_encode_forwarded_cmdlist(
             out.as_mut_ptr(),
@@ -229,9 +245,8 @@ pub fn encode_forwarded_cmdlist(
             depth_flags,
             push_const.as_ptr(),
             push_const.len() as u32,
-            ubo.as_ptr(),
-            ubo.len() as u32,
-            ubo_binding,
+            ubos.as_ptr(),
+            ubos.len() as u32,
             ssbo.as_ptr(),
             ssbo.len() as u32,
             ssbo_binding,

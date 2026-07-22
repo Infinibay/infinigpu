@@ -529,17 +529,23 @@ struct ForwardedCmdListTail {
    */
   uint32_t tex_count;
   /**
-   * Byte length of the uniform-buffer (UBO) block (ABI 0.11) — a fixed-length byte blob appended
-   * after the push constants and before the trailing texture pixels. `0` ⇒ no UBO. The host uploads
-   * these bytes into a `UNIFORM_BUFFER` bound at descriptor set 0 binding [`ubo_binding`]
-   * (VERTEX|FRAGMENT), so a shader's `var<uniform>` block (e.g. per-frame matrices) reads them.
+   * Total byte length of the uniform-buffer (UBO) block (ABI 0.14) — a SELF-DESCRIBING blob at the
+   * same wire position as before (after the push constants, before the SSBO block). `0` ⇒ no UBOs.
+   * The block is `ubo_count` back-to-back records, each `[binding: u32][len: u32][len bytes]`; the
+   * host uploads each record's bytes into a `UNIFORM_BUFFER` bound at descriptor set 0 binding
+   * `binding` (VERTEX|FRAGMENT). This lets a draw carry SEVERAL uniform blocks at distinct bindings
+   * (e.g. an MVP matrix at binding 0 read by the VS + a material/colour block at binding 4 read by the
+   * FS) — zink's fixed-function path binds >=2, and dropping any collapses gl_Position. (ABI <=0.13
+   * carried a single raw UBO here + its binding in the field now named `ubo_count`.)
    */
   uint32_t ubo_len;
   /**
-   * Descriptor-set-0 binding the UBO occupies (ABI 0.11). Ignored when `ubo_len == 0`. Must not fall
-   * inside the texture's binding range `[tex_binding .. tex_binding + 2*tex_count)`.
+   * Number of UBO records packed in the UBO block (ABI 0.14; the field was `ubo_binding` in <=0.13,
+   * which carried the single UBO's binding — each record now carries its own). `0` ⇒ no UBOs. Each
+   * record's binding must not collide with the SSBO (`ssbo_binding`) nor the texture range
+   * `[tex_binding .. tex_binding + 2*tex_count)`.
    */
-  uint32_t ubo_binding;
+  uint32_t ubo_count;
   /**
    * Base descriptor-set-0 binding of texture 0's sampled image (ABI 0.11); sampler at `tex_binding+1`,
    * texture `i` at `tex_binding + 2i` / `+ 2i + 1`. `0` (the pre-0.11 default) ⇒ image@0 / sampler@1,

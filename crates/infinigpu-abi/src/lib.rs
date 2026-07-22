@@ -75,14 +75,15 @@ mod layout_asserts {
     const _: () = assert!(align_of::<ForwardedDrawTail>() == 4);
     // ForwardedCmdListTail (vk_op::FORWARDED_CMDLIST): 20×u32 = 80, 4-byte aligned (ABI 0.9 added
     // push_const_len; 0.10 tex_count; 0.11 ubo_len/ubo_binding/tex_binding; 0.12 raster_flags; 0.13
-    // ssbo_len/ssbo_binding). Its trailing VertexAttrWire[]/DrawCmdWire[]/TextureDescWire[] arrays are
-    // 4-multiples so they stay 4-aligned.
+    // ssbo_len/ssbo_binding; 0.14 renamed ubo_binding→ubo_count, same offset — the UBO block is now
+    // `ubo_count` self-describing [binding][len][bytes] records). Its trailing VertexAttrWire[]/
+    // DrawCmdWire[]/TextureDescWire[] arrays are 4-multiples so they stay 4-aligned.
     const _: () = assert!(size_of::<ForwardedCmdListTail>() == 80);
     const _: () = assert!(align_of::<ForwardedCmdListTail>() == 4);
     const _: () = assert!(offset_of!(ForwardedCmdListTail, push_const_len) == 48);
     const _: () = assert!(offset_of!(ForwardedCmdListTail, tex_count) == 52);
     const _: () = assert!(offset_of!(ForwardedCmdListTail, ubo_len) == 56);
-    const _: () = assert!(offset_of!(ForwardedCmdListTail, ubo_binding) == 60);
+    const _: () = assert!(offset_of!(ForwardedCmdListTail, ubo_count) == 60);
     const _: () = assert!(offset_of!(ForwardedCmdListTail, tex_binding) == 64);
     const _: () = assert!(offset_of!(ForwardedCmdListTail, raster_flags) == 68);
     const _: () = assert!(offset_of!(ForwardedCmdListTail, ssbo_len) == 72);

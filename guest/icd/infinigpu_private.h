@@ -206,6 +206,17 @@ struct infinigpu_descriptor_pool {
    struct list_head sets;   /* infinigpu_descriptor_set::link — freed on reset/destroy */
 };
 
+/* One uniform buffer bound in a descriptor set: the buffer + write offset/range + the dstBinding. A set
+ * carries SEVERAL (e.g. zink's fixed-function VS reads an MVP matrix at binding 0 and the FS a colour
+ * block at binding 4) — keeping only one collapses gl_Position, so they are stored per-binding. */
+#define INFINIGPU_MAX_SET_UBOS 8
+struct infinigpu_desc_ubo {
+   struct infinigpu_buffer *buffer;
+   uint64_t offset;
+   uint64_t range;
+   uint32_t binding;
+};
+
 /* One sampled texture bound in a descriptor set: its image + sampler + the dstBinding the sampled image
  * was written at (image@binding, sampler@binding+1). A real material shader binds several. */
 #define INFINIGPU_MAX_SET_TEXTURES 8
@@ -223,12 +234,11 @@ struct infinigpu_descriptor_set {
     * dstBinding; at submit they are sorted by binding and forwarded as texture i at tex_binding + 2i. */
    struct infinigpu_desc_texture textures[INFINIGPU_MAX_SET_TEXTURES];
    uint32_t texture_count;
-   /* Phase-2c uniform buffer bound here (NULL ⇒ none). Composes with the textures in the same set at a
-    * distinct binding. `ubo_range == VK_WHOLE_SIZE` ⇒ resolve to total_size - ubo_offset at submit. */
-   struct infinigpu_buffer *ubo_buffer;
-   uint64_t ubo_offset;
-   uint64_t ubo_range;
-   uint32_t ubo_binding;                  /* dstBinding the UBO was written at */
+   /* Phase-2c uniform buffers bound here (ubo_count == 0 ⇒ none). Each is keyed by its dstBinding so a
+    * VS-UBO (MVP@0) and an FS-UBO (colour@4) both survive; `range == VK_WHOLE_SIZE` ⇒ resolve to
+    * total_size - offset at submit. All are forwarded (ABI 0.14 multi-UBO). */
+   struct infinigpu_desc_ubo ubos[INFINIGPU_MAX_SET_UBOS];
+   uint32_t ubo_count;
    /* Phase-2c read-only storage buffer bound here (NULL ⇒ none). Composes with the UBO + textures in the
     * same set at a distinct binding. Same clamp/resolve rules as the UBO; forwarded as bytes (no writeback). */
    struct infinigpu_buffer *ssbo_buffer;

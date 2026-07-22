@@ -180,10 +180,11 @@ pub struct Geometry<'a> {
     /// `tex_binding + 2i` / `+ 2i + 1`). `0` ⇒ image@0 / sampler@1 (the pre-UBO default). Non-zero lets a
     /// UBO and the textures share set 0 at distinct bindings. Ignored when `textures` is empty.
     pub tex_binding: u32,
-    /// One uniform buffer (Phase-2c) bound at descriptor set 0 binding `uniform.binding`
-    /// (VERTEX|FRAGMENT), for a shader's `var<uniform>` block (e.g. per-frame matrices). `None` ⇒ no
-    /// UBO. Composes with `texture` in the same set at a distinct binding.
-    pub uniform: Option<UniformBlock<'a>>,
+    /// Uniform buffers (Phase-2c) bound at descriptor set 0, each at its own `binding` (VERTEX|FRAGMENT),
+    /// for a shader's `var<uniform>` blocks. Empty ⇒ no UBOs. ABI 0.14 carries SEVERAL — zink's
+    /// fixed-function path needs an MVP@0 for the VS AND a colour@4 for the FS, and dropping either
+    /// collapses gl_Position. Composes with `textures`/`storage` in the same set at distinct bindings.
+    pub uniforms: Vec<UniformBlock<'a>>,
     /// One READ-ONLY storage buffer (Phase-2c SSBO) bound at descriptor set 0 binding `storage.binding`
     /// (VERTEX|FRAGMENT), for a shader's `var<storage>` block (a DXVK structured/raw SRV, a skinning
     /// palette, per-instance data). `None` ⇒ no SSBO. Composes with the UBO + textures in the same set
@@ -722,9 +723,16 @@ struct PipelineKey {
 /// `tex_count` `SAMPLED_IMAGE` + `SAMPLER` pairs at `tex_binding + 2i` / `+ 2i + 1` (FRAGMENT). The full
 /// layout is fixed by `(tex_binding, tex_count)`, so those two fields key it. Same signature ⇒ same
 /// layout ⇒ same pipeline, so it is cached and part of the [`PipelineKey`].
+/// Max distinct UBO bindings a draw's descriptor set 0 can carry (matches the guest ICD's
+/// `INFINIGPU_MAX_SET_UBOS`). A fixed array keeps [`DescriptorSig`] `Copy` (it keys the pipeline cache).
+pub const MAX_UBOS: usize = 8;
+
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 struct DescriptorSig {
-    ubo_binding: Option<u32>,
+    /// Distinct UBO bindings, SORTED, first `ubo_count` valid (the tail stays 0 so equal binding-sets
+    /// hash equal regardless of guest write order). Each becomes a `UNIFORM_BUFFER` (VERTEX|FRAGMENT).
+    ubo_bindings: [u32; MAX_UBOS],
+    ubo_count: u32,
     /// Base binding of texture 0's sampled image; `None` ⇒ no textures. Present iff `tex_count > 0`.
     tex_binding: Option<u32>,
     /// Number of sampled textures (each an image+sampler pair). `0` ⇒ none.
@@ -734,18 +742,23 @@ struct DescriptorSig {
 }
 
 /// The descriptor-set signature a draw needs, or `None` if it binds no descriptor resources (Phase-2c).
-/// Textures bind image+sampler pairs from `tex_binding` (texture `i` at `+2i`/`+2i+1`); a UBO at its
-/// `binding`; an SSBO at its `binding`.
+/// Textures bind image+sampler pairs from `tex_binding` (texture `i` at `+2i`/`+2i+1`); each UBO at its
+/// own `binding`; an SSBO at its `binding`.
 fn desc_sig_of(draw: &ForwardedDraw) -> Option<DescriptorSig> {
     let g = draw.geometry.as_ref()?;
-    let ubo_binding = g.uniform.as_ref().map(|u| u.binding);
+    let mut ubo_bindings = [0u32; MAX_UBOS];
+    let ubo_count = g.uniforms.len().min(MAX_UBOS);
+    for (i, u) in g.uniforms.iter().take(MAX_UBOS).enumerate() {
+        ubo_bindings[i] = u.binding;
+    }
+    ubo_bindings[..ubo_count].sort_unstable();
     let ssbo_binding = g.storage.as_ref().map(|s| s.binding);
     let tex_count = g.textures.len() as u32;
     let tex_binding = (tex_count > 0).then_some(g.tex_binding);
-    if ubo_binding.is_none() && tex_binding.is_none() && ssbo_binding.is_none() {
+    if ubo_count == 0 && tex_binding.is_none() && ssbo_binding.is_none() {
         None
     } else {
-        Some(DescriptorSig { ubo_binding, tex_binding, tex_count, ssbo_binding })
+        Some(DescriptorSig { ubo_bindings, ubo_count: ubo_count as u32, tex_binding, tex_count, ssbo_binding })
     }
 }
 
@@ -1188,7 +1201,7 @@ impl StorageGpu {
 struct FrameDescriptors {
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
-    ubo: Option<UniformGpu>,
+    ubos: Vec<UniformGpu>,
     ssbo: Option<StorageGpu>,
     tex: Vec<TextureGpu>,
 }
@@ -1200,7 +1213,7 @@ impl FrameDescriptors {
         if self.pool != vk::DescriptorPool::null() {
             dev.destroy_descriptor_pool(self.pool, None); // frees the set
         }
-        if let Some(u) = &self.ubo {
+        for u in &self.ubos {
             u.destroy(dev);
         }
         if let Some(s) = &self.ssbo {
@@ -2690,7 +2703,7 @@ impl HostGpu {
                 let g = draw.geometry.as_ref().expect("desc_sig_of ⇒ geometry present");
                 let built = self
                     .desc_set_layout(sig)
-                    .and_then(|sl| self.build_frame_descriptors(g.uniform.as_ref(), g.storage.as_ref(), g.textures, g.tex_binding, sl));
+                    .and_then(|sl| self.build_frame_descriptors(&g.uniforms, g.storage.as_ref(), g.textures, g.tex_binding, sl));
                 match built {
                     Ok(d) => Some(d),
                     Err(e) => {
@@ -3291,7 +3304,8 @@ impl HostGpu {
             }
         }
         let mut bindings: Vec<vk::DescriptorSetLayoutBinding> = Vec::new();
-        if let Some(b) = sig.ubo_binding {
+        // One UNIFORM_BUFFER per distinct UBO binding (ABI 0.14 multi-UBO).
+        for &b in &sig.ubo_bindings[..sig.ubo_count as usize] {
             bindings.push(
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(b)
@@ -3490,7 +3504,7 @@ impl HostGpu {
     /// (image@`image_binding`, sampler@`image_binding + 1`). Frees partials on any error.
     fn build_frame_descriptors(
         &self,
-        uniform: Option<&UniformBlock>,
+        uniforms: &[UniformBlock],
         storage: Option<&StorageBlock>,
         textures: &[Texture],
         tex_base: u32,
@@ -3498,7 +3512,7 @@ impl HostGpu {
     ) -> R<FrameDescriptors> {
         let dev = &self.device;
         // Reject a degenerate/oversized UBO before allocating anything (mirrors the device decode cap).
-        if let Some(u) = uniform {
+        for u in uniforms {
             if u.bytes.is_empty() || u.bytes.len() > 65536 {
                 return Err(format!("bad uniform block ({} bytes)", u.bytes.len()).into());
             }
@@ -3513,18 +3527,21 @@ impl HostGpu {
             return Err(format!("too many textures ({} > {MAX_TEXTURES})", textures.len()).into());
         }
         let mut pool = vk::DescriptorPool::null();
-        let mut ubo_buf = vk::Buffer::null();
-        let mut ubo_mem = vk::DeviceMemory::null();
+        // Track every UBO buffer/memory in Vecs (ABI 0.14 multi-UBO) so the outer error path frees them
+        // all; on success FrameDescriptors owns the equivalent UniformGpu Vec (handles are Copy, so the
+        // tracking Vecs just drop without a double-free).
+        let mut ubo_bufs: Vec<vk::Buffer> = Vec::new();
+        let mut ubo_mems: Vec<vk::DeviceMemory> = Vec::new();
         let mut ssbo_buf = vk::Buffer::null();
         let mut ssbo_mem = vk::DeviceMemory::null();
         let mut build = || -> R<FrameDescriptors> {
             unsafe {
                 let mut sizes: Vec<vk::DescriptorPoolSize> = Vec::new();
-                if uniform.is_some() {
+                if !uniforms.is_empty() {
                     sizes.push(
                         vk::DescriptorPoolSize::default()
                             .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                            .descriptor_count(1),
+                            .descriptor_count(uniforms.len() as u32),
                     );
                 }
                 if storage.is_some() {
@@ -3555,17 +3572,23 @@ impl HostGpu {
                     &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts),
                 )?[0];
 
-                // UBO first (nothing after it can fail before the texture, which self-cleans on error).
-                let ubo = if let Some(u) = uniform {
-                    ubo_buf = dev.create_buffer(
+                // UBOs first: one host-visible|coherent UNIFORM_BUFFER per binding (ABI 0.14 multi-UBO —
+                // zink's fixed-function VS reads an MVP@0 while the FS reads a colour@4). Each is tracked
+                // in ubo_bufs/ubo_mems the instant it is created (before the next fallible call) so the
+                // outer error path frees a partial. Nothing after this can fail before the texture, which
+                // self-cleans on error.
+                let mut ubos: Vec<UniformGpu> = Vec::with_capacity(uniforms.len());
+                for u in uniforms {
+                    let buf = dev.create_buffer(
                         &vk::BufferCreateInfo::default()
                             .size(u.bytes.len() as u64)
                             .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
                             .sharing_mode(vk::SharingMode::EXCLUSIVE),
                         None,
                     )?;
-                    let req = dev.get_buffer_memory_requirements(ubo_buf);
-                    ubo_mem = dev.allocate_memory(
+                    ubo_bufs.push(buf);
+                    let req = dev.get_buffer_memory_requirements(buf);
+                    let mem = dev.allocate_memory(
                         &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(
                             self.find_mem(
                                 req.memory_type_bits,
@@ -3574,12 +3597,13 @@ impl HostGpu {
                         ),
                         None,
                     )?;
-                    dev.bind_buffer_memory(ubo_buf, ubo_mem, 0)?;
-                    let ptr = dev.map_memory(ubo_mem, 0, u.bytes.len() as u64, vk::MemoryMapFlags::empty())?;
+                    ubo_mems.push(mem);
+                    dev.bind_buffer_memory(buf, mem, 0)?;
+                    let ptr = dev.map_memory(mem, 0, u.bytes.len() as u64, vk::MemoryMapFlags::empty())?;
                     std::ptr::copy_nonoverlapping(u.bytes.as_ptr(), ptr as *mut u8, u.bytes.len());
-                    dev.unmap_memory(ubo_mem);
+                    dev.unmap_memory(mem);
                     let binfo = [vk::DescriptorBufferInfo::default()
-                        .buffer(ubo_buf)
+                        .buffer(buf)
                         .offset(0)
                         .range(u.bytes.len() as u64)];
                     let writes = [vk::WriteDescriptorSet::default()
@@ -3588,10 +3612,8 @@ impl HostGpu {
                         .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                         .buffer_info(&binfo)];
                     dev.update_descriptor_sets(&writes, &[]);
-                    Some(UniformGpu { buffer: ubo_buf, mem: ubo_mem })
-                } else {
-                    None
-                };
+                    ubos.push(UniformGpu { buffer: buf, mem });
+                }
 
                 // SSBO next — identical to the UBO block but STORAGE_BUFFER, read-only, bound at offset 0
                 // (sidesteps minStorageBufferOffsetAlignment). No barrier: host-coherent + read-only.
@@ -3664,16 +3686,16 @@ impl HostGpu {
                     }
                 }
 
-                Ok(FrameDescriptors { pool, set, ubo, ssbo, tex: tgpu })
+                Ok(FrameDescriptors { pool, set, ubos, ssbo, tex: tgpu })
             }
         };
         build().map_err(|e| {
             unsafe {
-                if ubo_buf != vk::Buffer::null() {
-                    dev.destroy_buffer(ubo_buf, None);
+                for b in &ubo_bufs {
+                    dev.destroy_buffer(*b, None);
                 }
-                if ubo_mem != vk::DeviceMemory::null() {
-                    dev.free_memory(ubo_mem, None);
+                for m in &ubo_mems {
+                    dev.free_memory(*m, None);
                 }
                 if ssbo_buf != vk::Buffer::null() {
                     dev.destroy_buffer(ssbo_buf, None);
@@ -5104,7 +5126,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 push_constants: &[],
                 textures: &[],
                 tex_binding: 0,
-                uniform: None,
+                uniforms: vec![],
                 storage: None,
                 raster_flags: 0,
             }),
@@ -5223,7 +5245,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 push_constants: &[],
                 textures: &[],
                 tex_binding: 0,
-                uniform: None,
+                uniforms: vec![],
                 storage: None,
                 raster_flags: 0,
             }),
@@ -5314,7 +5336,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     push_constants: &[],
                     textures: &[],
                     tex_binding: 0,
-                    uniform: None,
+                    uniforms: vec![],
                     storage: None,
                     raster_flags: 0,
                 }),
@@ -5429,7 +5451,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     push_constants: m,
                     textures: &[],
                     tex_binding: 0,
-                    uniform: None,
+                    uniforms: vec![],
                     storage: None,
                     raster_flags: 0,
                 }),
@@ -5535,7 +5557,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     sampler: SamplerCfg { linear: false, repeat: false },
                 }],
                 tex_binding: 0,
-                uniform: None,
+                uniforms: vec![],
                 storage: None,
                 raster_flags: 0,
             }),
@@ -5665,7 +5687,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     push_constants: &[],
                     textures: &textures,
                     tex_binding: 0,
-                    uniform: None,
+                    uniforms: vec![],
                     storage: None,
                     raster_flags: 0,
                 }),
@@ -5764,7 +5786,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     push_constants: &[],
                     textures: &[],
                     tex_binding: 0,
-                    uniform: Some(UniformBlock { binding: 0, bytes: &ubo }),
+                    uniforms: vec![UniformBlock { binding: 0, bytes: &ubo }],
                     storage: None,
                     raster_flags: 0,
                 }),
@@ -5850,7 +5872,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     push_constants: &[],
                     textures: &[],
                     tex_binding: 0,
-                    uniform: None,
+                    uniforms: vec![],
                     storage: Some(StorageBlock { binding: 0, bytes: &ssbo }),
                     raster_flags: 0,
                 }),
@@ -5939,7 +5961,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     push_constants: &[],
                     textures: &[],
                     tex_binding: 0,
-                    uniform: Some(UniformBlock { binding: 0, bytes: &ubo }),
+                    uniforms: vec![UniformBlock { binding: 0, bytes: &ubo }],
                     storage: Some(StorageBlock { binding: 1, bytes: &ssbo }),
                     raster_flags: 0,
                 }),
@@ -6046,7 +6068,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                         sampler: SamplerCfg { linear: false, repeat: false },
                     }],
                     tex_binding: 1, // image@1, sampler@2 — composes with the UBO@0
-                    uniform: Some(UniformBlock { binding: 0, bytes: &ubo }),
+                    uniforms: vec![UniformBlock { binding: 0, bytes: &ubo }],
                     storage: None,
                     raster_flags: 0,
                 }),
@@ -6146,7 +6168,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     push_constants: &[],
                     textures: &[],
                     tex_binding: 0,
-                    uniform: None,
+                    uniforms: vec![],
                     storage: None,
                     raster_flags: rf,
                 }),
@@ -6220,7 +6242,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                     push_constants: &[],
                     textures: &[],
                     tex_binding: 0,
-                    uniform: None,
+                    uniforms: vec![],
                     storage: None,
                     raster_flags: rf,
                 }),
@@ -6312,7 +6334,7 @@ fn main(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
                 push_constants: &[],
                 textures: &textures,
                 tex_binding: 0, // t0 @0/s0 @1, t1 @2/s1 @3
-                uniform: None,
+                uniforms: vec![],
                 storage: None,
                 raster_flags: 0,
             }),

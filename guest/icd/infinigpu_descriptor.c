@@ -193,10 +193,7 @@ infinigpu_AllocateDescriptorSets(VkDevice _device,
       }
       set->pool = pool;
       set->texture_count = 0;
-      set->ubo_buffer = NULL;
-      set->ubo_offset = 0;
-      set->ubo_range = 0;
-      set->ubo_binding = 0;
+      set->ubo_count = 0;
       set->ssbo_buffer = NULL;
       set->ssbo_offset = 0;
       set->ssbo_range = 0;
@@ -238,6 +235,25 @@ infinigpu_tex_slot(struct infinigpu_descriptor_set *set, uint32_t binding)
    t->sampler = NULL;
    t->binding = binding;
    return t;
+}
+
+/* Find the UBO slot for `binding`, creating it if absent. Returns NULL only when the set already holds
+ * INFINIGPU_MAX_SET_UBOS distinct UBO bindings (fail-safe drop). Keyed by binding so re-writing the same
+ * binding updates in place and distinct bindings (MVP@0, colour@4) each keep their own slot. */
+static struct infinigpu_desc_ubo *
+infinigpu_ubo_slot(struct infinigpu_descriptor_set *set, uint32_t binding)
+{
+   for (uint32_t i = 0; i < set->ubo_count; i++)
+      if (set->ubos[i].binding == binding)
+         return &set->ubos[i];
+   if (set->ubo_count >= INFINIGPU_MAX_SET_UBOS)
+      return NULL;
+   struct infinigpu_desc_ubo *u = &set->ubos[set->ubo_count++];
+   u->buffer = NULL;
+   u->offset = 0;
+   u->range = 0;
+   u->binding = binding;
+   return u;
 }
 
 /* Capture ONE descriptor's resource into the set, keyed by binding number so the host can build a
@@ -282,13 +298,16 @@ infinigpu_apply_descriptor(struct infinigpu_descriptor_set *set, VkDescriptorTyp
       break;
    }
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-      /* A UBO (per-frame matrices etc.). Non-dynamic only — dynamic offsets from
-       * CmdBindDescriptorSets are unsupported this iteration. */
+      /* A UBO (per-frame matrices, a material/colour block, etc.). Keyed by binding so a set with
+       * several (zink binds an MVP@0 for the VS + a colour@4 for the FS) keeps them all. Non-dynamic
+       * only — dynamic offsets from CmdBindDescriptorSets are unsupported this iteration. */
       if (buf && buf->buffer) {
-         set->ubo_buffer = infinigpu_buffer_from_handle(buf->buffer);
-         set->ubo_offset = buf->offset;
-         set->ubo_range = buf->range;
-         set->ubo_binding = dstBinding;
+         struct infinigpu_desc_ubo *u = infinigpu_ubo_slot(set, dstBinding);
+         if (u) {
+            u->buffer = infinigpu_buffer_from_handle(buf->buffer);
+            u->offset = buf->offset;
+            u->range = buf->range;
+         }
       }
       break;
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:

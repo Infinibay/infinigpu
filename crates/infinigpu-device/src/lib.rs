@@ -322,8 +322,9 @@ pub struct OwnedGeometry {
     pub textures: Vec<OwnedTexture>,
     /// Phase-2c base binding of texture 0's sampled image (sampler at `+1`); `0` ⇒ image@0/sampler@1.
     pub tex_binding: u32,
-    /// Phase-2c uniform buffer (binding + bytes); `None` ⇒ no UBO. Composes with `texture`.
-    pub uniform: Option<OwnedUniform>,
+    /// Phase-2c uniform buffers (each binding + bytes); empty ⇒ no UBOs. ABI 0.14 carries SEVERAL (an
+    /// MVP@0 for the VS + a colour@4 for the FS is zink's fixed-function minimum). Composes with `textures`.
+    pub uniforms: Vec<OwnedUniform>,
     /// Phase-2c read-only storage buffer (binding + bytes); `None` ⇒ no SSBO. Composes with the UBO +
     /// textures in the same set. Never written back.
     pub storage: Option<OwnedStorage>,
@@ -392,10 +393,11 @@ impl OwnedForwardedDraw {
                 push_constants: &g.push_constants,
                 textures,
                 tex_binding: g.tex_binding,
-                uniform: g.uniform.as_ref().map(|u| UniformBlock {
-                    binding: u.binding,
-                    bytes: &u.bytes,
-                }),
+                uniforms: g
+                    .uniforms
+                    .iter()
+                    .map(|u| UniformBlock { binding: u.binding, bytes: &u.bytes })
+                    .collect(),
                 storage: g.storage.as_ref().map(|s| StorageBlock {
                     binding: s.binding,
                     bytes: &s.bytes,
@@ -517,7 +519,7 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
     let pc_len = tail.push_const_len as usize;
     let tex_count = tail.tex_count as usize;
     let ubo_len = tail.ubo_len as usize;
-    let ubo_binding = tail.ubo_binding;
+    let ubo_count = tail.ubo_count as usize;
     let ssbo_len = tail.ssbo_len as usize;
     let ssbo_binding = tail.ssbo_binding;
     let tex_binding = tail.tex_binding;
@@ -546,8 +548,10 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         // Bound tex_binding like every other field so the host's `tex_binding + 2i` layout arithmetic
         // can't overflow (real descriptor bindings are tiny; 65535 is astronomically above any).
         || tex_binding > 65535
-        || ubo_binding > 65535
-        || ubo_len > 65536
+        // ABI 0.14: the UBO block is `ubo_count` self-describing records; bound the COUNT (each record's
+        // binding + per-record 64 KiB len are validated as the block is parsed below). `ubo_len` is the
+        // total block bytes — its upper bound is the payload-total check, no separate scalar cap needed.
+        || ubo_count > 16
         // The SSBO's guaranteed range (`maxStorageBufferRange` ≥ 128 MiB) is far above the UBO's, so it
         // gets a much larger cap (`MAX_SSBO_BYTES`); `ssbo_len == 0` is valid (no SSBO). Bound its binding
         // like the others. `ssbo_len` is separately bounded ≤ `max_bytes` by the payload-total check below.
@@ -562,12 +566,10 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
     let in_tex_range = |b: u32| {
         tex_count > 0 && b >= tex_binding && b < tex_binding.saturating_add(2 * tex_count as u32)
     };
-    if ubo_len > 0 && in_tex_range(ubo_binding) {
-        return None;
-    }
-    if ssbo_len > 0
-        && (in_tex_range(ssbo_binding) || (ubo_len > 0 && ssbo_binding == ubo_binding))
-    {
+    // Per-UBO binding collisions (vs the texture range, vs each other, vs the SSBO) are checked as the
+    // self-describing UBO block is parsed below (each record carries its own binding now). Here we only
+    // reject an SSBO that lands in the texture range.
+    if ssbo_len > 0 && in_tex_range(ssbo_binding) {
         return None;
     }
     // A mesh carries a vertex buffer: a real stride, and vertex bytes that are a whole number of
@@ -724,13 +726,31 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
         out
     };
 
-    // Phase-2c: the uniform buffer, if any (`ubo_len == 0` ⇒ none). `ubo_b` was carved as a fixed-length
-    // blob (bounds already enforced by the total-vs-payload check above), so this is a pure copy.
-    let uniform = if ubo_len > 0 {
-        Some(OwnedUniform { binding: ubo_binding, bytes: ubo_b.to_vec() })
-    } else {
-        None
-    };
+    // Phase-2c multi-UBO (ABI 0.14): `ubo_b` is `ubo_count` self-describing records, each an 8-byte
+    // header `[binding: u32][len: u32]` (native-endian, matching the guest's `memcpy` of two u32s and
+    // the SPIR-V word decode above) followed by `len` bytes. Walk it, validating each record stays
+    // inside the block and each binding is distinct + doesn't collide with the texture range or the
+    // SSBO — fail-closed on any overrun/collision so a hostile guest can't over-read or mis-bind.
+    let mut uniforms: Vec<OwnedUniform> = Vec::with_capacity(ubo_count);
+    let mut ub = ubo_b;
+    for _ in 0..ubo_count {
+        let hdr = ub.get(..8)?;
+        let binding = u32::from_ne_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        let len = u32::from_ne_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+        ub = &ub[8..];
+        if binding > 65535
+            || len > 65536
+            || len > ub.len()
+            || in_tex_range(binding)
+            || (ssbo_len > 0 && binding == ssbo_binding)
+            || uniforms.iter().any(|u| u.binding == binding)
+        {
+            return None;
+        }
+        let (bytes, next) = ub.split_at(len);
+        ub = next;
+        uniforms.push(OwnedUniform { binding, bytes: bytes.to_vec() });
+    }
 
     // Phase-2c SSBO: the read-only storage buffer, if any (`ssbo_len == 0` ⇒ none). `ssbo_b` was carved
     // as a fixed-length blob (bounds already enforced above), so this is a pure copy.
@@ -758,7 +778,7 @@ pub fn decode_forwarded_cmdlist(payload: &[u8], max_bytes: usize) -> Option<Owne
             push_constants: pc_b.to_vec(),
             textures,
             tex_binding,
-            uniform,
+            uniforms,
             storage,
             raster_flags: tail.raster_flags,
         }),
@@ -3717,8 +3737,10 @@ mod tests {
             depth_flags,
             push_const_len: push_const.len() as u32,
             tex_count: texs.len() as u32,
-            ubo_len: ubo.len() as u32,
-            ubo_binding,
+            // ABI 0.14: the UBO block is self-describing. This test helper carries a single UBO, so the
+            // block is one [binding][len][bytes] record (empty ⇒ no UBOs).
+            ubo_len: if ubo.is_empty() { 0 } else { (8 + ubo.len()) as u32 },
+            ubo_count: if ubo.is_empty() { 0 } else { 1 },
             tex_binding,
             raster_flags,
             ssbo_len: ssbo.len() as u32,
@@ -3743,7 +3765,11 @@ mod tests {
         p.extend_from_slice(ve);
         p.extend_from_slice(fe);
         p.extend_from_slice(push_const);
-        p.extend_from_slice(ubo);
+        if !ubo.is_empty() {
+            p.extend_from_slice(&ubo_binding.to_ne_bytes());
+            p.extend_from_slice(&(ubo.len() as u32).to_ne_bytes());
+            p.extend_from_slice(ubo);
+        }
         p.extend_from_slice(ssbo);
         p.extend_from_slice(texpix);
         p
@@ -3827,7 +3853,8 @@ mod tests {
         assert_eq!(t.rgba, texpix, "texture pixels round-trip");
         assert!(t.linear && t.repeat, "sampler flags round-trip");
         assert_eq!(g.tex_binding, 1, "tex_binding round-trips (image@1 / sampler@2)");
-        let u = g.uniform.expect("ubo bytes decode to a uniform");
+        assert_eq!(g.uniforms.len(), 1, "one UBO decodes");
+        let u = &g.uniforms[0];
         assert_eq!(u.binding, 0, "ubo binding round-trips");
         assert_eq!(u.bytes, ubo, "ubo bytes round-trip (after push-const, before texpix)");
         let s = g.storage.expect("ssbo bytes decode to a storage buffer");
@@ -3846,13 +3873,18 @@ mod tests {
         let mut no_draws = payload.clone();
         no_draws[40 + 36..40 + 40].copy_from_slice(&0u32.to_le_bytes());
         assert!(decode_forwarded_cmdlist(&no_draws, CAP).is_none(), "zero draw_count rejected");
-        // ubo_len (tail @ offset 56) beyond the 64 KiB cap → rejected before any allocation.
+        // ubo_len (tail @ offset 56, ABI 0.14 = the total self-describing block bytes) inflated past the
+        // real block → the block would run off the payload → rejected by the total-vs-payload check.
         let mut big_ubo = payload.clone();
         big_ubo[40 + 56..40 + 60].copy_from_slice(&65537u32.to_le_bytes());
-        assert!(decode_forwarded_cmdlist(&big_ubo, CAP).is_none(), "oversized ubo_len rejected");
-        // ubo_binding (tail @ offset 60) overlapping the texture range [tex_binding .. +2) → rejected.
-        let mut overlap = payload.clone();
-        overlap[40 + 60..40 + 64].copy_from_slice(&1u32.to_le_bytes()); // 1 collides with image@1
+        assert!(decode_forwarded_cmdlist(&big_ubo, CAP).is_none(), "inflated ubo_len rejected");
+        // A UBO whose record binding overlaps the texture range [tex_binding .. +2) → rejected. Rebuild
+        // with ubo_binding=1 (collides with image@1); the collision is now checked per-record.
+        let overlap = encode_forwarded_cmdlist(
+            32, 16, [0.1, 0.2, 0.3, 1.0], 0, &vspirv, &fspirv, c"vs", c"fs", 20, &attrs, &vdata,
+            &idata, false, 1, df, &[0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4], &draws, &texs, &texpix,
+            &ubo, 1, 1, rf, &ssbo, 3,
+        );
         assert!(decode_forwarded_cmdlist(&overlap, CAP).is_none(), "ubo/texture binding overlap rejected");
         // A texture whose data_len doesn't match width*height*4 is rejected. The single texdesc's
         // data_len is its 3rd u32; the texdescs sit after VulkanWorkload(40) + tail(80) + attrs + draws.

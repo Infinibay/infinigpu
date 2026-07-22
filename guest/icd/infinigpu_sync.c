@@ -484,28 +484,32 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       }
    }
 
-   /* Phase-2c uniform buffer: if a UBO is bound in the (single) descriptor set, forward its bytes so
-    * the host binds them for the shader's var<uniform> block. buf->map already includes the
+   /* Phase-2c multi-UBO (ABI 0.14): forward EVERY uniform buffer bound in the set, each with its own
+    * binding, so the host binds an MVP@0 for the VS AND a colour@4 for the FS — zink's fixed-function
+    * path binds >=2 and dropping any collapses gl_Position. buf->map already includes the
     * BindBufferMemory bind offset, so add ONLY the write offset (never double-count). */
-   const uint8_t *ubo = NULL;
-   uint32_t ubo_len = 0;
-   uint32_t ubo_binding = 0;
+   struct ForwardedUbo ubos[INFINIGPU_MAX_SET_UBOS];
+   uint32_t ubo_count = 0;
+   size_t ubo_total_bytes = 0;
    if (ds) {
-      if (ds->ubo_buffer && ds->ubo_buffer->map && ds->ubo_offset < ds->ubo_buffer->total_size) {
-         /* Clamp to the bytes actually in the buffer past the write offset, exactly like the vertex
-          * (vavail) and index (iavail) paths above. A non-conformant app can bind an explicit
-          * VkDescriptorBufferInfo.range that overruns the buffer (offset+range > total_size); without
-          * this clamp the encoder would memcpy past the mapped region — an OOB read of the guest's own
-          * memory. VK_WHOLE_SIZE is already exactly the available bytes. */
-         uint64_t uavail = ds->ubo_buffer->total_size - ds->ubo_offset;
-         uint64_t range = (ds->ubo_range == VK_WHOLE_SIZE) ? uavail : ds->ubo_range;
+      for (uint32_t i = 0; i < ds->ubo_count; i++) {
+         const struct infinigpu_desc_ubo *du = &ds->ubos[i];
+         if (!du->buffer || !du->buffer->map || du->offset >= du->buffer->total_size)
+            continue;
+         /* Clamp the range to the bytes actually mapped past the write offset (a non-conformant app can
+          * bind an explicit range that overruns the buffer → an OOB read of the guest's own memory).
+          * VK_WHOLE_SIZE is already exactly the available bytes. */
+         uint64_t uavail = du->buffer->total_size - du->offset;
+         uint64_t range = (du->range == VK_WHOLE_SIZE) ? uavail : du->range;
          if (range > uavail)
             range = uavail;
-         if (range > 0 && range <= 65536) {
-            ubo = (const uint8_t *)ds->ubo_buffer->map + ds->ubo_offset;
-            ubo_len = (uint32_t)range;
-            ubo_binding = ds->ubo_binding;
-         }
+         if (range == 0 || range > 65536)
+            continue;
+         ubos[ubo_count].data = (const uint8_t *)du->buffer->map + du->offset;
+         ubos[ubo_count].len = (uint32_t)range;
+         ubos[ubo_count].binding = du->binding;
+         ubo_count++;
+         ubo_total_bytes += 8u + (size_t)range;  /* wire record = [binding u32][len u32] + bytes */
       }
    }
 
@@ -534,7 +538,7 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
                       (size_t)p->attr_count * sizeof(struct VertexAttrWire) +
                       (size_t)cmd->draw_count * sizeof(struct DrawCmdWire) +
                       (size_t)tex_count * sizeof(struct TextureDescWire) +
-                      vlen + ilen + cmd->push_const_len + ubo_len + ssbo_len + texpix_len;
+                      vlen + ilen + cmd->push_const_len + ubo_total_bytes + ssbo_len + texpix_len;
    uint8_t *payload = malloc(cap);
    if (!payload) {
       free(draws);
@@ -570,7 +574,7 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       vdata, vlen, idata, ilen, cmd->index_type,
       topo_final, depth_flags,
       cmd->push_const, cmd->push_const_len,
-      ubo, ubo_len, ubo_binding,
+      ubos, ubo_count,
       ssbo, ssbo_len, ssbo_binding,
       draws, cmd->draw_count,
       tex_count ? texs : NULL, tex_count, tex_binding, texpix, texpix_len,
@@ -632,7 +636,7 @@ infinigpu_replay_cmd_buffer(struct infinigpu_device *dev,
        * gl_VertexIndex (vkcube), which the Phase-1 bufferless path can't carry (it forwards no UBO).
        * Only a pipeline with neither a vertex buffer nor a UBO falls to the Phase-1 SM-generated path. */
       const bool has_vbuf = (p->vertex_stride > 0 && cmd->vbuf);
-      const bool has_ubo = cmd->bound_desc_set && cmd->bound_desc_set->ubo_buffer;
+      const bool has_ubo = cmd->bound_desc_set && cmd->bound_desc_set->ubo_count > 0;
       if (has_vbuf || has_ubo) {
          VkResult r = infinigpu_replay_cmdlist(dev, cmd, p, vs, fs, img);
          if (r != VK_SUCCESS)

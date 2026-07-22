@@ -125,6 +125,17 @@ size_t infinigpu_encode_forwarded(uint8_t *out, size_t cap,
  * degenerate). The caller wraps the result in a SUBMIT_CMD (encoding VULKAN_VENUSLIKE), the same as
  * the bufferless encoder.
  */
+/* One uniform buffer to forward (encoder INPUT, not a wire struct): the host-mapped bytes, their
+ * length, and the descriptor-set-0 binding the shader reads them at. The encoder packs `ubo_count` of
+ * these into the self-describing UBO block (each record `[binding][len][bytes]`); see the tail's
+ * `ubo_len`/`ubo_count` docs. Lets a draw carry several uniform blocks (MVP at one binding, material
+ * at another) instead of the old single-UBO slot. */
+struct ForwardedUbo {
+    const uint8_t *data;
+    uint32_t len;
+    uint32_t binding;
+};
+
 size_t infinigpu_encode_forwarded_cmdlist(
     uint8_t *out, size_t cap,
     uint32_t width, uint32_t height, const float bg[4], uint64_t scanout_addr,
@@ -137,7 +148,7 @@ size_t infinigpu_encode_forwarded_cmdlist(
     const uint8_t *index_data, uint32_t index_data_len, uint32_t index_type,
     uint32_t topology, uint32_t depth_flags,
     const uint8_t *push_const, uint32_t push_const_len,
-    const uint8_t *ubo, uint32_t ubo_len, uint32_t ubo_binding,
+    const struct ForwardedUbo *ubos, uint32_t ubo_count,
     const uint8_t *ssbo, uint32_t ssbo_len, uint32_t ssbo_binding,
     const struct DrawCmdWire *draws, uint32_t draw_count,
     const struct TextureDescWire *texs, uint32_t tex_count, uint32_t tex_binding,
