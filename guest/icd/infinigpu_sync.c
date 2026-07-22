@@ -252,6 +252,61 @@ infinigpu_run_clear(struct infinigpu_image *img, const VkClearColorValue *col,
    }
 }
 
+/* Forward an encoded draw payload to the host so the A5000 renders it into `img`'s pixels.
+ *
+ * The SUBMIT_FORWARDED uAPI DMA-writes the rendered RGBA8 to the target BO's BASE (the KMD patches
+ * scanout_addr = the gem's dma_addr; there is NO sub-BO offset field). But zink sub-allocates: it
+ * binds a colour image at img->mem_offset INSIDE a shared VkDeviceMemory whose base holds OTHER
+ * resources. Rendering to the base would (a) land the pixels where the image ISN'T — the readback
+ * then reads base+mem_offset and sees all zeros (the observed "black render"), and (b) clobber the
+ * neighbour resource sitting at offset 0. So when the image is sub-allocated, render into a PRIVATE
+ * scratch BO (offset 0) and CPU-blit the tightly-packed result into the image's real, row_pitch-
+ * strided rows. A dedicated allocation (mem_offset == 0) keeps the direct, zero-copy path — and is
+ * exactly the case the coherency regression test exercises, so that path is unchanged.
+ *
+ * TODO(perf): add a bo_offset field to drm_infinigpu_submit_forwarded so the KMD can patch
+ * scanout_addr = dma_addr + mem_offset and the host writes straight to base+mem_offset — dropping the
+ * scratch BO + per-draw blit. That is a uAPI+KMD change (needs a guest module reload/reboot). */
+static VkResult
+infinigpu_forward_to_image(struct infinigpu_device *dev, struct infinigpu_image *img,
+                           uint32_t width, uint32_t height, const uint8_t *payload, uint32_t n)
+{
+   const int drm_fd = dev->physical_device->drm_fd;
+
+   if (img->mem_offset == 0) {
+      const int ret = infinigpu_submit_forwarded(drm_fd, img->mem->gem_handle, width, height,
+                                                 payload, n);
+      if (ret != 0)
+         return vk_errorf(dev, VK_ERROR_DEVICE_LOST, "SUBMIT_FORWARDED failed (%d)", ret);
+      return VK_SUCCESS;
+   }
+
+   const uint64_t fb_bytes = (uint64_t)width * height * 4u;
+   uint32_t sh = 0;
+   uint64_t ssz = 0;
+   if (infinigpu_dumb_alloc(drm_fd, fb_bytes, &sh, &ssz) != 0)
+      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "scratch render BO alloc failed");
+   void *smap = infinigpu_dumb_map(drm_fd, sh, ssz);
+
+   IGPU_TRACE("forward: scratch gem=%u (image gem=%u off=%llu) %ux%u", sh, img->mem->gem_handle,
+              (unsigned long long)img->mem_offset, width, height);
+   const int ret = infinigpu_submit_forwarded(drm_fd, sh, width, height, payload, n);
+   if (ret == 0 && smap) {
+      const char *src = (const char *)smap;                 /* tightly packed: width*4 per row */
+      char *dst = (char *)img->mem->map + img->mem_offset;  /* image: row_pitch per row */
+      const size_t rb = (size_t)width * 4u;
+      for (uint32_t y = 0; y < height; y++)
+         memcpy(dst + (uint64_t)y * img->row_pitch, src + (uint64_t)y * rb, rb);
+   }
+   if (smap)
+      infinigpu_dumb_unmap(smap, ssz);
+   infinigpu_gem_close(drm_fd, sh);
+
+   if (ret != 0)
+      return vk_errorf(dev, VK_ERROR_DEVICE_LOST, "SUBMIT_FORWARDED failed (%d)", ret);
+   return VK_SUCCESS;
+}
+
 /* Phase-2b/2c: forward a real mesh (bound vertex/index buffers + multi-draw) via the command-list
  * encoder. The bound pipeline captured a non-zero vertex stride, so the app reads a vertex buffer;
  * we read its host-mapped bytes (whole vertices from the bound offset to the buffer end), build the
@@ -263,7 +318,6 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
                          const struct infinigpu_pipeline_stage *fs,
                          struct infinigpu_image *img)
 {
-   int drm_fd = dev->physical_device->drm_fd;
    const uint32_t width = img->vk.extent.width;
    const uint32_t height = img->vk.extent.height;
    float bg[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -528,15 +582,12 @@ infinigpu_replay_cmdlist(struct infinigpu_device *dev, struct infinigpu_cmd_buff
       return vk_errorf(dev, VK_ERROR_UNKNOWN, "cmdlist payload did not fit");
    }
 
-   IGPU_TRACE("cmdlist: encoded payload=%zuB vlen=%u ilen=%u -> SUBMIT_FORWARDED gem=%u %ux%u",
-              n, vlen, ilen, img->mem->gem_handle, width, height);
-   const int ret = infinigpu_submit_forwarded(drm_fd, img->mem->gem_handle,
-                                               width, height, payload, (uint32_t)n);
+   IGPU_TRACE("cmdlist: encoded payload=%zuB vlen=%u ilen=%u -> forward gem=%u off=%llu %ux%u",
+              n, vlen, ilen, img->mem->gem_handle, (unsigned long long)img->mem_offset, width, height);
+   VkResult fr = infinigpu_forward_to_image(dev, img, width, height, payload, (uint32_t)n);
    free(payload);
-   IGPU_TRACE("cmdlist: SUBMIT_FORWARDED ret=%d", ret);
-   if (ret != 0)
-      return vk_errorf(dev, VK_ERROR_DEVICE_LOST, "SUBMIT_FORWARDED failed (%d)", ret);
-   return VK_SUCCESS;
+   IGPU_TRACE("cmdlist: forward ret=%d", (int)fr);
+   return fr;
 }
 
 /* Forward one command buffer's recorded draw to the host, then run its deferred
@@ -545,8 +596,6 @@ static VkResult
 infinigpu_replay_cmd_buffer(struct infinigpu_device *dev,
                             struct infinigpu_cmd_buffer *cmd)
 {
-   int drm_fd = dev->physical_device->drm_fd;
-
    IGPU_TRACE("submit cmdbuf: draws=%u clear=%d color_att=%p pipeline=%p uploads=%u copies=%u",
               cmd->draw_count, cmd->has_clear, (void *)cmd->color_att,
               (void *)cmd->bound_pipeline, cmd->upload_count, cmd->copy_count);
@@ -617,12 +666,10 @@ infinigpu_replay_cmd_buffer(struct infinigpu_device *dev,
             return vk_errorf(dev, VK_ERROR_UNKNOWN, "forwarded payload did not fit");
          }
 
-         const int ret = infinigpu_submit_forwarded(drm_fd, img->mem->gem_handle,
-                                                     width, height, payload, (uint32_t)n);
+         VkResult fr = infinigpu_forward_to_image(dev, img, width, height, payload, (uint32_t)n);
          free(payload);
-         if (ret != 0)
-            return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
-                             "SUBMIT_FORWARDED failed (%d)", ret);
+         if (fr != VK_SUCCESS)
+            return fr;
       }
    } else if (cmd->has_clear && cmd->color_att && cmd->color_att->image) {
       /* Draw-less clear (glClear + readback): no forwarded submit runs, so realise the
