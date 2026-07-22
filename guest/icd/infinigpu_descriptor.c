@@ -18,8 +18,10 @@
 #include "infinigpu_private.h"
 
 #include "vk_alloc.h"
+#include "vk_descriptor_update_template.h"
 #include "vk_log.h"
 #include "vk_object.h"
+#include "vk_util.h"
 
 /* ------------------------------------------------------------ descriptor set layout */
 
@@ -51,6 +53,35 @@ infinigpu_DestroyDescriptorSetLayout(VkDevice _device, VkDescriptorSetLayout _la
    if (!layout)
       return;
    vk_descriptor_set_layout_unref(&dev->vk, layout);
+}
+
+/* Core Vulkan 1.1.  zink calls this UNCHECKED when it builds a set layout for a
+ * shader's resources at first draw — leaving it NULL is a jump-to-0 SIGSEGV on
+ * the zink thread.  We back layouts with runtime bookkeeping only (types come
+ * from the writes, our per-stage limits are all 1024), so every layout zink can
+ * describe is supported; just report that and echo any variable-count request. */
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_GetDescriptorSetLayoutSupport(VkDevice _device,
+                                        const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                                        VkDescriptorSetLayoutSupport *pSupport)
+{
+   const VkDescriptorSetLayoutBindingFlagsCreateInfo *variable_flags =
+      vk_find_struct_const(pCreateInfo->pNext,
+                           DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
+   VkDescriptorSetVariableDescriptorCountLayoutSupport *variable_count =
+      vk_find_struct(pSupport->pNext,
+                     DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT);
+   if (variable_count) {
+      variable_count->maxVariableDescriptorCount = 0;
+      if (variable_flags) {
+         for (unsigned i = 0; i < variable_flags->bindingCount; i++) {
+            if (variable_flags->pBindingFlags[i] &
+                VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)
+               variable_count->maxVariableDescriptorCount = 1024;
+         }
+      }
+   }
+   pSupport->supported = VK_TRUE;
 }
 
 /* ------------------------------------------------------------ sampler */
@@ -209,80 +240,116 @@ infinigpu_tex_slot(struct infinigpu_descriptor_set *set, uint32_t binding)
    return t;
 }
 
+/* Capture ONE descriptor's resource into the set, keyed by binding number so the host can build a
+ * layout that places it where the shader declares it. Shared by the plain-write path
+ * (vkUpdateDescriptorSets) and the template path (vkUpdateDescriptorSetWithTemplate): `img` and
+ * `buf` point at the source VkDescriptorImageInfo / VkDescriptorBufferInfo — only the one matching
+ * `type` is read. A separate SAMPLER at `b+1` pairs with the image at `b` (host layout image@b,
+ * sampler@b+1). Single-resource capture; array elements collapse onto the binding (last wins). */
+static void
+infinigpu_apply_descriptor(struct infinigpu_descriptor_set *set, VkDescriptorType type,
+                           uint32_t dstBinding, const VkDescriptorImageInfo *img,
+                           const VkDescriptorBufferInfo *buf)
+{
+   switch (type) {
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
+      if (!img)
+         break;
+      struct infinigpu_desc_texture *t = infinigpu_tex_slot(set, dstBinding);
+      if (!t)
+         break;
+      if (img->imageView)
+         t->image = infinigpu_image_view_from_handle(img->imageView);
+      if (img->sampler)
+         t->sampler = infinigpu_sampler_from_handle(img->sampler);
+      break;
+   }
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: {
+      if (!img || !img->imageView)
+         break;
+      struct infinigpu_desc_texture *t = infinigpu_tex_slot(set, dstBinding);
+      if (t)
+         t->image = infinigpu_image_view_from_handle(img->imageView);
+      break;
+   }
+   case VK_DESCRIPTOR_TYPE_SAMPLER: {
+      /* A separate sampler pairs with the image one binding lower (host layout: image@b, sampler@b+1). */
+      if (!img || !img->sampler || dstBinding == 0)
+         break;
+      struct infinigpu_desc_texture *t = infinigpu_tex_slot(set, dstBinding - 1);
+      if (t)
+         t->sampler = infinigpu_sampler_from_handle(img->sampler);
+      break;
+   }
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+      /* A UBO (per-frame matrices etc.). Non-dynamic only — dynamic offsets from
+       * CmdBindDescriptorSets are unsupported this iteration. */
+      if (buf && buf->buffer) {
+         set->ubo_buffer = infinigpu_buffer_from_handle(buf->buffer);
+         set->ubo_offset = buf->offset;
+         set->ubo_range = buf->range;
+         set->ubo_binding = dstBinding;
+      }
+      break;
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+      /* A read-only SSBO (a DXVK structured/raw SRV, a skinning palette, per-instance data).
+       * Non-dynamic only (STORAGE_BUFFER_DYNAMIC stays in `default:` — dynamic offsets are a
+       * follow-up). Mirrors the UBO capture exactly; forwarded as bytes, never written back. */
+      if (buf && buf->buffer) {
+         set->ssbo_buffer = infinigpu_buffer_from_handle(buf->buffer);
+         set->ssbo_offset = buf->offset;
+         set->ssbo_range = buf->range;
+         set->ssbo_binding = dstBinding;
+      }
+      break;
+   default:
+      break; /* STORAGE_BUFFER_DYNAMIC/UNIFORM_BUFFER_DYNAMIC/etc. — not forwarded yet */
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 infinigpu_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
                                const VkWriteDescriptorSet *pDescriptorWrites,
                                uint32_t descriptorCopyCount,
                                const VkCopyDescriptorSet *pDescriptorCopies)
 {
-   /* Capture the resources each write binds, and the binding NUMBER (dstBinding) so the host can build
-    * a descriptor-set layout that places them where the shader declares them. Several sampled images +
-    * samplers and a uniform buffer can be written into the SAME set at distinct bindings (Phase-2c
-    * multi-texture composition). Each image is keyed by its dstBinding; a separate SAMPLER at `b+1`
-    * pairs with the image at `b`. The single-resource case takes element 0. */
    for (uint32_t w = 0; w < descriptorWriteCount; w++) {
       const VkWriteDescriptorSet *wr = &pDescriptorWrites[w];
       VK_FROM_HANDLE(infinigpu_descriptor_set, set, wr->dstSet);
       if (!set || wr->descriptorCount == 0)
          continue;
-
-      switch (wr->descriptorType) {
-      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
-         if (!wr->pImageInfo)
-            break;
-         struct infinigpu_desc_texture *t = infinigpu_tex_slot(set, wr->dstBinding);
-         if (!t)
-            break;
-         if (wr->pImageInfo[0].imageView)
-            t->image = infinigpu_image_view_from_handle(wr->pImageInfo[0].imageView);
-         if (wr->pImageInfo[0].sampler)
-            t->sampler = infinigpu_sampler_from_handle(wr->pImageInfo[0].sampler);
-         break;
-      }
-      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: {
-         if (!wr->pImageInfo || !wr->pImageInfo[0].imageView)
-            break;
-         struct infinigpu_desc_texture *t = infinigpu_tex_slot(set, wr->dstBinding);
-         if (t)
-            t->image = infinigpu_image_view_from_handle(wr->pImageInfo[0].imageView);
-         break;
-      }
-      case VK_DESCRIPTOR_TYPE_SAMPLER: {
-         /* A separate sampler pairs with the image one binding lower (host layout: image@b, sampler@b+1). */
-         if (!wr->pImageInfo || !wr->pImageInfo[0].sampler || wr->dstBinding == 0)
-            break;
-         struct infinigpu_desc_texture *t = infinigpu_tex_slot(set, wr->dstBinding - 1);
-         if (t)
-            t->sampler = infinigpu_sampler_from_handle(wr->pImageInfo[0].sampler);
-         break;
-      }
-      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-         /* A UBO (per-frame matrices etc.). Non-dynamic only — dynamic offsets from
-          * CmdBindDescriptorSets are unsupported this iteration. */
-         if (wr->pBufferInfo && wr->pBufferInfo[0].buffer) {
-            set->ubo_buffer = infinigpu_buffer_from_handle(wr->pBufferInfo[0].buffer);
-            set->ubo_offset = wr->pBufferInfo[0].offset;
-            set->ubo_range = wr->pBufferInfo[0].range;
-            set->ubo_binding = wr->dstBinding;
-         }
-         break;
-      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-         /* A read-only SSBO (a DXVK structured/raw SRV, a skinning palette, per-instance data).
-          * Non-dynamic only (STORAGE_BUFFER_DYNAMIC stays in `default:` — dynamic offsets are a
-          * follow-up). Mirrors the UBO capture exactly; forwarded as bytes, never written back. */
-         if (wr->pBufferInfo && wr->pBufferInfo[0].buffer) {
-            set->ssbo_buffer = infinigpu_buffer_from_handle(wr->pBufferInfo[0].buffer);
-            set->ssbo_offset = wr->pBufferInfo[0].offset;
-            set->ssbo_range = wr->pBufferInfo[0].range;
-            set->ssbo_binding = wr->dstBinding;
-         }
-         break;
-      default:
-         break; /* STORAGE_BUFFER_DYNAMIC/UNIFORM_BUFFER_DYNAMIC/etc. — not forwarded yet */
-      }
+      infinigpu_apply_descriptor(set, wr->descriptorType, wr->dstBinding,
+                                 wr->pImageInfo, wr->pBufferInfo);
    }
 
    /* Descriptor copies would move bindings between sets; unused by the apps we forward today. */
    (void)descriptorCopyCount;
    (void)pDescriptorCopies;
+}
+
+/* Core Vulkan 1.1.  zink's DEFAULT descriptor path: it bakes a set's writes into a template once and
+ * replays them per draw via this call (leaving it NULL is the jump-to-0 SIGSEGV zink hits after the
+ * layout-support check).  The common runtime already parsed the template into vk_descriptor_template_
+ * entry records; we walk them and reuse the exact same per-descriptor capture as the plain-write path.
+ * `pData` is the caller's blob — each entry element lives at pData + offset + i*stride and is a
+ * VkDescriptorImageInfo, VkDescriptorBufferInfo, or VkBufferView per the entry's descriptor type. */
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_UpdateDescriptorSetWithTemplate(VkDevice _device, VkDescriptorSet descriptorSet,
+                                          VkDescriptorUpdateTemplate descriptorUpdateTemplate,
+                                          const void *pData)
+{
+   VK_FROM_HANDLE(infinigpu_descriptor_set, set, descriptorSet);
+   VK_FROM_HANDLE(vk_descriptor_update_template, templ, descriptorUpdateTemplate);
+   if (!set || !templ)
+      return;
+
+   for (uint32_t e = 0; e < templ->entry_count; e++) {
+      const struct vk_descriptor_template_entry *entry = &templ->entries[e];
+      for (uint32_t j = 0; j < entry->array_count; j++) {
+         const char *p = (const char *)pData + entry->offset + (size_t)j * entry->stride;
+         infinigpu_apply_descriptor(set, entry->type, entry->binding,
+                                    (const VkDescriptorImageInfo *)p,
+                                    (const VkDescriptorBufferInfo *)p);
+      }
+   }
 }

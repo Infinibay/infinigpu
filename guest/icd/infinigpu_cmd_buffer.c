@@ -498,3 +498,66 @@ infinigpu_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
              (const char *)src->map + r->srcOffset, r->size);
    }
 }
+
+/* zink issues mid-render-pass attachment clears (glClear that can't be a loadOp) through
+ * CmdClearAttachments (zink_clear.c). It is core VK 1.0 but weak/undefined in BOTH this ICD
+ * and Mesa vk_common (no alias-merge), so leaving it NULL is a call-through-NULL SIGSEGV the
+ * moment a GL app clears inside a pass — the immediate-mode glClear+glBegin/glEnd crash. We fold
+ * a COLOR clear into the SAME has_clear/clear_value path CmdBeginRendering's loadOp=CLEAR uses,
+ * so the forwarded draw's background is the requested colour. This is EXACT for the dominant case
+ * (clear before any draw is recorded). A clear issued AFTER a draw is a true mid-pass wipe the
+ * single-forwarded-draw wire can't express, so we only fold when no draw is pending yet and
+ * otherwise leave the recorded geometry intact (best-effort, never a crash). DEPTH/STENCIL aspects
+ * are intentionally ignored — run_clear (infinigpu_sync.c) packs 4-bpp RGBA8 only, so a depth
+ * clear would silently no-op; honest to skip rather than pretend. Full-target clear (pRects is the
+ * common full-framebuffer rect; a partial rect over-clears, acceptable for now). */
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
+                              const VkClearAttachment *pAttachments, UNUSED uint32_t rectCount,
+                              UNUSED const VkClearRect *pRects)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   for (uint32_t i = 0; i < attachmentCount; i++) {
+      const VkClearAttachment *a = &pAttachments[i];
+      if (!(a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT))
+         continue;
+      if (cmd->draw_count == 0) {
+         cmd->clear_value = a->clearValue.color;
+         cmd->has_clear = true;
+      }
+   }
+}
+
+/* Fill a host-coherent dumb buffer with a repeated 32-bit pattern (zink clears buffers this way,
+ * zink_clear.c). Eager CPU write like CmdCopyBuffer2; unimplemented slot = call-through-NULL. */
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
+                        VkDeviceSize dstOffset, VkDeviceSize size, uint32_t data)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   (void)cmd;
+   struct infinigpu_buffer *dst = infinigpu_buffer_from_handle(dstBuffer);
+   if (!dst || !dst->map || dstOffset > dst->total_size)
+      return;
+   uint64_t end = (size == VK_WHOLE_SIZE) ? dst->total_size : dstOffset + size;
+   if (end > dst->total_size)
+      end = dst->total_size;
+   /* Vulkan requires dstOffset + fill size to be 4-byte multiples; write whole 32-bit words. */
+   uint32_t *p = (uint32_t *)((char *)dst->map + dstOffset);
+   for (uint64_t w = 0, n = (end - dstOffset) / 4; w < n; w++)
+      p[w] = data;
+}
+
+/* Small inline buffer update (zink uses it for tiny host→buffer writes). Eager memcpy over the
+ * persistent host-coherent map, bounds-guarded like CmdCopyBuffer2. */
+VKAPI_ATTR void VKAPI_CALL
+infinigpu_CmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
+                         VkDeviceSize dstOffset, VkDeviceSize dataSize, const void *pData)
+{
+   VK_FROM_HANDLE(infinigpu_cmd_buffer, cmd, commandBuffer);
+   (void)cmd;
+   struct infinigpu_buffer *dst = infinigpu_buffer_from_handle(dstBuffer);
+   if (!dst || !dst->map || !pData || dstOffset + dataSize > dst->total_size)
+      return;
+   memcpy((char *)dst->map + dstOffset, pData, dataSize);
+}

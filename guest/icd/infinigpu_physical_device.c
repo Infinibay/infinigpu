@@ -212,6 +212,21 @@ infinigpu_get_properties(const struct infinigpu_physical_device *pdev,
       .maxViewportDimensions            = { 16384, 16384 },
       .viewportBoundsRange              = { -32768.0f, 32768.0f },
 
+      /* Buffer/copy alignment + granularity. These were 0 (omitted) — harmless while only the
+       * triangle path ran, but as zink activates UBO/SSBO/texel-buffer binding and its map/flush
+       * math, a 0 offset-alignment trips zink's guest-side alignment/divide asserts and a 0
+       * nonCoherentAtomSize can divide-by-zero in flush/invalidate. Report >= the A5000's real
+       * alignments (256/32) so a forwarded UBO/SSBO offset stays valid on the host; the copy
+       * alignments are byte-generic (run_copy is bpp-generic) and timestampPeriod must be nonzero
+       * because timestampValidBits is advertised. */
+      .minUniformBufferOffsetAlignment  = 256,
+      .minStorageBufferOffsetAlignment  = 32,
+      .minTexelBufferOffsetAlignment    = 64,
+      .nonCoherentAtomSize              = 64,
+      .optimalBufferCopyOffsetAlignment = 1,
+      .optimalBufferCopyRowPitchAlignment = 1,
+      .timestampPeriod                  = 1.0f,
+
       /* Descriptor / attachment / vertex-input / framebuffer / sample limits that
        * zink reads to SIZE its resource usage. Leaving them zero (the old default)
        * makes zink clamp-to-zero, divide-by-zero, or hard-abort at context/pipeline
@@ -636,6 +651,11 @@ infinigpu_GetPhysicalDeviceFormatProperties2(
          VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
          VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
          VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+         /* the wire sampler already does bilinear (sampler_flags LINEAR) — advertise it so zink
+          * exposes GL_LINEAR filtering / linear-filterable configs. NOT BLIT_DST: BLIT_SRC+DST
+          * would let zink pick native vkCmdBlitImage2 (unimplemented → SIGSEGV) over its safe
+          * draw-based blit fallback; keep BLIT_SRC only. */
+         VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
          VK_FORMAT_FEATURE_BLIT_SRC_BIT |
          VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
          VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
