@@ -117,6 +117,18 @@ const struct vk_device_extension_table infinigpu_device_extensions = {
     * builds its descriptor set from the bound resources, so an unbound (null) slot is simply
     * absent — consistent with the promise. This was not a zink requirement in 25.0.7. */
    .EXT_robustness2               = true,
+
+   /* OpenGL/Zink base requirements — the extension STRINGS zink matches to enable a hardware
+    * GL screen (it checks the string, not just the promoted core version). The matching
+    * features are set in infinigpu_get_features and the host device enables them.
+    *  - EXT_scalar_block_layout: no entrypoints (pure feature/decoration); the SPIR-V carries
+    *    the scalar layout, honoured on the host. Core in 1.2, but advertised as the string too.
+    *  - EXT_custom_border_color / EXT_line_rasterization: advertised so zink stops falling back;
+    *    the border-colour / line-mode STATE is a wire-forwarding follow-up (see the feature note).
+    *    Neither adds an entrypoint the forwarded-draw path does not already service. */
+   .EXT_scalar_block_layout       = true,
+   .EXT_custom_border_color       = true,
+   .EXT_line_rasterization        = true,
 };
 
 /* Fill VkPhysicalDeviceDrmPropertiesEXT (mapped by Mesa's generated
@@ -313,6 +325,35 @@ infinigpu_get_features(struct vk_features *f)
        * enforce the tightened robustness2 bounds). See the EXT_robustness2 note on
        * the extension table. */
       .nullDescriptor      = true,
+
+      /* OpenGL/Zink base requirements. zink_device_info.py marks these required for a
+       * HARDWARE GL screen; without them zink either mis-renders ("Some incorrect
+       * rendering might occur") or (kopper/DRI) falls back to kms_swrast/llvmpipe — the
+       * root of "OpenGL runs on CPU". The host device enables the matching A5000 features
+       * (infinigpu-replay open()), so these are backed by the real GPU:
+       *  - logicOp / shaderClipDistance / shaderCullDistance: shader-level, carried by the
+       *    verbatim-forwarded SPIR-V (clip/cull ride the vertex stage; logicOp is pipeline
+       *    color-blend state) — fully honoured.
+       *  - scalarBlockLayout: a descriptor-block layout DECORATION in the forwarded SPIR-V;
+       *    the host compiles it with the extension enabled — fully honoured. Also core 1.2,
+       *    but zink matches on the feature bit + the string (see the extension table). */
+      .logicOp             = true,
+      .shaderClipDistance  = true,
+      .shaderCullDistance  = true,
+      .scalarBlockLayout   = true,
+
+      /* customBorderColor + lineRasterization: the remaining two zink base requirements.
+       * Advertised (with the extension strings) so zink stops warning + mis-rendering and
+       * uses the HW screen. The host enables the A5000 features; the sampler border colour /
+       * line-rasterization MODE are pipeline/sampler state the wire does not yet forward, so
+       * an app that actually uses a CUSTOM border colour or a non-default line mode gets the
+       * default (opaque-black border / bresenham lines) until that state is forwarded — a
+       * follow-up. Real GL content (desktops, glmark2, most games) uses neither, so this
+       * unblocks the HW path today without a visible regression. */
+      .customBorderColors  = true,
+      .customBorderColorWithoutFormat = true,
+      .rectangularLines    = true,
+      .bresenhamLines      = true,
    };
 }
 

@@ -179,6 +179,32 @@ if [ -f "$SRC_DIR/libvulkan_infinigpu.so" ] && [ -f "$SRC_DIR/infinigpu_icd.json
   fi
   log "[OK] installed Vulkan ICD → $ICDDIR/infinigpu_icd.x86_64.json (lib in $LIBDIR)"
 
+  # 5b. Make zink→infinigpu the DEFAULT OpenGL driver for the whole session (gnome-shell + apps).
+  #     Mesa has no native GL gallium driver for the infinigpu DRM node, so it otherwise auto-selects
+  #     the SOFTWARE path (kms_swrast/llvmpipe) → all OpenGL, including the desktop compositor, runs on
+  #     the CPU. Routing GL through zink (GL-on-Vulkan) onto the infinigpu ICD puts it on the real
+  #     A5000. Written to /etc/environment.d (systemd user sessions, incl. gnome-shell/mutter) AND
+  #     /etc/profile.d (login shells). VK_ICD_FILENAMES/VK_DRIVER_FILES pin the infinigpu ICD so zink
+  #     — and every Vulkan app — targets the A5000 and never a competing SOFTWARE ICD (lavapipe/llvmpipe)
+  #     that ships in the base desktop image and would otherwise be pickable by extension order.
+  ENVD=/etc/environment.d; mkdir -p "$ENVD"
+  cat > "$ENVD/90-infinigpu-zink.conf" <<ENVCONF
+# infinigpu: OpenGL via zink onto the infinigpu virtual GPU (the A5000), not llvmpipe.
+MESA_LOADER_DRIVER_OVERRIDE=zink
+GALLIUM_DRIVER=zink
+__GLX_VENDOR_LIBRARY_NAME=mesa
+VK_ICD_FILENAMES=$ICDDIR/infinigpu_icd.x86_64.json
+VK_DRIVER_FILES=$ICDDIR/infinigpu_icd.x86_64.json
+ENVCONF
+  cat > /etc/profile.d/90-infinigpu-zink.sh <<PROFCONF
+# infinigpu: route OpenGL through zink→infinigpu (the A5000) for login-shell GL apps.
+export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink __GLX_VENDOR_LIBRARY_NAME=mesa
+export VK_ICD_FILENAMES=$ICDDIR/infinigpu_icd.x86_64.json
+export VK_DRIVER_FILES=$ICDDIR/infinigpu_icd.x86_64.json
+PROFCONF
+  chmod 0644 "$ENVD/90-infinigpu-zink.conf" /etc/profile.d/90-infinigpu-zink.sh
+  log "[OK] OpenGL default → zink→infinigpu (A5000); llvmpipe is no longer the default GL path"
+
   # Ship + best-effort build the end-to-end validation app (run it after the GPU attaches).
   if [ -f "$SRC_DIR/infinigpu_tri_test.c" ]; then
     SHARE=/usr/local/share/infinigpu; mkdir -p "$SHARE"
