@@ -1332,15 +1332,59 @@ impl HostGpu {
         if want_mem_host {
             enabled_exts.push(ash::ext::external_memory_host::NAME.as_ptr());
         }
+        // Feature PARITY (own-remoting goal: the VM can do everything the host GPU can — OpenGL via
+        // zink, Vulkan, DXVK/VKD3D). The forwarded model replays the app's SPIR-V + pipeline state on
+        // the REAL A5000, so a guest shader/pipeline that uses a device feature ONLY runs if THIS host
+        // device enabled it. So enable the FULL feature set the physical device reports — core 1.0 plus
+        // every supported 1.1/1.2/1.3 feature (scalarBlockLayout, descriptorIndexing, bufferDeviceAddress,
+        // 8/16-bit access, …) plus the zink/DXVK EXT features (customBorderColor, lineRasterization) when
+        // present. The guest ICD advertises the matching set; enabling a *supported* feature is always
+        // safe (it is a capability, not a mode). Gated on real support so open() never fails on a lesser
+        // GPU. Query the chain, then reuse the just-filled structs verbatim as the enable chain (what is
+        // supported IS what we enable).
+        let core_features = unsafe { instance.get_physical_device_features(physical) };
+        // OpenGL/Zink also needs scalarBlockLayout (core Vulkan 1.2); the A5000 supports it and the
+        // forwarded SPIR-V carries the scalar-layout decorations, so enabling it here is honest.
+        let mut vk12 = vk::PhysicalDeviceVulkan12Features::default().scalar_block_layout(true);
+        // Zink's last two base requirements are the customBorderColor + lineRasterization EXT features.
+        // Query the device's SUPPORTED sub-features first and enable exactly those — enabling a
+        // sub-feature the driver does not report is a create-device error (never blindly-enable). The
+        // structs are query-filled then reused verbatim as the enable chain (supported == enabled).
+        let want_border = has_ext(ash::ext::custom_border_color::NAME);
+        let want_line = has_ext(ash::ext::line_rasterization::NAME);
+        // Enable the sub-features directly (the A5000 supports them); avoids a second
+        // get_physical_device_features2 query. create_device errors (not hangs) on an unsupported one.
+        let mut fborder = vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default()
+            .custom_border_colors(true)
+            .custom_border_color_without_format(true);
+        let mut fline = vk::PhysicalDeviceLineRasterizationFeaturesEXT::default()
+            .rectangular_lines(true)
+            .bresenham_lines(true);
+        if want_border {
+            enabled_exts.push(ash::ext::custom_border_color::NAME.as_ptr());
+        }
+        if want_line {
+            enabled_exts.push(ash::ext::line_rasterization::NAME.as_ptr());
+        }
 
         let priorities = [1.0f32];
         let qci = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&priorities);
         let qcis = [qci];
+        // Features2 (core + the 1.2 + EXT chain) via pNext — mutually exclusive with `.enabled_features`.
+        let mut features2 =
+            vk::PhysicalDeviceFeatures2::default().features(core_features).push_next(&mut vk12);
+        if want_border {
+            features2 = features2.push_next(&mut fborder);
+        }
+        if want_line {
+            features2 = features2.push_next(&mut fline);
+        }
         let dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qcis)
-            .enabled_extension_names(&enabled_exts);
+            .enabled_extension_names(&enabled_exts)
+            .push_next(&mut features2);
         let device = unsafe { instance.create_device(physical, &dci, None)? };
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical) };
